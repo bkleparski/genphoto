@@ -1,0 +1,13 @@
+[Unit]
+Description=GenPhoto — AI Photo Generation Studio
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/%i/.env.genphoto
+ExecStart=/usr/bin/python3 /home/%i/genphoto.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
