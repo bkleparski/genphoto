@@ -480,11 +480,16 @@ def comfy_video_thread(params, jid):
             if entry.get('status', {}).get('completed'):
                 outputs = entry.get('outputs', {})
                 for node_id, node_out in outputs.items():
-                    for vid in node_out.get('videos', []):
-                        if vid.get('filename', '').endswith('.mp4'):
-                            mp4_filename = vid['filename']
-                            mp4_subfolder = vid.get('subfolder', '')
+                    for key in ('videos', 'images'):
+                        for vid in node_out.get(key, []):
+                            if vid.get('filename', '').endswith('.mp4'):
+                                mp4_filename = vid['filename']
+                                mp4_subfolder = vid.get('subfolder', '')
+                                break
+                        if mp4_filename:
                             break
+                    if mp4_filename:
+                        break
                 break
             if entry.get('status', {}).get('status_str') == 'error':
                 msgs = entry.get('status', {}).get('messages', [])
