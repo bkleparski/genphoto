@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GenPhoto — AI photo generation studio (frontend for Stable Diffusion Forge)"""
 
-import base64, hashlib, html, json, mimetypes, os, secrets, sqlite3
+import base64, hashlib, html, json, mimetypes, os, secrets, shutil, sqlite3
 import threading, time, uuid
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -45,6 +45,13 @@ with db() as _c:
         sampler TEXT, scheduler TEXT, steps INTEGER, cfg REAL,
         width INTEGER, height INTEGER, seed INTEGER, batch INTEGER,
         preset TEXT, paths TEXT
+    )''')
+    _c.execute('''CREATE TABLE IF NOT EXISTS videos (
+        id TEXT PRIMARY KEY, ts INTEGER,
+        description TEXT, positive TEXT, negative TEXT,
+        model TEXT, sampler TEXT, steps INTEGER, cfg REAL,
+        width INTEGER, height INTEGER, seed INTEGER,
+        frames INTEGER, fps INTEGER, preset TEXT, path TEXT, source_path TEXT
     )''')
     _c.execute('''CREATE TABLE IF NOT EXISTS edits (
         id TEXT PRIMARY KEY, ts INTEGER,
@@ -245,6 +252,123 @@ def forge_edit_thread(params, jid):
                      params.get('source_path', ''))
                 )
         job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+def _find_recent_video(ts_before):
+    """Znajdź MP4 wygenerowany przez AnimateDiff po podanym timestampie."""
+    search_dirs = [
+        OUTPUTS_DIR / 'txt2img-images' / 'AnimateDiff',
+        OUTPUTS_DIR / 'img2img-images' / 'AnimateDiff',
+        OUTPUTS_DIR / 'AnimateDiff',
+    ]
+    candidates = []
+    for d in search_dirs:
+        if d.exists():
+            for f in d.rglob('*.mp4'):
+                try:
+                    if f.stat().st_mtime >= ts_before:
+                        candidates.append(f)
+                except OSError:
+                    pass
+    if not candidates:
+        for f in OUTPUTS_DIR.rglob('*.mp4'):
+            try:
+                if f.stat().st_mtime >= ts_before:
+                    candidates.append(f)
+            except OSError:
+                pass
+    return max(candidates, key=lambda f: f.stat().st_mtime) if candidates else None
+
+def forge_video_thread(params, jid):
+    try:
+        job_set(jid, status='generating')
+        title  = resolve_model(params['model'])
+        frames = int(params.get('frames', 16))
+        fps    = int(params.get('fps', 8))
+        loop   = params.get('loop', False)
+
+        animatediff_args = {
+            'enable':           True,
+            'model':            'v3_sd15_mm.ckpt',
+            'video_length':     frames,
+            'fps':              fps,
+            'loop_number':      0,
+            'closed_loop':      'R+P' if loop else 'N',
+            'batch_size':       1,
+            'stride':           1,
+            'overlap':          -1,
+            'format':           ['MP4'],
+            'interp':           'off',
+            'interp_x':        10,
+            'video_source':     None,
+            'video_path':       None,
+            'latent_power':     1,
+            'latent_scale':     32,
+            'last_frame':       None,
+            'latent_power_last':1,
+            'latent_scale_last':32,
+            'request_id':       '',
+        }
+        common = {
+            'prompt':           params['positive'],
+            'negative_prompt':  params.get('negative', ''),
+            'sampler_name':     params.get('sampler', 'Euler a'),
+            'scheduler':        'Karras',
+            'steps':            int(params.get('steps', 20)),
+            'cfg_scale':        float(params.get('cfg', 7)),
+            'width':            int(params.get('width', 512)),
+            'height':           int(params.get('height', 512)),
+            'seed':             int(params.get('seed', -1)),
+            'batch_size':       1,
+            'n_iter':           1,
+            'override_settings': {'sd_model_checkpoint': title},
+            'override_settings_restore_afterwards': True,
+            'save_images':      True,
+            'alwayson_scripts': {'animatediff': {'args': [animatediff_args]}},
+        }
+
+        ts_before = time.time()
+        if params.get('image_b64'):
+            data = forge_post('/sdapi/v1/img2img', {
+                **common,
+                'init_images':        [params['image_b64']],
+                'denoising_strength': float(params.get('denoising', 0.80)),
+            }, timeout=1200)
+        else:
+            data = forge_post('/sdapi/v1/txt2img', common, timeout=1200)
+
+        info = json.loads(data.get('info', '{}'))
+        seed = info.get('seed', -1)
+
+        mp4_src = _find_recent_video(ts_before)
+        if not mp4_src:
+            raise RuntimeError('Nie znaleziono pliku MP4. Sprawdź logi Forge i czy AnimateDiff jest włączony.')
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto_videos' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts   = int(time.time() * 1000)
+        name = f'gpv_{ts}_s{seed}.mp4'
+        dest = out_dir / name
+        shutil.copy2(str(mp4_src), str(dest))
+        vid_path = f'genphoto_videos/{today}/{name}'
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description', ''),
+                     params['positive'], params.get('negative', ''),
+                     params['model'], params.get('sampler', 'Euler a'),
+                     int(params.get('steps', 20)), float(params.get('cfg', 7)),
+                     int(params.get('width', 512)), int(params.get('height', 512)),
+                     seed, frames, fps,
+                     params.get('preset', 'custom'), vid_path,
+                     params.get('source_path', ''))
+                )
+        job_set(jid, status='done', images=[vid_path], seed=seed, gen_id=gid)
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
@@ -505,6 +629,16 @@ select{resize:none;cursor:pointer}
 .result-overlay-btn{position:absolute;bottom:5px;left:4px;right:4px;background:rgba(15,23,42,.88);border:1px solid #334155;color:#94a3b8;padding:4px 6px;border-radius:6px;font-size:.7rem;cursor:pointer;text-align:center;opacity:0;transition:opacity .15s;pointer-events:none}
 .result-wrap:hover .result-overlay-btn{opacity:1;pointer-events:auto}
 
+/* ── Video view ── */
+.vid-preset-btn{background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:5px 11px;border-radius:6px;font-size:.76rem;cursor:pointer;transition:all .2s;white-space:nowrap}
+.vid-preset-btn.active{background:#3b0764;border-color:#7c3aed;color:#c4b5fd}
+.vid-preset-btn:hover{border-color:#475569;color:#e2e8f0}
+.vid-btn{width:100%;background:linear-gradient(135deg,#7c3aed,#db2777);border:none;color:#fff;padding:13px;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer;margin-top:16px;transition:opacity .2s;letter-spacing:.02em}
+.vid-btn:hover{opacity:.9}
+.vid-btn:disabled{opacity:.5;cursor:not-allowed}
+#vid-prog-fill{background:linear-gradient(90deg,#7c3aed,#db2777)}
+.vid-hist-thumb{width:80px;height:56px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid #334155}
+
 /* ── Mobile responsive ── */
 @media(max-width:640px){
   header{flex-wrap:wrap;gap:6px;padding:8px 12px}
@@ -542,6 +676,7 @@ select{resize:none;cursor:pointer}
   <div class="view-tabs">
     <button class="view-tab-btn active" id="tab-gen" onclick="switchView(\'generate\')">&#127912; Generuj</button>
     <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
+    <button class="view-tab-btn" id="tab-video" onclick="switchView(\'video\')">&#127916; Wideo</button>
   </div>
   <div class="hdr-links">
     <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
@@ -814,6 +949,148 @@ select{resize:none;cursor:pointer}
 </div>
 
 </div><!-- /view-edit -->
+
+<!-- ── Video View ── -->
+<div id="view-video" style="display:none">
+<div class="edit-layout">
+
+  <!-- Lewa kolumna: źródło + presety -->
+  <div class="panel">
+    <div class="panel-title">&#127916; Źródło wideo</div>
+
+    <div style="display:flex;gap:6px;margin-bottom:14px">
+      <button class="mask-btn active" id="vtab-text" onclick="setVideoSrc(\'text\')">&#9999; Z prompta</button>
+      <button class="mask-btn" id="vtab-img" onclick="setVideoSrc(\'image\')">&#128247; Ze zdjęcia</button>
+    </div>
+
+    <div id="vid-upload-wrap" style="display:none">
+      <div id="vid-upload-area" class="upload-area"
+           onclick="document.getElementById(\'vid-file-in\').click()"
+           ondragover="event.preventDefault();this.classList.add(\'drag\')"
+           ondragleave="this.classList.remove(\'drag\')"
+           ondrop="handleVidDrop(event)">
+        <div style="font-size:2rem">&#128247;</div>
+        <div style="font-size:.85rem;margin-top:6px">Kliknij lub przeciągnij zdjęcie</div>
+        <div style="font-size:.73rem;color:#475569;margin-top:3px">Pierwsza klatka klipu</div>
+      </div>
+      <input type="file" id="vid-file-in" accept="image/*" style="display:none" onchange="handleVidFile(this.files[0])">
+      <div id="vid-src-preview" style="display:none;margin-top:10px">
+        <img id="vid-src-img" style="max-width:100%;border-radius:8px;display:block" src="" alt="">
+        <button class="mask-btn" style="margin-top:6px;font-size:.75rem" onclick="clearVidSrc()">&#10005; Zmień zdjęcie</button>
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label>Siła animacji</label>
+        <input type="range" id="vid-denoise-sl" min="0.5" max="1.0" step="0.05" value="0.8"
+               oninput="document.getElementById(\'vid-denoise-val\').textContent=parseFloat(this.value).toFixed(2)" style="width:100%;accent-color:#7c3aed">
+        <div class="denoising-labels">
+          <span>Subtelna</span>
+          <span id="vid-denoise-val" style="color:#c4b5fd;font-weight:600">0.80</span>
+          <span>Dynamiczna</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel-title" style="margin-top:14px">&#9889; Preset klipu</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+      <button class="vid-preset-btn active" id="vpre-flash" onclick="applyVidPreset(\'flash\')">&#9889; Mgnienie 2s</button>
+      <button class="vid-preset-btn" id="vpre-short" onclick="applyVidPreset(\'short\')">&#9654; Krótki 3s</button>
+      <button class="vid-preset-btn" id="vpre-std" onclick="applyVidPreset(\'std\')">&#9654;&#9654; Standard 4s</button>
+      <button class="vid-preset-btn" id="vpre-cine" onclick="applyVidPreset(\'cine\')">&#127916; Kinowy 4s</button>
+      <button class="vid-preset-btn" id="vpre-loop" onclick="applyVidPreset(\'loop\')">&#8635; Loop 3s</button>
+      <button class="vid-preset-btn" id="vpre-long" onclick="applyVidPreset(\'long\')">&#8987; Długi 6s</button>
+    </div>
+    <div id="vid-preset-info" style="font-size:.71rem;color:#64748b;padding:7px 10px;background:#0f172a;border-radius:6px;margin-bottom:12px">
+      16 klatek × 8fps = 2s · 512×512 · szybkie
+    </div>
+
+    <div class="adv-toggle" id="vid-adv-toggle" onclick="toggleVidAdv()">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="2,4 7,10 12,4"/></svg>
+      Zaawansowane
+    </div>
+    <div id="vid-adv-section" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #334155">
+      <div class="field">
+        <label>Model (wymagany SD 1.5)</label>
+        <select id="vid-model-sel">__VID_MODEL_OPTIONS__</select>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Klatki</label><input type="number" id="vid-frames-in" value="16" min="8" max="64" step="8"></div>
+        <div class="field"><label>FPS</label><input type="number" id="vid-fps-in" value="8" min="4" max="24" step="2"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Sampler</label>
+          <select id="vid-sampler-sel">
+            <option>Euler a</option><option>Euler</option><option>DPM++ SDE</option><option>DPM++ 2M</option><option>DDIM</option>
+          </select>
+        </div>
+        <div class="field"><label>Steps</label><input type="number" id="vid-steps-in" value="20" min="10" max="40"></div>
+      </div>
+      <div class="row3">
+        <div class="field"><label>CFG</label><input type="number" id="vid-cfg-in" value="7" min="1" max="15" step="0.5"></div>
+        <div class="field"><label>Szerokość</label><input type="number" id="vid-w-in" value="512" step="64" min="256" max="768"></div>
+        <div class="field"><label>Wysokość</label><input type="number" id="vid-h-in" value="512" step="64" min="256" max="768"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Seed</label><input type="number" id="vid-seed-in" value="-1"></div>
+        <div class="field"><label style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="vid-loop-cb" style="width:auto;accent-color:#7c3aed">
+          Seamless loop
+        </label></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Prawa kolumna: prompt + wynik -->
+  <div class="panel">
+    <div class="panel-title">&#128221; Prompt &amp; wynik</div>
+
+    <div class="field">
+      <label>Opisz animację (po polsku)</label>
+      <div class="ai-row">
+        <textarea id="vid-desc-ta" placeholder="np. fale oceanu spokojnie uderzają o brzeg, złoty zachód słońca, lekki wiatr..."></textarea>
+        <button class="ai-btn" id="vid-ai-btn" onclick="genVidAiPrompt()" style="background:#7c3aed">&#10024; AI<br>Prompt</button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Positive prompt</label>
+      <textarea id="vid-positive-ta" style="height:80px;font-size:.82rem;color:#bfdbfe"></textarea>
+    </div>
+    <div class="field">
+      <label>Negative prompt</label>
+      <textarea id="vid-negative-ta" style="height:44px;font-size:.78rem;color:#fca5a5"></textarea>
+    </div>
+
+    <button class="vid-btn" id="vid-btn" onclick="startVideo()">&#127916; GENERUJ WIDEO</button>
+
+    <div id="vid-progress-wrap" style="display:none;margin-top:16px">
+      <div class="progress-label"><span id="vid-prog-label">Generowanie wideo...</span><span id="vid-prog-pct"></span></div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="vid-prog-fill"></div></div>
+      <div style="font-size:.7rem;color:#64748b;margin-top:4px">Wideo zajmuje zwykle 2–10 minut zależnie od liczby klatek</div>
+    </div>
+
+    <div id="vid-result" style="display:none;margin-top:16px">
+      <div style="font-size:.72rem;color:#64748b;margin-bottom:6px">&#127916; Wygenerowany klip</div>
+      <video id="vid-player" controls autoplay loop playsinline
+             style="width:100%;border-radius:8px;background:#000;display:block;max-height:400px"></video>
+      <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+        <a id="vid-dl" class="hist-btn" style="flex:1;text-align:center;text-decoration:none" href="#" download>&#11015; Pobierz MP4</a>
+        <span id="vid-seed-show" style="font-size:.72rem;color:#475569"></span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="edit-hist-wrap">
+<div id="vid-hist-section" class="panel" style="margin-top:0">
+  <div class="hist-header" onclick="toggleVidHist()">
+    <h2>&#128252; Historia wideo <span id="vid-hist-count" style="color:#475569;font-weight:400"></span></h2>
+    <svg id="vid-hist-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#64748b" stroke-width="2"><polyline points="3,5 8,11 13,5"/></svg>
+  </div>
+  <div id="vid-hist-body" style="display:none;flex-direction:column;gap:10px"></div>
+</div>
+</div>
+
+</div><!-- /view-video -->
 
 <!-- ── Lightbox ── -->
 <div id="lb">
@@ -1145,11 +1422,14 @@ var _editDrawing = false;
 var _editHistOpen = false;
 
 function switchView(v) {
-  document.getElementById('view-generate').style.display = v==='generate' ? '' : 'none';
-  document.getElementById('view-edit').style.display     = v==='edit'     ? '' : 'none';
-  document.getElementById('tab-gen').classList.toggle('active', v==='generate');
-  document.getElementById('tab-edit').classList.toggle('active', v==='edit');
-  if(v==='edit') loadEditHistory();
+  ['generate','edit','video'].forEach(function(n){
+    document.getElementById('view-'+n).style.display = v===n ? '' : 'none';
+  });
+  document.getElementById('tab-gen').classList.toggle('active',   v==='generate');
+  document.getElementById('tab-edit').classList.toggle('active',  v==='edit');
+  document.getElementById('tab-video').classList.toggle('active', v==='video');
+  if(v==='edit')  loadEditHistory();
+  if(v==='video') loadVidHistory();
 }
 
 function handleEditFile(file) {
@@ -1476,6 +1756,227 @@ function toggleEditHist() {
   if(_editHistOpen) loadEditHistory();
 }
 
+/* ── Video View ── */
+var _vidSrcMode   = 'text';
+var _vidImgB64    = null;
+var _vidHistOpen  = false;
+var _curVidPreset = 'flash';
+
+var VID_PRESETS = {
+  flash: {frames:16,fps:8, w:512,h:512,sampler:'Euler a',  steps:20,cfg:7,   loop:false, label:'16 klatek × 8fps = 2s · 512×512 · szybkie'},
+  short: {frames:24,fps:8, w:512,h:512,sampler:'Euler a',  steps:20,cfg:7,   loop:false, label:'24 klatki × 8fps = 3s · 512×512'},
+  std:   {frames:32,fps:8, w:512,h:512,sampler:'Euler a',  steps:20,cfg:7,   loop:false, label:'32 klatki × 8fps = 4s · 512×512'},
+  cine:  {frames:32,fps:8, w:768,h:512,sampler:'DPM++ SDE',steps:25,cfg:7.5, loop:false, label:'32 klatki × 8fps = 4s · 768×512 kinowy (wolniejsze)'},
+  loop:  {frames:24,fps:8, w:512,h:512,sampler:'Euler a',  steps:20,cfg:7,   loop:true,  label:'24 klatki × 8fps = 3s · 512×512 · seamless loop'},
+  long:  {frames:48,fps:8, w:512,h:512,sampler:'Euler a',  steps:20,cfg:7,   loop:false, label:'48 klatek × 8fps = 6s · 512×512 (wolne!)'},
+};
+
+function setVideoSrc(mode) {
+  _vidSrcMode = mode;
+  document.getElementById('vtab-text').classList.toggle('active', mode==='text');
+  document.getElementById('vtab-img').classList.toggle('active',  mode==='image');
+  document.getElementById('vid-upload-wrap').style.display = mode==='image' ? '' : 'none';
+}
+
+function applyVidPreset(key) {
+  _curVidPreset = key;
+  var p = VID_PRESETS[key];
+  if(!p) return;
+  document.querySelectorAll('[id^="vpre-"]').forEach(function(b){b.classList.remove('active');});
+  document.getElementById('vpre-'+key).classList.add('active');
+  document.getElementById('vid-preset-info').textContent = p.label;
+  document.getElementById('vid-frames-in').value = p.frames;
+  document.getElementById('vid-fps-in').value    = p.fps;
+  document.getElementById('vid-w-in').value      = p.w;
+  document.getElementById('vid-h-in').value      = p.h;
+  setVal('vid-sampler-sel', p.sampler);
+  document.getElementById('vid-steps-in').value  = p.steps;
+  document.getElementById('vid-cfg-in').value    = p.cfg;
+  document.getElementById('vid-loop-cb').checked = !!p.loop;
+}
+
+function toggleVidAdv() {
+  var sec = document.getElementById('vid-adv-section');
+  var tog = document.getElementById('vid-adv-toggle');
+  var open = sec.style.display==='none';
+  sec.style.display = open ? '' : 'none';
+  tog.classList.toggle('open', open);
+}
+
+function handleVidFile(file) {
+  if(!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    _vidImgB64 = e.target.result.split(',')[1];
+    document.getElementById('vid-src-img').src = e.target.result;
+    document.getElementById('vid-upload-area').style.display  = 'none';
+    document.getElementById('vid-src-preview').style.display  = '';
+  };
+  reader.readAsDataURL(file);
+}
+
+function handleVidDrop(e) {
+  e.preventDefault();
+  document.getElementById('vid-upload-area').classList.remove('drag');
+  var f = e.dataTransfer.files[0];
+  if(f && f.type.startsWith('image/')) handleVidFile(f);
+}
+
+function clearVidSrc() {
+  _vidImgB64 = null;
+  document.getElementById('vid-src-img').src = '';
+  document.getElementById('vid-upload-area').style.display  = '';
+  document.getElementById('vid-src-preview').style.display  = 'none';
+}
+
+function genVidAiPrompt() {
+  var desc = document.getElementById('vid-desc-ta').value.trim();
+  if(!desc) return toast('Opisz animację', 'err');
+  var btn = document.getElementById('vid-ai-btn');
+  btn.disabled=true; btn.innerHTML='&#8987; AI<br>Prompt';
+  fetch('/api/ai-prompt', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({description: desc})
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
+    if(d.ok) {
+      document.getElementById('vid-positive-ta').value = d.positive;
+      document.getElementById('vid-negative-ta').value = d.negative;
+      toast('Prompt wygenerowany!','ok');
+    } else toast('Błąd AI: '+d.error,'err');
+  }).catch(function(){
+    btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
+    toast('Błąd połączenia','err');
+  });
+}
+
+function startVideo() {
+  var pos = document.getElementById('vid-positive-ta').value.trim();
+  if(!pos) return toast('Wpisz prompt lub użyj AI Prompt','err');
+  if(_vidSrcMode==='image' && !_vidImgB64) return toast('Wczytaj zdjęcie źródłowe','err');
+  var modelSel = document.getElementById('vid-model-sel');
+  var params = {
+    image_b64:   _vidSrcMode==='image' ? _vidImgB64 : null,
+    description: document.getElementById('vid-desc-ta').value.trim(),
+    positive:    pos,
+    negative:    document.getElementById('vid-negative-ta').value.trim(),
+    model:       modelSel ? modelSel.value : 'v1-5-pruned-emaonly',
+    sampler:     document.getElementById('vid-sampler-sel').value,
+    steps:       parseInt(document.getElementById('vid-steps-in').value),
+    cfg:         parseFloat(document.getElementById('vid-cfg-in').value),
+    frames:      parseInt(document.getElementById('vid-frames-in').value),
+    fps:         parseInt(document.getElementById('vid-fps-in').value),
+    width:       parseInt(document.getElementById('vid-w-in').value),
+    height:      parseInt(document.getElementById('vid-h-in').value),
+    seed:        parseInt(document.getElementById('vid-seed-in').value),
+    denoising:   parseFloat(document.getElementById('vid-denoise-sl').value),
+    loop:        document.getElementById('vid-loop-cb').checked,
+    preset:      _curVidPreset,
+  };
+  var btn = document.getElementById('vid-btn');
+  btn.disabled=true; btn.textContent='Generowanie...';
+  document.getElementById('vid-progress-wrap').style.display='block';
+  document.getElementById('vid-prog-fill').style.width='5%';
+  document.getElementById('vid-prog-pct').textContent='';
+  document.getElementById('vid-result').style.display='none';
+  startForgeProgress('vid-prog-fill','vid-prog-pct');
+  fetch('/api/video', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(params)
+  }).then(function(r){return r.json();}).then(function(d){
+    if(d.job_id) pollVidJob(d.job_id);
+    else {
+      resetVidBtn();
+      document.getElementById('vid-progress-wrap').style.display='none';
+      toast('Błąd: '+(d.error||'nieznany'),'err');
+    }
+  }).catch(function(){ resetVidBtn(); toast('Błąd połączenia','err'); });
+}
+
+function pollVidJob(jid) {
+  fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
+    if(d.status==='done') {
+      stopForgeProgress();
+      document.getElementById('vid-prog-fill').style.width='100%';
+      document.getElementById('vid-prog-pct').textContent='';
+      setTimeout(function(){
+        document.getElementById('vid-progress-wrap').style.display='none';
+        showVidResult(d.images[0], d.seed);
+        resetVidBtn();
+        loadVidHistory();
+      }, 400);
+    } else if(d.status==='error') {
+      stopForgeProgress();
+      document.getElementById('vid-progress-wrap').style.display='none';
+      resetVidBtn(); toast('Błąd: '+d.error,'err');
+    } else {
+      setTimeout(function(){pollVidJob(jid);}, 2000);
+    }
+  }).catch(function(){ setTimeout(function(){pollVidJob(jid);}, 3000); });
+}
+
+function showVidResult(path, seed) {
+  var src = '/img/'+path;
+  var player = document.getElementById('vid-player');
+  player.src = src; player.load();
+  var dl = document.getElementById('vid-dl');
+  dl.href = src; dl.download = path.split('/').pop();
+  document.getElementById('vid-seed-show').textContent = seed>0 ? 'Seed: '+seed : '';
+  document.getElementById('vid-result').style.display = '';
+  toast('Wideo gotowe!','ok');
+}
+
+function resetVidBtn() {
+  var b = document.getElementById('vid-btn');
+  b.disabled=false; b.innerHTML='&#127916; GENERUJ WIDEO';
+}
+
+function loadVidHistory() {
+  fetch('/api/video-history').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('vid-hist-count').textContent = d.length ? '('+d.length+')' : '';
+    if(!_vidHistOpen) return;
+    var body = document.getElementById('vid-hist-body');
+    body.innerHTML='';
+    if(!d.length){
+      var em=document.createElement('div'); em.className='no-hist';
+      em.textContent='Brak historii wideo'; body.appendChild(em); return;
+    }
+    d.forEach(function(g){
+      var item=document.createElement('div'); item.className='hist-item';
+      var thumbs=document.createElement('div'); thumbs.className='hist-thumbs';
+      var vid=document.createElement('video');
+      vid.src='/img/'+g.path; vid.className='vid-hist-thumb';
+      vid.muted=true; vid.loop=true; vid.preload='none';
+      vid.onmouseenter=function(){this.play();}; vid.onmouseleave=function(){this.pause(); this.currentTime=0;};
+      vid.onclick=function(){ showVidResult(g.path, g.seed||0); switchView('video'); };
+      thumbs.appendChild(vid);
+      var meta=document.createElement('div'); meta.className='hist-meta';
+      var desc=document.createElement('div'); desc.className='hist-desc';
+      desc.textContent = g.description || (g.positive||'').substring(0,60)+'...';
+      var dt=new Date(g.ts*1000).toLocaleString('pl');
+      var dur=((g.frames||16)/(g.fps||8)).toFixed(1);
+      var tags=document.createElement('div'); tags.className='hist-tags';
+      tags.textContent=[g.model,(g.frames||16)+'kl/'+dur+'s',g.width+'x'+g.height,dt].join(' · ');
+      var actions=document.createElement('div'); actions.className='hist-actions';
+      var dl=document.createElement('a'); dl.className='hist-btn'; dl.textContent='↓ Pobierz';
+      dl.href='/img/'+g.path; dl.download=g.path.split('/').pop(); dl.style.textDecoration='none';
+      actions.appendChild(dl);
+      meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
+      item.appendChild(thumbs); item.appendChild(meta);
+      body.appendChild(item);
+    });
+  });
+}
+
+function toggleVidHist() {
+  _vidHistOpen=!_vidHistOpen;
+  var body=document.getElementById('vid-hist-body');
+  var arrow=document.getElementById('vid-hist-arrow');
+  body.style.display=_vidHistOpen?'flex':'none';
+  arrow.style.transform=_vidHistOpen?'rotate(180deg)':'';
+  if(_vidHistOpen) loadVidHistory();
+}
+
 /* ── Init ── */
 applyPreset('portrait');
 loadHistory();
@@ -1549,10 +2050,22 @@ class Handler(BaseHTTPRequestHandler):
                                 'steps','cfg','width','height','batch','prefix','negative')}
             for p in PRESETS
         ])
+        # Filtruj modele SD1.5 dla AnimateDiff (zawierają "v1-5" lub "sd15" w nazwie)
+        sd15_opts = ''
+        for m in raw_models:
+            n = html.escape(m.get('model_name',''))
+            t = html.escape(m.get('model_name',''))
+            nl = n.lower()
+            if any(k in nl for k in ('v1-5','v1_5','sd15','sd1.5','pruned')):
+                sd15_opts += f'<option value="{t}">{n}</option>'
+        if not sd15_opts:
+            sd15_opts = '<option value="v1-5-pruned-emaonly">v1-5-pruned-emaonly</option>'
+
         return (HTML_TEMPLATE
                 .replace('__PRESET_TABS__', preset_tabs)
                 .replace('__MODEL_OPTIONS__', model_opts)
                 .replace('__EDIT_MODEL_OPTIONS__', model_opts)
+                .replace('__VID_MODEL_OPTIONS__', sd15_opts)
                 .replace('__PRESETS_JSON__', presets_json)
                 .replace('__GALLERY_URL__', GALLERY_URL))
 
@@ -1636,6 +2149,15 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if path == '/api/video-history':
+            with _db_lock:
+                with db() as con:
+                    rows = con.execute(
+                        'SELECT * FROM videos ORDER BY ts DESC LIMIT 50'
+                    ).fetchall()
+            self._json([dict(r) for r in rows])
+            return
+
         self.send_error(404)
 
     def do_DELETE(self):
@@ -1713,6 +2235,23 @@ class Handler(BaseHTTPRequestHandler):
                 params['gen_id'] = uuid.uuid4().hex
                 jid = job_create()
                 t = threading.Thread(target=forge_edit_thread, args=(params, jid), daemon=True)
+                t.start()
+                self._json({'ok': True, 'job_id': jid})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
+            return
+
+        if self.path == '/api/video':
+            try:
+                params = json.loads(body)
+                if not params.get('positive'):
+                    self._json({'ok': False, 'error': 'Brak positive prompt'}); return
+                frames = int(params.get('frames', 16))
+                if frames < 8 or frames > 96:
+                    self._json({'ok': False, 'error': 'frames musi być 8–96'}); return
+                params['gen_id'] = uuid.uuid4().hex
+                jid = job_create()
+                t = threading.Thread(target=forge_video_thread, args=(params, jid), daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
