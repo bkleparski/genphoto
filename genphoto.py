@@ -426,7 +426,7 @@ def comfy_video_thread(params, jid):
                 "type": "ltxv"
             }},
             "3": {"class_type": "VAELoader", "inputs": {
-                "vae_name": "ltxv_vae.safetensors"
+                "vae_name": "ltxv_vae_comfy.safetensors"
             }},
             "4": {"class_type": "CLIPTextEncode", "inputs": {
                 "text": positive, "clip": ["2", 0]
