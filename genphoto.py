@@ -13,6 +13,8 @@ import urllib.request, urllib.error
 PORT         = int(os.environ.get('GP_PORT', '7862'))
 OUTPUTS_DIR  = Path(os.environ.get('GP_OUTPUTS_DIR', '/home/bartek/forge/outputs'))
 FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('/')
+COMFY_URL    = os.environ.get('GP_COMFY_URL', 'http://localhost:8189').rstrip('/')
+COMFY_OUTPUTS = Path(os.environ.get('GP_COMFY_OUTPUTS', '/home/bartek/comfyui/output'))
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('GP_DEEPSEEK_MODEL', 'deepseek-v4-flash')
 AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
@@ -374,6 +376,143 @@ def forge_video_thread(params, jid):
                      int(params.get('steps', 25)), float(params.get('cfg', 6.5)),
                      int(params.get('width', 512)), int(params.get('height', 512)),
                      seed, frames, fps,
+                     params.get('preset', 'custom'), vid_path,
+                     params.get('source_path', ''))
+                )
+        job_set(jid, status='done', images=[vid_path], seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+# ── ComfyUI helpers ───────────────────────────────────────────────────────────
+def comfy_post(path, data, timeout=30):
+    raw = json.dumps(data).encode()
+    req = urllib.request.Request(
+        f'{COMFY_URL}{path}', data=raw,
+        headers={'Content-Type': 'application/json'}, method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+def comfy_get(path, timeout=10):
+    with urllib.request.urlopen(f'{COMFY_URL}{path}', timeout=timeout) as r:
+        return json.loads(r.read())
+
+def comfy_video_thread(params, jid):
+    try:
+        job_set(jid, status='generating')
+        positive = params['positive']
+        negative = params.get('negative', 'worst quality, blurry, deformed, watermark, text')
+        width    = int(params.get('width', 704))
+        height   = int(params.get('height', 480))
+        frames   = int(params.get('frames', 97))   # 97 = ~4s @ 25fps (musi być 8n+1)
+        fps      = int(params.get('fps', 25))
+        steps    = int(params.get('steps', 8))      # distilled = 8 kroków
+        cfg      = float(params.get('cfg', 3.0))
+        seed     = int(params.get('seed', -1))
+        if seed < 0:
+            import random
+            seed = random.randint(0, 2**32 - 1)
+
+        # LTX-V length musi być 8n+1 (1, 9, 17, 25, ..., 97, ...)
+        frames = max(9, ((frames - 1) // 8) * 8 + 1)
+
+        workflow = {
+            "1": {"class_type": "UNETLoader", "inputs": {
+                "unet_name": "ltxv-2b-0.9.8-distilled-fp8.safetensors",
+                "weight_dtype": "fp8_e4m3fn"
+            }},
+            "2": {"class_type": "CLIPLoader", "inputs": {
+                "clip_name": "t5xxl_fp8_e4m3fn.safetensors",
+                "type": "ltxv"
+            }},
+            "3": {"class_type": "VAELoader", "inputs": {
+                "vae_name": "ltxv_vae.safetensors"
+            }},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {
+                "text": positive, "clip": ["2", 0]
+            }},
+            "5": {"class_type": "CLIPTextEncode", "inputs": {
+                "text": negative, "clip": ["2", 0]
+            }},
+            "6": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+                "width": width, "height": height, "length": frames, "batch_size": 1
+            }},
+            "7": {"class_type": "LTXVConditioning", "inputs": {
+                "positive": ["4", 0], "negative": ["5", 0], "frame_rate": float(fps)
+            }},
+            "8": {"class_type": "ModelSamplingLTXV", "inputs": {
+                "model": ["1", 0], "max_shift": 2.05, "base_shift": 0.95,
+                "latent": ["6", 0]
+            }},
+            "9": {"class_type": "KSampler", "inputs": {
+                "model": ["8", 0],
+                "positive": ["7", 0], "negative": ["7", 1],
+                "latent_image": ["6", 0],
+                "seed": seed, "steps": steps, "cfg": cfg,
+                "sampler_name": "euler", "scheduler": "beta", "denoise": 1.0
+            }},
+            "10": {"class_type": "VAEDecode", "inputs": {
+                "samples": ["9", 0], "vae": ["3", 0]
+            }},
+            "11": {"class_type": "CreateVideo", "inputs": {
+                "images": ["10", 0], "fps": float(fps)
+            }},
+            "12": {"class_type": "SaveVideo", "inputs": {
+                "video": ["11", 0],
+                "filename_prefix": "genphoto_ltxv",
+                "format": "mp4", "codec": "h264"
+            }},
+        }
+
+        client_id = uuid.uuid4().hex
+        resp = comfy_post('/prompt', {'prompt': workflow, 'client_id': client_id})
+        prompt_id = resp.get('prompt_id')
+        if not prompt_id:
+            raise RuntimeError(f'ComfyUI nie zwrócił prompt_id: {resp}')
+
+        # Poll /history aż status done (max 10 min)
+        ts_before = time.time()
+        mp4_filename = None
+        for _ in range(600):
+            time.sleep(1)
+            hist = comfy_get(f'/history/{prompt_id}', timeout=5)
+            entry = hist.get(prompt_id, {})
+            if entry.get('status', {}).get('completed'):
+                outputs = entry.get('outputs', {})
+                for node_id, node_out in outputs.items():
+                    for vid in node_out.get('videos', []):
+                        if vid.get('filename', '').endswith('.mp4'):
+                            mp4_filename = vid['filename']
+                            mp4_subfolder = vid.get('subfolder', '')
+                            break
+                break
+            if entry.get('status', {}).get('status_str') == 'error':
+                msgs = entry.get('status', {}).get('messages', [])
+                raise RuntimeError(f'ComfyUI błąd: {msgs}')
+
+        if not mp4_filename:
+            raise RuntimeError('ComfyUI nie wygenerował MP4 (timeout lub brak output)')
+
+        # Skopiuj z ComfyUI output do genphoto_videos
+        src = COMFY_OUTPUTS / mp4_subfolder / mp4_filename
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto_videos' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts   = int(time.time() * 1000)
+        name = f'gpv_{ts}_s{seed}.mp4'
+        dest = out_dir / name
+        shutil.copy2(str(src), str(dest))
+        vid_path = f'genphoto_videos/{today}/{name}'
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description', ''),
+                     positive, negative, 'ltxv-2b-0.9.8-distilled',
+                     'euler/beta', steps, cfg,
+                     width, height, seed, frames, fps,
                      params.get('preset', 'custom'), vid_path,
                      params.get('source_path', ''))
                 )
@@ -1054,25 +1193,16 @@ select{resize:none;cursor:pointer}
       Zaawansowane
     </div>
     <div id="vid-adv-section" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #334155">
-      <div class="field">
-        <label>Model (wymagany SD 1.5)</label>
-        <select id="vid-model-sel">__VID_MODEL_OPTIONS__</select>
+      <div class="row2">
+        <div class="field"><label>Klatki</label><input type="number" id="vid-frames-in" value="97" min="9" max="249" step="8"></div>
+        <div class="field"><label>FPS</label><input type="number" id="vid-fps-in" value="25" min="8" max="30" step="1"></div>
       </div>
       <div class="row2">
-        <div class="field"><label>Klatki</label><input type="number" id="vid-frames-in" value="16" min="8" max="64" step="8"></div>
-        <div class="field"><label>FPS</label><input type="number" id="vid-fps-in" value="8" min="4" max="24" step="2"></div>
+        <div class="field"><label>Steps</label><input type="number" id="vid-steps-in" value="8" min="4" max="30"></div>
+        <div class="field"><label>CFG</label><input type="number" id="vid-cfg-in" value="3.0" min="1" max="10" step="0.5"></div>
       </div>
       <div class="row2">
-        <div class="field"><label>Sampler</label>
-          <select id="vid-sampler-sel">
-            <option>DPM++ 2M Karras</option><option>Euler a</option><option>Euler</option><option>DPM++ SDE</option><option>DPM++ 2M</option><option>DDIM</option>
-          </select>
-        </div>
-        <div class="field"><label>Steps</label><input type="number" id="vid-steps-in" value="25" min="10" max="40"></div>
-      </div>
-      <div class="row3">
-        <div class="field"><label>CFG</label><input type="number" id="vid-cfg-in" value="6.5" min="1" max="15" step="0.5"></div>
-        <div class="field"><label>Szerokość</label><input type="number" id="vid-w-in" value="512" step="64" min="256" max="768"></div>
+        <div class="field"><label>Szerokość</label><input type="number" id="vid-w-in" value="704" step="32" min="256" max="1024"></div>
         <div class="field"><label>Wysokość</label><input type="number" id="vid-h-in" value="512" step="64" min="256" max="768"></div>
       </div>
       <div class="row2">
@@ -1831,12 +1961,12 @@ var _vidHistOpen  = false;
 var _curVidPreset = 'flash';
 
 var VID_PRESETS = {
-  flash: {frames:16,fps:8, w:512,h:512,sampler:'DPM++ 2M Karras',steps:25,cfg:6.5,loop:false, label:'16 klatek × 8fps = 2s · 512×512 · szybkie'},
-  short: {frames:24,fps:8, w:512,h:512,sampler:'DPM++ 2M Karras',steps:25,cfg:6.5,loop:false, label:'24 klatki × 8fps = 3s · 512×512'},
-  std:   {frames:32,fps:8, w:512,h:512,sampler:'DPM++ 2M Karras',steps:28,cfg:6.5,loop:false, label:'32 klatki × 8fps = 4s · 512×512'},
-  cine:  {frames:32,fps:8, w:768,h:512,sampler:'DPM++ 2M Karras',steps:30,cfg:6.5,loop:false, label:'32 klatki × 8fps = 4s · 768×512 kinowy (wolniejsze)'},
-  loop:  {frames:24,fps:8, w:512,h:512,sampler:'DPM++ 2M Karras',steps:25,cfg:6.5,loop:true,  label:'24 klatki × 8fps = 3s · 512×512 · seamless loop'},
-  long:  {frames:48,fps:8, w:512,h:512,sampler:'DPM++ 2M Karras',steps:28,cfg:6.5,loop:false, label:'48 klatek × 8fps = 6s · 512×512 (wolne!)'},
+  flash: {frames:25, fps:25,w:512,h:512,steps:8, cfg:3.0,loop:false,label:'25 klatek × 25fps = 1s · 512×512 · błyskawiczne (LTX-V)'},
+  short: {frames:49, fps:25,w:704,h:480,steps:8, cfg:3.0,loop:false,label:'49 klatek × 25fps = 2s · 704×480 (LTX-V)'},
+  std:   {frames:97, fps:25,w:704,h:480,steps:8, cfg:3.0,loop:false,label:'97 klatek × 25fps = 4s · 704×480 (LTX-V)'},
+  cine:  {frames:97, fps:25,w:768,h:512,steps:10,cfg:3.5,loop:false,label:'97 klatek × 25fps = 4s · 768×512 · wyższa jakość (LTX-V)'},
+  loop:  {frames:49, fps:25,w:704,h:480,steps:8, cfg:3.0,loop:false,label:'49 klatek × 25fps = 2s · 704×480 (LTX-V)'},
+  long:  {frames:121,fps:25,w:704,h:480,steps:8, cfg:3.0,loop:false,label:'121 klatek × 25fps = 5s · 704×480 (LTX-V, wolniejsze)'},
 };
 
 function setVideoSrc(mode) {
@@ -1857,10 +1987,8 @@ function applyVidPreset(key) {
   document.getElementById('vid-fps-in').value    = p.fps;
   document.getElementById('vid-w-in').value      = p.w;
   document.getElementById('vid-h-in').value      = p.h;
-  setVal('vid-sampler-sel', p.sampler);
   document.getElementById('vid-steps-in').value  = p.steps;
   document.getElementById('vid-cfg-in').value    = p.cfg;
-  document.getElementById('vid-loop-cb').checked = !!p.loop;
 }
 
 function toggleVidAdv() {
@@ -1922,14 +2050,12 @@ function startVideo() {
   var pos = document.getElementById('vid-positive-ta').value.trim();
   if(!pos) return toast('Wpisz prompt lub użyj AI Prompt','err');
   if(_vidSrcMode==='image' && !_vidImgB64) return toast('Wczytaj zdjęcie źródłowe','err');
-  var modelSel = document.getElementById('vid-model-sel');
   var params = {
+    backend:     'comfy',
     image_b64:   _vidSrcMode==='image' ? _vidImgB64 : null,
     description: document.getElementById('vid-desc-ta').value.trim(),
     positive:    pos,
     negative:    document.getElementById('vid-negative-ta').value.trim(),
-    model:       modelSel ? modelSel.value : 'v1-5-pruned-emaonly',
-    sampler:     document.getElementById('vid-sampler-sel').value,
     steps:       parseInt(document.getElementById('vid-steps-in').value),
     cfg:         parseFloat(document.getElementById('vid-cfg-in').value),
     frames:      parseInt(document.getElementById('vid-frames-in').value),
@@ -1937,8 +2063,6 @@ function startVideo() {
     width:       parseInt(document.getElementById('vid-w-in').value),
     height:      parseInt(document.getElementById('vid-h-in').value),
     seed:        parseInt(document.getElementById('vid-seed-in').value),
-    denoising:   parseFloat(document.getElementById('vid-denoise-sl').value),
-    loop:        document.getElementById('vid-loop-cb').checked,
     preset:      _curVidPreset,
   };
   var btn = document.getElementById('vid-btn');
@@ -2336,11 +2460,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not params.get('positive'):
                     self._json({'ok': False, 'error': 'Brak positive prompt'}); return
                 frames = int(params.get('frames', 16))
-                if frames < 8 or frames > 96:
-                    self._json({'ok': False, 'error': 'frames musi być 8–96'}); return
+                if frames < 8 or frames > 500:
+                    self._json({'ok': False, 'error': 'frames musi być 8–500'}); return
                 params['gen_id'] = uuid.uuid4().hex
                 jid = job_create()
-                t = threading.Thread(target=forge_video_thread, args=(params, jid), daemon=True)
+                backend = params.get('backend', 'comfy')
+                target  = comfy_video_thread if backend == 'comfy' else forge_video_thread
+                t = threading.Thread(target=target, args=(params, jid), daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
