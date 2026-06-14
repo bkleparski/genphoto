@@ -1395,6 +1395,24 @@ function deleteHist(id, el) {
     }).catch(function(){ el.style.opacity='1'; toast('Błąd połączenia','err'); });
 }
 
+function deleteEditHist(id, el) {
+  el.style.opacity='0.4';
+  fetch('/api/edit-history/'+id, {method:'DELETE'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){ el.remove(); loadEditHistory(); }
+      else { el.style.opacity='1'; toast('Błąd usuwania','err'); }
+    }).catch(function(){ el.style.opacity='1'; toast('Błąd połączenia','err'); });
+}
+
+function deleteVidHist(id, el) {
+  el.style.opacity='0.4';
+  fetch('/api/video-history/'+id, {method:'DELETE'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){ el.remove(); loadVidHistory(); }
+      else { el.style.opacity='1'; toast('Błąd usuwania','err'); }
+    }).catch(function(){ el.style.opacity='1'; toast('Błąd połączenia','err'); });
+}
+
 function repeatGen(g) {
   document.getElementById('desc-ta').value = g.description || '';
   document.getElementById('positive-ta').value = g.positive;
@@ -1777,7 +1795,11 @@ function loadEditHistory() {
       var dt=new Date(g.ts*1000).toLocaleString('pl');
       var tags=document.createElement('div'); tags.className='hist-tags';
       tags.textContent=[g.model,g.sampler,'denoising: '+g.denoising,g.width+'x'+g.height,dt].join(' · ');
-      meta.appendChild(desc); meta.appendChild(tags);
+      var actions=document.createElement('div'); actions.className='hist-actions';
+      var del=document.createElement('button'); del.className='hist-btn del'; del.textContent='✕ Usuń';
+      (function(gid,itm){ del.onclick=function(){ deleteEditHist(gid,itm); }; })(g.id,item);
+      actions.appendChild(del);
+      meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
       item.appendChild(thumbsDiv); item.appendChild(meta);
       body.appendChild(item);
     });
@@ -1997,7 +2019,9 @@ function loadVidHistory() {
       var actions=document.createElement('div'); actions.className='hist-actions';
       var dl=document.createElement('a'); dl.className='hist-btn'; dl.textContent='↓ Pobierz';
       dl.href='/img/'+g.path; dl.download=g.path.split('/').pop(); dl.style.textDecoration='none';
-      actions.appendChild(dl);
+      var del=document.createElement('button'); del.className='hist-btn del'; del.textContent='✕ Usuń';
+      (function(gid,itm){ del.onclick=function(){ deleteVidHist(gid,itm); }; })(g.id,item);
+      actions.appendChild(dl); actions.appendChild(del);
       meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
       item.appendChild(thumbs); item.appendChild(meta);
       body.appendChild(item);
@@ -2208,6 +2232,24 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 with db() as con:
                     con.execute('DELETE FROM generations WHERE id=?', (gen_id,))
+            self._json({'ok': True})
+            return
+        if path.startswith('/api/edit-history/'):
+            rec_id = path[18:]
+            if not rec_id:
+                self._json({'ok': False, 'error': 'brak id'}); return
+            with _db_lock:
+                with db() as con:
+                    con.execute('DELETE FROM edits WHERE id=?', (rec_id,))
+            self._json({'ok': True})
+            return
+        if path.startswith('/api/video-history/'):
+            rec_id = path[19:]
+            if not rec_id:
+                self._json({'ok': False, 'error': 'brak id'}); return
+            with _db_lock:
+                with db() as con:
+                    con.execute('DELETE FROM videos WHERE id=?', (rec_id,))
             self._json({'ok': True})
             return
         self.send_error(404)
