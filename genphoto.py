@@ -389,16 +389,38 @@ SYSTEM_PROMPT = (
 )
 
 VIDEO_SYSTEM_PROMPT = (
-    'You are an expert AnimateDiff / Stable Diffusion 1.5 prompt engineer specializing in short video clips.\n'
-    'The user will describe a motion or scene in any language. Generate an optimized SD1.5 prompt for AnimateDiff.\n\n'
+    'You are an expert AnimateDiff / Stable Diffusion 1.5 prompt engineer for short animated clips.\n'
+    'The user describes a motion scene in any language. Generate a prompt optimized for SD1.5 + AnimateDiff.\n\n'
+    'Rules:\n'
+    '- NEVER use: "real person", "skin texture", "RAW photo", portrait or face-specific tags\n'
+    '- Focus on: subject (animal/object/landscape), motion description, environment, mood\n'
+    '- Motion tags: smooth motion, fluid animation, cinematic movement, dynamic, flowing\n'
+    '- Style tags: photorealistic, highly detailed, natural lighting, 8k uhd\n'
+    '- Keep POSITIVE under 20 tags total\n\n'
     'Always answer with exactly two lines:\n'
     'POSITIVE: [comma-separated tags]\n'
     'NEGATIVE: [comma-separated tags]\n\n'
-    'For POSITIVE: describe the subject clearly (animal, object, landscape — NO "real person" or skin tags), '
-    'then motion keywords (walking, jumping, flowing, swaying, smooth motion, cinematic), '
-    'then style (photorealistic, detailed, 8k, natural lighting). Keep it under 80 words.\n\n'
     'For NEGATIVE always include: (worst quality:2), (low quality:2), (blurry:1.3), deformed, '
-    'watermark, text, cartoon, anime, 3d render, static, frozen, jerky motion.\n\n'
+    'watermark, text, cartoon, anime, 3d render, static image, frozen, jerky, flickering, '
+    'morphing faces, mutated.\n\n'
+    'Do not write anything else — just the two lines starting with POSITIVE: and NEGATIVE:'
+)
+
+EDIT_SYSTEM_PROMPT = (
+    'You are an expert Stable Diffusion inpainting / img2img prompt engineer.\n'
+    'The user describes a change they want to make to an existing photo (in any language).\n'
+    'Your job is to generate a prompt that describes ONLY the modified element, not the whole scene.\n\n'
+    'Rules:\n'
+    '- POSITIVE: describe what the changed area should look like — be specific about color, texture, material, shape\n'
+    '  Begin with photorealistic quality tags, then the specific change\n'
+    '  Example: "photorealistic, (red dress:1.4), vibrant red silk fabric, smooth folds, high quality"\n'
+    '- NEGATIVE: list what should NOT appear in that area (old element + standard quality negatives)\n'
+    '  Example: "blue dress, green dress, (worst quality:2), deformed, blurry, cartoon"\n'
+    '- Do NOT describe the background, lighting or other parts of the image — only the changed element\n'
+    '- Keep prompts short and focused (max 15 tags each)\n\n'
+    'Always answer with exactly two lines:\n'
+    'POSITIVE: [comma-separated tags]\n'
+    'NEGATIVE: [comma-separated tags]\n\n'
     'Do not write anything else — just the two lines starting with POSITIVE: and NEGATIVE:'
 )
 
@@ -426,7 +448,7 @@ def ai_prompt(description, mode='photo'):
         }
         model = DEEPSEEK_MODEL
     
-    sys_prompt = VIDEO_SYSTEM_PROMPT if mode == 'video' else SYSTEM_PROMPT
+    sys_prompt = {'video': VIDEO_SYSTEM_PROMPT, 'edit': EDIT_SYSTEM_PROMPT}.get(mode, SYSTEM_PROMPT)
     raw = json.dumps({
         'model': model,
         'messages': [
@@ -1594,7 +1616,7 @@ function genEditAiPrompt() {
   btn.disabled=true; btn.innerHTML='&#8987; AI<br>Prompt';
   fetch('/api/ai-prompt', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({description: desc})
+    body: JSON.stringify({description: desc, mode: 'edit'})
   }).then(function(r){return r.json();}).then(function(d){
     btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
     if(d.ok) {
