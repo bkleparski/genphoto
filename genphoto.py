@@ -11,15 +11,18 @@ import urllib.request, urllib.error
 
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get('GP_PORT', '7862'))
-OUTPUTS_DIR  = Path(os.environ.get('GP_OUTPUTS_DIR', '/home/user/stable-diffusion-webui/outputs'))
+OUTPUTS_DIR  = Path(os.environ.get('GP_OUTPUTS_DIR', '/home/bartek/forge/outputs'))
 FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('/')
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('GP_DEEPSEEK_MODEL', 'deepseek-v4-flash')
-DB_PATH      = Path(os.environ.get('GP_DB_PATH', '/home/user/genphoto.db'))
+AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
+OR_KEY         = os.environ.get('GP_OR_KEY', '')
+OR_MODEL       = os.environ.get('GP_OR_MODEL', 'nousresearch/hermes-4-405b')
+DB_PATH      = Path(os.environ.get('GP_DB_PATH', '/home/bartek/genphoto.db'))
 GP_USERNAME  = os.environ.get('GP_USERNAME', 'admin')
 GP_PW_HASH   = os.environ.get('GP_PASSWORD_HASH', '')
 COOKIE_NAME  = 'gp_sess'
-GALLERY_URL  = os.environ.get('GP_GALLERY_URL', '')
+GALLERY_URL  = os.environ.get('GP_GALLERY_URL', 'https://gallery.ebartnet.pl')
 
 if not GP_PW_HASH:
     raise SystemExit(
@@ -42,6 +45,14 @@ with db() as _c:
         sampler TEXT, scheduler TEXT, steps INTEGER, cfg REAL,
         width INTEGER, height INTEGER, seed INTEGER, batch INTEGER,
         preset TEXT, paths TEXT
+    )''')
+    _c.execute('''CREATE TABLE IF NOT EXISTS edits (
+        id TEXT PRIMARY KEY, ts INTEGER,
+        description TEXT, positive TEXT, negative TEXT,
+        model TEXT, sampler TEXT, scheduler TEXT,
+        steps INTEGER, cfg REAL, denoising REAL,
+        width INTEGER, height INTEGER, seed INTEGER,
+        paths TEXT, source_path TEXT
     )''')
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -179,6 +190,64 @@ def forge_generate_thread(params, jid):
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
+def forge_edit_thread(params, jid):
+    try:
+        job_set(jid, status='generating')
+        title = resolve_model(params['model'])
+        mask  = params.get('mask_b64') or None
+        data  = forge_post('/sdapi/v1/img2img', {
+            'init_images':        [params['image_b64']],
+            'mask':               mask,
+            'denoising_strength': float(params.get('denoising', 0.5)),
+            'mask_blur':          4,
+            'inpainting_fill':    1 if mask else 0,
+            'prompt':             params['positive'],
+            'negative_prompt':    params['negative'],
+            'sampler_name':       params['sampler'],
+            'scheduler':          params.get('scheduler', 'Karras'),
+            'steps':              int(params['steps']),
+            'cfg_scale':          float(params['cfg']),
+            'width':              int(params['width']),
+            'height':             int(params['height']),
+            'seed':               int(params.get('seed', -1)),
+            'batch_size':         1,
+            'n_iter':             1,
+            'override_settings':  {'sd_model_checkpoint': title},
+            'override_settings_restore_afterwards': True,
+            'save_images':        False,
+        })
+        imgs_b64 = data.get('images', [])
+        info     = json.loads(data.get('info', '{}'))
+        seed     = info.get('seed', -1)
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto_edits' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        paths = []
+        for i, b64 in enumerate(imgs_b64):
+            name = f'gpe_{ts}_{i:02d}_s{seed}.png'
+            (out_dir / name).write_bytes(base64.b64decode(b64))
+            paths.append(f'genphoto_edits/{today}/{name}')
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO edits VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description', ''),
+                     params['positive'], params['negative'], params['model'],
+                     params['sampler'], params.get('scheduler', 'Karras'),
+                     int(params['steps']), float(params['cfg']),
+                     float(params.get('denoising', 0.5)),
+                     int(params['width']), int(params['height']),
+                     seed, json.dumps(paths),
+                     params.get('source_path', ''))
+                )
+        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
 # ── DeepSeek AI Prompter ──────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     'You are an expert Stable Diffusion prompt engineer specializing in photorealistic images.\n'
@@ -195,11 +264,32 @@ SYSTEM_PROMPT = (
     'Do not write anything else — just the two lines starting with POSITIVE: and NEGATIVE:'
 )
 
-def deepseek_prompt(description):
-    if not DEEPSEEK_KEY:
-        raise RuntimeError('GP_DEEPSEEK_KEY not set')
+def ai_prompt(description):
+    provider = AI_PROVIDER
+    
+    if provider == 'openrouter':
+        if not OR_KEY:
+            raise RuntimeError('GP_OR_KEY not set')
+        url = 'https://openrouter.ai/api/v1/chat/completions'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {OR_KEY}',
+            'HTTP-Referer': 'https://ebartnet.pl',
+            'X-Title': 'GenPhoto'
+        }
+        model = OR_MODEL
+    else:
+        if not DEEPSEEK_KEY:
+            raise RuntimeError('GP_DEEPSEEK_KEY not set')
+        url = 'https://api.deepseek.com/chat/completions'
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {DEEPSEEK_KEY}',
+        }
+        model = DEEPSEEK_MODEL
+    
     raw = json.dumps({
-        'model': DEEPSEEK_MODEL,
+        'model': model,
         'messages': [
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user',   'content': description},
@@ -207,22 +297,15 @@ def deepseek_prompt(description):
         'temperature': 0.6,
         'max_tokens': 500,
     }).encode()
-    req = urllib.request.Request(
-        'https://api.deepseek.com/chat/completions', data=raw,
-        headers={
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {DEEPSEEK_KEY}',
-        }, method='POST'
-    )
+    req = urllib.request.Request(url, data=raw, headers=headers, method='POST')
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read())
     msg  = data['choices'][0]['message']
     text = (msg.get('content') or '').strip()
     if not text:
-        # reasoning models put output in reasoning_content
         text = (msg.get('reasoning_content') or '').strip()
     if not text:
-        raise RuntimeError(f'DeepSeek zwrócił pustą odpowiedź: {list(msg.keys())}')
+        raise RuntimeError(f'AI returned empty response: {list(msg.keys())}')
     pos = neg = ''
     for line in text.splitlines():
         l = line.strip()
@@ -231,8 +314,7 @@ def deepseek_prompt(description):
         elif l.upper().startswith('NEGATIVE:'):
             neg = l[9:].strip().lstrip(':').strip()
     if not pos and not neg:
-        # model nie odpowiedział w formacie POSITIVE:/NEGATIVE: — zwróć surowy tekst
-        raise RuntimeError(f'Nieprawidłowy format odpowiedzi DeepSeek: {text[:200]}')
+        raise RuntimeError(f'Invalid response format: {text[:200]}')
     return pos, neg
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -392,6 +474,36 @@ select{resize:none;cursor:pointer}
 #toast.show{transform:translateX(-50%) translateY(0)}
 #toast.ok{border-color:#22c55e;color:#86efac}
 #toast.err{border-color:#ef4444;color:#fca5a5}
+
+/* View tabs */
+.view-tabs{display:flex;gap:4px;margin:0 10px;flex-shrink:0}
+.view-tab-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 14px;border-radius:20px;font-size:.8rem;cursor:pointer;transition:all .2s;white-space:nowrap}
+.view-tab-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
+.view-tab-btn:hover{border-color:#60a5fa;color:#e2e8f0}
+
+/* Edit view layout */
+.edit-layout{max-width:1200px;margin:0 auto;padding:24px 20px;display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:780px){.edit-layout{grid-template-columns:1fr}}
+.edit-canvas-wrap{position:relative;display:block;max-width:100%}
+.edit-canvas-wrap img{display:block;max-width:100%;border-radius:8px}
+#mask-canvas{position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px;cursor:crosshair;opacity:.55;pointer-events:auto}
+.upload-area{border:2px dashed #334155;border-radius:12px;padding:40px 20px;text-align:center;color:#64748b;cursor:pointer;transition:border .2s;margin-bottom:14px}
+.upload-area:hover,.upload-area.drag{border-color:#3b82f6;color:#93c5fd}
+.mask-toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.mask-btn{background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:5px 11px;border-radius:6px;font-size:.76rem;cursor:pointer;transition:all .2s}
+.mask-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+.mask-btn:hover{border-color:#475569;color:#e2e8f0}
+.denoising-wrap input[type=range]{width:100%;margin:6px 0;accent-color:#3b82f6}
+.denoising-labels{display:flex;justify-content:space-between;font-size:.7rem;color:#475569}
+.edit-btn{width:100%;background:linear-gradient(135deg,#059669,#3b82f6);border:none;color:#fff;padding:13px;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer;margin-top:16px;transition:opacity .2s;letter-spacing:.02em}
+.edit-btn:hover{opacity:.9}
+.edit-btn:disabled{opacity:.5;cursor:not-allowed}
+.edit-hist-wrap{max-width:1200px;margin:0 auto;padding:0 20px 24px}
+
+/* Edit result wrappers */
+.result-wrap{position:relative;display:inline-block;width:100%}
+.result-overlay-btn{position:absolute;bottom:5px;left:4px;right:4px;background:rgba(15,23,42,.88);border:1px solid #334155;color:#94a3b8;padding:4px 6px;border-radius:6px;font-size:.7rem;cursor:pointer;text-align:center;opacity:0;transition:opacity .15s;pointer-events:none}
+.result-wrap:hover .result-overlay-btn{opacity:1;pointer-events:auto}
 </style>
 </head>
 <body>
@@ -401,12 +513,17 @@ select{resize:none;cursor:pointer}
   <div class="preset-tabs" id="preset-tabs">
     __PRESET_TABS__
   </div>
+  <div class="view-tabs">
+    <button class="view-tab-btn active" id="tab-gen" onclick="switchView(\'generate\')">&#127912; Generuj</button>
+    <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
+  </div>
   <div class="hdr-links">
     <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
     <a href="/logout" class="hdr-btn">&#10155;</a>
   </div>
 </header>
 
+<div id="view-generate">
 <main>
 
 <!-- ── Form ── -->
@@ -517,6 +634,147 @@ select{resize:none;cursor:pointer}
 </div>
 
 </main>
+</div><!-- /view-generate -->
+
+<!-- ── Edit View ── -->
+<div id="view-edit" style="display:none">
+<div class="edit-layout">
+
+  <!-- Lewa kolumna: upload + canvas -->
+  <div class="panel">
+    <div class="panel-title">&#128247; Zdjęcie do edycji</div>
+    <div id="upload-area" class="upload-area"
+         onclick="document.getElementById(\'edit-file-in\').click()"
+         ondragover="event.preventDefault();this.classList.add(\'drag\')"
+         ondragleave="this.classList.remove(\'drag\')"
+         ondrop="handleEditDrop(event)">
+      <div style="font-size:2rem">&#128247;</div>
+      <div style="margin-top:8px;font-size:.85rem">Kliknij lub przeciągnij zdjęcie</div>
+      <div style="font-size:.75rem;color:#475569;margin-top:4px">PNG, JPG, WEBP</div>
+    </div>
+    <input type="file" id="edit-file-in" accept="image/*" style="display:none" onchange="handleEditFile(this.files[0])">
+
+    <div id="edit-canvas-wrap" class="edit-canvas-wrap" style="display:none">
+      <img id="edit-src-img" src="" alt="" style="display:block;max-width:100%;border-radius:8px">
+      <canvas id="mask-canvas"></canvas>
+    </div>
+
+    <div id="mask-toolbar" class="mask-toolbar" style="display:none">
+      <button class="mask-btn active" id="btn-paint" onclick="setEditMode(\'paint\')">&#128396; Maluj</button>
+      <button class="mask-btn" id="btn-erase" onclick="setEditMode(\'erase\')">&#9676; Gumka</button>
+      <button class="mask-btn" onclick="clearMask()">&#10006; Wyczyść</button>
+      <span style="color:#64748b;font-size:.75rem;margin-left:8px">Pędzel:</span>
+      <input type="range" id="brush-size" min="5" max="80" value="20" style="width:80px;accent-color:#3b82f6" oninput="document.getElementById(\'brush-sz-lbl\').textContent=this.value+\'px\'">
+      <span id="brush-sz-lbl" style="font-size:.75rem;color:#94a3b8;min-width:32px">20px</span>
+    </div>
+    <div id="mask-hint" style="display:none;font-size:.72rem;color:#475569;margin-top:6px">
+      Zamaluj obszar do edycji — lub pozostaw pusty, by edytować całe zdjęcie
+    </div>
+  </div>
+
+  <!-- Prawa kolumna: prompt + parametry -->
+  <div class="panel">
+    <div class="panel-title">&#128221; Opis zmiany &amp; Prompt</div>
+
+    <div class="field">
+      <label>Opisz co chcesz zmienić (po polsku)</label>
+      <div class="ai-row">
+        <textarea id="edit-desc-ta" placeholder="np. zmień kolor sukienki na czerwony, dodaj okulary..."></textarea>
+        <button class="ai-btn" id="edit-ai-btn" onclick="genEditAiPrompt()">&#10024; AI<br>Prompt</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Positive prompt</label>
+      <textarea id="edit-positive-ta" style="height:80px;font-size:.82rem;color:#bfdbfe" placeholder="Co ma być na zdjęciu..."></textarea>
+    </div>
+    <div class="field">
+      <label>Negative prompt</label>
+      <textarea id="edit-negative-ta" style="height:50px;font-size:.78rem;color:#fca5a5"></textarea>
+    </div>
+
+    <div class="field denoising-wrap">
+      <label>Inwazyjność edycji</label>
+      <input type="range" id="denoising-sl" min="0.1" max="1.0" step="0.05" value="0.5" oninput="updateDenoisingLabel()">
+      <div class="denoising-labels">
+        <span>Subtelna korekta</span>
+        <span id="denoising-val" style="color:#93c5fd;font-weight:600">0.50</span>
+        <span>Silna przeróbka</span>
+      </div>
+    </div>
+
+    <div class="adv-toggle" id="edit-adv-toggle" onclick="toggleEditAdv()">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="2,4 7,10 12,4"/></svg>
+      Parametry generowania
+    </div>
+    <div id="edit-adv-section" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid #334155">
+      <div class="field">
+        <label>Model</label>
+        <select id="edit-model-sel">__EDIT_MODEL_OPTIONS__</select>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Sampler</label>
+          <select id="edit-sampler-sel">
+            <option>DPM++ SDE</option><option>DPM++ 2M SDE</option><option>Euler a</option><option>Euler</option>
+          </select>
+        </div>
+        <div class="field"><label>Scheduler</label>
+          <select id="edit-sched-sel">
+            <option>Karras</option><option>Exponential</option><option>Simple</option>
+          </select>
+        </div>
+      </div>
+      <div class="row3">
+        <div class="field"><label>Steps</label><input type="number" id="edit-steps-in" value="25" min="5" max="80"></div>
+        <div class="field"><label>CFG Scale</label><input type="number" id="edit-cfg-in" value="7" min="1" max="20" step="0.5"></div>
+        <div class="field"><label>Seed</label><input type="number" id="edit-seed-in" value="-1"></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>Szerokość</label><input type="number" id="edit-w-in" value="512" step="8" min="256" max="2048"></div>
+        <div class="field"><label>Wysokość</label><input type="number" id="edit-h-in" value="512" step="8" min="256" max="2048"></div>
+      </div>
+    </div>
+
+    <button class="edit-btn" id="edit-btn" onclick="startEdit()">&#9999;&#65039; EDYTUJ ZDJĘCIE</button>
+
+    <div id="edit-progress-wrap" style="display:none;margin-top:16px">
+      <div class="progress-label"><span id="edit-prog-label">Edytowanie...</span><span id="edit-prog-pct"></span></div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="edit-prog-fill"></div></div>
+    </div>
+    <div id="edit-img-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:12px"></div>
+    <div id="edit-seed-info" style="font-size:.72rem;color:#475569;margin-top:8px"></div>
+
+    <!-- Porównanie przed/po -->
+    <div id="edit-comparison" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid #1e3a5f">
+      <div style="font-size:.72rem;color:#64748b;text-align:center;margin-bottom:8px">&#128247; Porównanie</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div>
+          <div style="font-size:.7rem;color:#475569;margin-bottom:3px;text-align:center">Oryginał</div>
+          <img id="edit-before-img" style="width:100%;border-radius:6px;display:block" src="" alt="">
+        </div>
+        <div>
+          <div style="font-size:.7rem;color:#475569;margin-bottom:3px;text-align:center">Po edycji</div>
+          <img id="edit-after-img" style="width:100%;border-radius:6px;display:block;cursor:pointer" src="" alt="">
+          <button id="edit-after-edit-btn" class="hist-btn" style="margin-top:5px;width:100%;text-align:center;font-size:.72rem">&#8635; Edytuj dalej</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /edit-layout -->
+
+<!-- Historia edycji -->
+<div class="edit-hist-wrap">
+<div id="edit-history-section" class="panel" style="margin-top:0">
+  <div class="hist-header" onclick="toggleEditHist()">
+    <h2>&#128337; Historia edycji <span id="edit-hist-count" style="color:#475569;font-weight:400"></span></h2>
+    <svg id="edit-hist-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#64748b" stroke-width="2"><polyline points="3,5 8,11 13,5"/></svg>
+  </div>
+  <div id="edit-hist-body" style="display:none;flex-direction:column;gap:10px"></div>
+</div>
+</div>
+
+</div><!-- /view-edit -->
 
 <!-- ── Lightbox ── -->
 <div id="lb">
@@ -525,6 +783,7 @@ select{resize:none;cursor:pointer}
   <div id="lb-nav">
     <button onclick="navLb(-1)">&#8592; Poprzednie</button>
     <button id="lb-dl" onclick="dlLb()">&#8595; Pobierz</button>
+    <button onclick="editFromLb()" style="background:#059669;border-color:#059669;color:#fff">&#9999;&#65039; Edytuj</button>
     <button onclick="navLb(1)">Następne &#8594;</button>
   </div>
 </div>
@@ -654,12 +913,13 @@ function startGenerate() {
 
 function pollJob(jid, tick) {
   fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
-    var pct = Math.min(10 + tick*7, 90);
-    document.getElementById('prog-fill').style.width = pct+'%';
     if(d.status === 'done') {
+      stopForgeProgress();
       document.getElementById('prog-fill').style.width='100%';
+      document.getElementById('prog-pct').textContent='';
       setTimeout(function(){showProgress(false); showImages(d.images, d.seed); resetBtn(); loadHistory();}, 400);
     } else if(d.status === 'error') {
+      stopForgeProgress();
       showProgress(false); resetBtn(); toast('Błąd: '+d.error, 'err');
     } else {
       _pollTimer = setTimeout(function(){pollJob(jid, tick+1);}, 2000);
@@ -674,6 +934,11 @@ function showProgress(on) {
   if(on) {
     document.getElementById('prog-fill').style.width='5%';
     document.getElementById('prog-label').textContent='Generowanie...';
+    document.getElementById('prog-pct').textContent='';
+    startForgeProgress('prog-fill', 'prog-pct');
+  } else {
+    stopForgeProgress();
+    document.getElementById('prog-pct').textContent='';
   }
 }
 
@@ -751,10 +1016,13 @@ function loadHistory() {
       var btn = document.createElement('button'); btn.className='hist-btn';
       btn.textContent='↺ Powtórz';
       btn.onclick=(function(gen){return function(){repeatGen(gen);};})(g);
+      var editBtn = document.createElement('button'); editBtn.className='hist-btn';
+      editBtn.textContent='✏ Edytuj';
+      editBtn.onclick=(function(ps){return function(){ if(ps.length) openInEditor('/img/'+encodeURI(ps[0])); };})(paths);
       var delBtn = document.createElement('button'); delBtn.className='hist-btn del';
       delBtn.textContent='🗑 Usuń';
       delBtn.onclick=(function(id,el){return function(){deleteHist(id,el);};})(g.id,item);
-      actions.appendChild(btn); actions.appendChild(delBtn);
+      actions.appendChild(btn); actions.appendChild(editBtn); actions.appendChild(delBtn);
 
       meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
       item.appendChild(thumbsDiv); item.appendChild(meta);
@@ -797,6 +1065,25 @@ function repeatGen(g) {
   toast('Parametry załadowane', 'ok');
 }
 
+/* ── Forge progress ── */
+var _fpTimer = null;
+function startForgeProgress(fillId, pctId) {
+  clearTimeout(_fpTimer);
+  (function tick(){
+    fetch('/api/forge-progress').then(function(r){return r.json();}).then(function(d){
+      var pct = Math.round(d.progress * 100);
+      if(pct > 2) {
+        var f = document.getElementById(fillId);
+        if(f) f.style.width = pct + '%';
+        var p = pctId ? document.getElementById(pctId) : null;
+        if(p) { p.textContent = pct + '%' + (d.eta > 0 ? ' · ETA ' + d.eta + 's' : ''); }
+      }
+      _fpTimer = setTimeout(tick, 2500);
+    }).catch(function(){ _fpTimer = setTimeout(tick, 5000); });
+  })();
+}
+function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
+
 /* ── Toast ── */
 function toast(msg,type){ var t=document.getElementById('toast'); t.textContent=msg; t.className='show '+(type||''); clearTimeout(t._t); t._t=setTimeout(function(){t.className='';},3000); }
 
@@ -808,6 +1095,317 @@ document.addEventListener('keydown',function(e){
     if(e.key==='ArrowRight') navLb(1);
   }
 });
+
+/* ── Edit View ── */
+var _editImgB64 = null;
+var _editSrcDataUrl = null;
+var _editLastResult = null;
+var _editMode = 'paint';
+var _editDrawing = false;
+var _editHistOpen = false;
+
+function switchView(v) {
+  document.getElementById('view-generate').style.display = v==='generate' ? '' : 'none';
+  document.getElementById('view-edit').style.display     = v==='edit'     ? '' : 'none';
+  document.getElementById('tab-gen').classList.toggle('active', v==='generate');
+  document.getElementById('tab-edit').classList.toggle('active', v==='edit');
+  if(v==='edit') loadEditHistory();
+}
+
+function handleEditFile(file) {
+  if(!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) { loadEditImage(e.target.result); };
+  reader.readAsDataURL(file);
+}
+
+function handleEditDrop(e) {
+  e.preventDefault();
+  document.getElementById('upload-area').classList.remove('drag');
+  var f = e.dataTransfer.files[0];
+  if(f && f.type.startsWith('image/')) handleEditFile(f);
+}
+
+function loadEditImage(dataUrl) {
+  _editSrcDataUrl = dataUrl;
+  document.getElementById('edit-comparison').style.display='none';
+  var img = document.getElementById('edit-src-img');
+  img.onload = function() {
+    var canvas = document.getElementById('mask-canvas');
+    canvas.width  = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    document.getElementById('edit-w-in').value = img.naturalWidth;
+    document.getElementById('edit-h-in').value = img.naturalHeight;
+    clearMask();
+    initMaskCanvas();
+  };
+  img.src = dataUrl;
+  _editImgB64 = dataUrl.indexOf(',') > -1 ? dataUrl.split(',')[1] : dataUrl;
+  document.getElementById('upload-area').style.display = 'none';
+  document.getElementById('edit-canvas-wrap').style.display = '';
+  document.getElementById('mask-toolbar').style.display = '';
+  document.getElementById('mask-hint').style.display = '';
+}
+
+function initMaskCanvas() {
+  var canvas = document.getElementById('mask-canvas');
+  var getPos = function(e, isTouch) {
+    var rect = canvas.getBoundingClientRect();
+    var scaleX = canvas.width  / rect.width;
+    var scaleY = canvas.height / rect.height;
+    var src = isTouch ? e.touches[0] : e;
+    return {x:(src.clientX-rect.left)*scaleX, y:(src.clientY-rect.top)*scaleY};
+  };
+  var draw = function(pos) {
+    var ctx = canvas.getContext('2d');
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, parseInt(document.getElementById('brush-size').value)/2, 0, Math.PI*2);
+    ctx.fillStyle = _editMode==='paint' ? 'white' : 'black';
+    ctx.fill();
+  };
+  canvas.onmousedown  = function(e){ _editDrawing=true; draw(getPos(e,false)); e.preventDefault(); };
+  canvas.onmousemove  = function(e){ if(_editDrawing) draw(getPos(e,false)); };
+  canvas.onmouseup    = function(){ _editDrawing=false; };
+  canvas.onmouseleave = function(){ _editDrawing=false; };
+  canvas.ontouchstart = function(e){ _editDrawing=true; draw(getPos(e,true)); e.preventDefault(); };
+  canvas.ontouchmove  = function(e){ if(_editDrawing) draw(getPos(e,true)); e.preventDefault(); };
+  canvas.ontouchend   = function(){ _editDrawing=false; };
+}
+
+function clearMask() {
+  var canvas = document.getElementById('mask-canvas');
+  var ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = 'black';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+
+function setEditMode(mode) {
+  _editMode = mode;
+  document.getElementById('btn-paint').classList.toggle('active', mode==='paint');
+  document.getElementById('btn-erase').classList.toggle('active', mode==='erase');
+}
+
+function isMaskEmpty() {
+  var canvas = document.getElementById('mask-canvas');
+  if(!canvas.width) return true;
+  var d = canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data;
+  for(var i=0;i<d.length;i+=4) if(d[i]>10) return false;
+  return true;
+}
+
+function getMaskB64() {
+  if(isMaskEmpty()) return null;
+  return document.getElementById('mask-canvas').toDataURL('image/png').split(',')[1];
+}
+
+function updateDenoisingLabel() {
+  document.getElementById('denoising-val').textContent =
+    parseFloat(document.getElementById('denoising-sl').value).toFixed(2);
+}
+
+function toggleEditAdv() {
+  var sec = document.getElementById('edit-adv-section');
+  var tog = document.getElementById('edit-adv-toggle');
+  var open = sec.style.display==='none';
+  sec.style.display = open ? '' : 'none';
+  tog.classList.toggle('open', open);
+}
+
+function genEditAiPrompt() {
+  var desc = document.getElementById('edit-desc-ta').value.trim();
+  if(!desc) return toast('Najpierw opisz co chcesz zmienić', 'err');
+  var btn = document.getElementById('edit-ai-btn');
+  btn.disabled=true; btn.innerHTML='&#8987; AI<br>Prompt';
+  fetch('/api/ai-prompt', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({description: desc})
+  }).then(function(r){return r.json();}).then(function(d){
+    btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
+    if(d.ok) {
+      document.getElementById('edit-positive-ta').value = d.positive;
+      document.getElementById('edit-negative-ta').value = d.negative;
+      toast('Prompt wygenerowany!','ok');
+    } else toast('Błąd AI: '+d.error,'err');
+  }).catch(function(){
+    btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
+    toast('Błąd połączenia','err');
+  });
+}
+
+function startEdit() {
+  if(!_editImgB64) return toast('Najpierw wczytaj zdjęcie','err');
+  var pos = document.getElementById('edit-positive-ta').value.trim();
+  if(!pos) return toast('Wpisz positive prompt lub użyj AI Prompt','err');
+  var modelSel = document.getElementById('edit-model-sel');
+  var params = {
+    image_b64:   _editImgB64,
+    mask_b64:    getMaskB64(),
+    description: document.getElementById('edit-desc-ta').value.trim(),
+    positive:    pos,
+    negative:    document.getElementById('edit-negative-ta').value.trim(),
+    model:       modelSel ? modelSel.value : '',
+    sampler:     document.getElementById('edit-sampler-sel').value,
+    scheduler:   document.getElementById('edit-sched-sel').value,
+    steps:       parseInt(document.getElementById('edit-steps-in').value),
+    cfg:         parseFloat(document.getElementById('edit-cfg-in').value),
+    denoising:   parseFloat(document.getElementById('denoising-sl').value),
+    width:       parseInt(document.getElementById('edit-w-in').value),
+    height:      parseInt(document.getElementById('edit-h-in').value),
+    seed:        parseInt(document.getElementById('edit-seed-in').value),
+  };
+  document.getElementById('edit-btn').disabled=true;
+  document.getElementById('edit-btn').textContent='Edytowanie...';
+  document.getElementById('edit-progress-wrap').style.display='block';
+  document.getElementById('edit-prog-fill').style.width='5%';
+  document.getElementById('edit-prog-label').textContent='Edytowanie...';
+  document.getElementById('edit-prog-pct').textContent='';
+  document.getElementById('edit-comparison').style.display='none';
+  startForgeProgress('edit-prog-fill', 'edit-prog-pct');
+  fetch('/api/edit', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(params)
+  }).then(function(r){return r.json();}).then(function(d){
+    if(d.job_id) pollEditJob(d.job_id, 0);
+    else {
+      resetEditBtn();
+      document.getElementById('edit-progress-wrap').style.display='none';
+      toast('Błąd: '+(d.error||'nieznany'), 'err');
+    }
+  }).catch(function(){ resetEditBtn(); toast('Błąd połączenia','err'); });
+}
+
+function pollEditJob(jid, tick) {
+  fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
+    if(d.status==='done') {
+      stopForgeProgress();
+      document.getElementById('edit-prog-fill').style.width='100%';
+      document.getElementById('edit-prog-pct').textContent='';
+      setTimeout(function(){
+        document.getElementById('edit-progress-wrap').style.display='none';
+        showEditImages(d.images, d.seed);
+        resetEditBtn();
+        loadEditHistory();
+      },400);
+    } else if(d.status==='error') {
+      stopForgeProgress();
+      document.getElementById('edit-progress-wrap').style.display='none';
+      resetEditBtn(); toast('Błąd: '+d.error,'err');
+    } else {
+      setTimeout(function(){pollEditJob(jid, tick+1);}, 2000);
+    }
+  }).catch(function(){ setTimeout(function(){pollEditJob(jid, tick+1);}, 3000); });
+}
+
+function showEditImages(paths, seed) {
+  _editLastResult = paths.length ? paths[0] : null;
+
+  /* Sekcja porównania przed/po */
+  var comp = document.getElementById('edit-comparison');
+  if(_editSrcDataUrl && paths.length) {
+    document.getElementById('edit-before-img').src = _editSrcDataUrl;
+    var afterImg = document.getElementById('edit-after-img');
+    afterImg.src = '/img/' + paths[0];
+    afterImg.onclick = (function(p0){return function(){_lbImgs=paths;openLb(0);};})(paths[0]);
+    var afterBtn = document.getElementById('edit-after-edit-btn');
+    afterBtn.onclick = (function(p0){return function(){openInEditor('/img/'+p0);};})(paths[0]);
+    comp.style.display = '';
+  }
+
+  var grid = document.getElementById('edit-img-grid');
+  grid.innerHTML='';
+  _lbImgs = paths;
+  paths.forEach(function(p,i){
+    var wrap=document.createElement('div'); wrap.className='result-wrap';
+    var img=document.createElement('img');
+    img.className='res-img'; img.src='/img/'+p; img.loading='lazy';
+    img.onclick=function(){openLb(i);};
+    var btn=document.createElement('button'); btn.className='result-overlay-btn';
+    btn.textContent='↺ Edytuj dalej';
+    btn.onclick=(function(path){return function(e){e.stopPropagation();openInEditor('/img/'+path);};})(p);
+    wrap.appendChild(img); wrap.appendChild(btn);
+    grid.appendChild(wrap);
+  });
+  document.getElementById('edit-seed-info').textContent = seed>0 ? 'Seed: '+seed : '';
+  toast('Edycja gotowa!','ok');
+}
+
+function resetEditBtn() {
+  var b=document.getElementById('edit-btn');
+  b.disabled=false; b.innerHTML='&#9999;&#65039; EDYTUJ ZDJĘCIE';
+}
+
+function openInEditor(src) {
+  var img = new Image();
+  img.crossOrigin='anonymous';
+  img.onload=function(){
+    var c=document.createElement('canvas');
+    c.width=img.naturalWidth; c.height=img.naturalHeight;
+    c.getContext('2d').drawImage(img,0,0);
+    _editImgB64=c.toDataURL('image/png').split(',')[1];
+    var ei=document.getElementById('edit-src-img');
+    ei.onload=function(){
+      var canvas=document.getElementById('mask-canvas');
+      canvas.width=img.naturalWidth; canvas.height=img.naturalHeight;
+      document.getElementById('edit-w-in').value=img.naturalWidth;
+      document.getElementById('edit-h-in').value=img.naturalHeight;
+      clearMask();
+      initMaskCanvas();
+    };
+    ei.src=src;
+    document.getElementById('upload-area').style.display='none';
+    document.getElementById('edit-canvas-wrap').style.display='';
+    document.getElementById('mask-toolbar').style.display='';
+    document.getElementById('mask-hint').style.display='';
+    switchView('edit');
+  };
+  img.onerror=function(){ toast('Nie można załadować zdjęcia','err'); };
+  img.src=src;
+}
+
+function editFromLb() { closeLb(); openInEditor('/img/'+_lbImgs[_lbIdx]); }
+
+function loadEditHistory() {
+  fetch('/api/edit-history').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('edit-hist-count').textContent = d.length?'('+d.length+')':'';
+    if(!_editHistOpen) return;
+    var body=document.getElementById('edit-hist-body');
+    body.innerHTML='';
+    if(!d.length){
+      var em=document.createElement('div'); em.className='no-hist';
+      em.textContent='Brak historii edycji'; body.appendChild(em); return;
+    }
+    d.forEach(function(g){
+      var paths=JSON.parse(g.paths||'[]');
+      var item=document.createElement('div'); item.className='hist-item';
+      var thumbsDiv=document.createElement('div'); thumbsDiv.className='hist-thumbs';
+      paths.slice(0,4).forEach(function(p,i){
+        var img=document.createElement('img'); img.className='hist-thumb'; img.loading='lazy';
+        img.src='/img/'+encodeURI(p);
+        img.onclick=(function(ps,idx){return function(){openHistLb(ps,idx);};})(paths,i);
+        thumbsDiv.appendChild(img);
+      });
+      var meta=document.createElement('div'); meta.className='hist-meta';
+      var desc=document.createElement('div'); desc.className='hist-desc';
+      desc.textContent=g.description||(g.positive||'').substring(0,60)+'...';
+      var dt=new Date(g.ts*1000).toLocaleString('pl');
+      var tags=document.createElement('div'); tags.className='hist-tags';
+      tags.textContent=[g.model,g.sampler,'denoising: '+g.denoising,g.width+'x'+g.height,dt].join(' · ');
+      meta.appendChild(desc); meta.appendChild(tags);
+      item.appendChild(thumbsDiv); item.appendChild(meta);
+      body.appendChild(item);
+    });
+  });
+}
+
+function toggleEditHist() {
+  _editHistOpen=!_editHistOpen;
+  var body=document.getElementById('edit-hist-body');
+  var arrow=document.getElementById('edit-hist-arrow');
+  body.style.display=_editHistOpen?'flex':'none';
+  arrow.style.transform=_editHistOpen?'rotate(180deg)':'';
+  if(_editHistOpen) loadEditHistory();
+}
 
 /* ── Init ── */
 applyPreset('portrait');
@@ -877,6 +1475,7 @@ class Handler(BaseHTTPRequestHandler):
         return (HTML_TEMPLATE
                 .replace('__PRESET_TABS__', preset_tabs)
                 .replace('__MODEL_OPTIONS__', model_opts)
+                .replace('__EDIT_MODEL_OPTIONS__', model_opts)
                 .replace('__PRESETS_JSON__', presets_json)
                 .replace('__GALLERY_URL__', GALLERY_URL))
 
@@ -943,6 +1542,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json([{'name': m.get('model_name',''), 'title': m.get('title','')} for m in raw])
             return
 
+        if path == '/api/edit-history':
+            with _db_lock:
+                with db() as con:
+                    rows = con.execute(
+                        'SELECT * FROM edits ORDER BY ts DESC LIMIT 50'
+                    ).fetchall()
+            self._json([dict(r) for r in rows])
+            return
+
+        if path == '/api/forge-progress':
+            prog = forge_get('/sdapi/v1/progress') or {}
+            self._json({
+                'progress': round(prog.get('progress', 0), 3),
+                'eta': int(prog.get('eta_relative', 0)),
+            })
+            return
+
         self.send_error(404)
 
     def do_DELETE(self):
@@ -1004,8 +1620,24 @@ class Handler(BaseHTTPRequestHandler):
                 desc = data.get('description', '').strip()
                 if not desc:
                     self._json({'ok': False, 'error': 'Brak opisu'}); return
-                pos, neg = deepseek_prompt(desc)
+                pos, neg = ai_prompt(desc)
                 self._json({'ok': True, 'positive': pos, 'negative': neg})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
+            return
+
+        if self.path == '/api/edit':
+            try:
+                params = json.loads(body)
+                if not params.get('image_b64'):
+                    self._json({'ok': False, 'error': 'Brak image_b64'}); return
+                if not params.get('positive'):
+                    self._json({'ok': False, 'error': 'Brak positive prompt'}); return
+                params['gen_id'] = uuid.uuid4().hex
+                jid = job_create()
+                t = threading.Thread(target=forge_edit_thread, args=(params, jid), daemon=True)
+                t.start()
+                self._json({'ok': True, 'job_id': jid})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
