@@ -322,21 +322,30 @@ def forge_video_thread(params, jid):
             'seed':             int(params.get('seed', -1)),
             'batch_size':       1,
             'n_iter':           1,
-            'override_settings': {'sd_model_checkpoint': title},
+            'override_settings': {
+                'sd_model_checkpoint': title,
+                'sd_vae': 'None',  # wymuś wbudowany VAE SD1.5 — sdxl_vae daje szary obraz
+            },
             'override_settings_restore_afterwards': True,
             'save_images':      True,
             'alwayson_scripts': {'animatediff': {'args': [animatediff_args]}},
         }
 
-        ts_before = time.time()
+        # Ze zdjęcia: CLIP interrogate → wzbogać prompt, potem txt2img
         if params.get('image_b64'):
-            data = forge_post('/sdapi/v1/img2img', {
-                **common,
-                'init_images':        [params['image_b64']],
-                'denoising_strength': float(params.get('denoising', 0.80)),
-            }, timeout=1200)
-        else:
-            data = forge_post('/sdapi/v1/txt2img', common, timeout=1200)
+            try:
+                clip_resp = forge_post('/sdapi/v1/interrogate', {
+                    'image': 'data:image/png;base64,' + params['image_b64'],
+                    'model': 'clip',
+                }, timeout=60)
+                clip_caption = clip_resp.get('caption', '').strip()
+                if clip_caption:
+                    common['prompt'] = clip_caption + ', ' + common['prompt']
+            except Exception:
+                pass  # jeśli CLIP zawiedzie, generuj z samego promptu
+
+        ts_before = time.time()
+        data = forge_post('/sdapi/v1/txt2img', common, timeout=1200)
 
         info = json.loads(data.get('info', '{}'))
         seed = info.get('seed', -1)
