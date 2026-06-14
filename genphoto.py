@@ -486,7 +486,7 @@ select{resize:none;cursor:pointer}
 @media(max-width:780px){.edit-layout{grid-template-columns:1fr}}
 .edit-canvas-wrap{position:relative;display:block;max-width:100%}
 .edit-canvas-wrap img{display:block;max-width:100%;border-radius:8px}
-#mask-canvas{position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px;cursor:crosshair;opacity:.55;pointer-events:auto}
+#mask-canvas{position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px;cursor:crosshair;opacity:.55;pointer-events:auto;touch-action:none;user-select:none}
 .upload-area{border:2px dashed #334155;border-radius:12px;padding:40px 20px;text-align:center;color:#64748b;cursor:pointer;transition:border .2s;margin-bottom:14px}
 .upload-area:hover,.upload-area.drag{border-color:#3b82f6;color:#93c5fd}
 .mask-toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
@@ -504,6 +504,32 @@ select{resize:none;cursor:pointer}
 .result-wrap{position:relative;display:inline-block;width:100%}
 .result-overlay-btn{position:absolute;bottom:5px;left:4px;right:4px;background:rgba(15,23,42,.88);border:1px solid #334155;color:#94a3b8;padding:4px 6px;border-radius:6px;font-size:.7rem;cursor:pointer;text-align:center;opacity:0;transition:opacity .15s;pointer-events:none}
 .result-wrap:hover .result-overlay-btn{opacity:1;pointer-events:auto}
+
+/* ── Mobile responsive ── */
+@media(max-width:640px){
+  header{flex-wrap:wrap;gap:6px;padding:8px 12px}
+  .logo{font-size:.9rem;flex-shrink:0}
+  .preset-tabs{order:20;width:100%;border-top:1px solid #1e3a5f;margin-top:4px;padding-top:6px}
+  .view-tabs{margin:0 2px;flex-shrink:0}
+  .view-tab-btn{padding:4px 10px;font-size:.74rem}
+  .hdr-links{flex-shrink:0}
+  .hdr-btn{padding:4px 9px;font-size:.74rem}
+  main{padding:12px 10px;gap:14px}
+  .edit-layout{padding:12px 10px;gap:14px}
+  .panel{padding:14px 12px}
+  .edit-hist-wrap{padding:0 10px 16px}
+  .row2{grid-template-columns:1fr 1fr}
+  .row3{grid-template-columns:1fr 1fr 1fr}
+  #lb-img{max-width:96vw;max-height:78vh}
+  #lb-nav{gap:8px;flex-wrap:wrap;justify-content:center}
+  #lb-nav button{padding:6px 12px;font-size:.8rem}
+  #lb-close{font-size:1.3rem;top:10px;right:12px}
+  .mask-toolbar{gap:5px}
+  .mask-btn{padding:6px 10px;font-size:.76rem}
+  #params-bar{gap:5px;padding:8px 10px}
+  .pb-item{font-size:.68rem}
+  .pb-item strong{font-size:.74rem}
+}
 </style>
 </head>
 <body>
@@ -691,6 +717,19 @@ select{resize:none;cursor:pointer}
     <div class="field">
       <label>Negative prompt</label>
       <textarea id="edit-negative-ta" style="height:50px;font-size:.78rem;color:#fca5a5"></textarea>
+    </div>
+
+    <div class="field">
+      <label>Skaluj zdjęcie przed wysłaniem do AI</label>
+      <select id="scale-sel" onchange="onScaleChange()">
+        <option value="0">Oryginał (wolno przy dużych zdjęciach)</option>
+        <option value="2048">Max 2048px — wysoka jakość</option>
+        <option value="1536" selected>Max 1536px — zalecane</option>
+        <option value="1024">Max 1024px — szybkie</option>
+        <option value="768">Max 768px — bardzo szybkie</option>
+        <option value="512">Max 512px — najszybsze</option>
+      </select>
+      <div id="scale-info" style="font-size:.7rem;color:#475569;margin-top:4px"></div>
     </div>
 
     <div class="field denoising-wrap">
@@ -1098,6 +1137,7 @@ document.addEventListener('keydown',function(e){
 
 /* ── Edit View ── */
 var _editImgB64 = null;
+var _editOrigDataUrl = null;
 var _editSrcDataUrl = null;
 var _editLastResult = null;
 var _editMode = 'paint';
@@ -1115,8 +1155,48 @@ function switchView(v) {
 function handleEditFile(file) {
   if(!file) return;
   var reader = new FileReader();
-  reader.onload = function(e) { loadEditImage(e.target.result); };
+  reader.onload = function(e) {
+    _editOrigDataUrl = e.target.result;
+    _editSrcDataUrl  = e.target.result;
+    applyScaleAndLoad(e.target.result);
+  };
   reader.readAsDataURL(file);
+}
+
+function applyScaleAndLoad(origDataUrl) {
+  var maxPx = parseInt(document.getElementById('scale-sel').value) || 0;
+  if(!maxPx) {
+    loadEditImage(origDataUrl);
+  } else {
+    resizeImageForEdit(origDataUrl, maxPx, loadEditImage);
+  }
+}
+
+function resizeImageForEdit(dataUrl, maxPx, callback) {
+  var img = new Image();
+  img.onload = function() {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    if(w <= maxPx && h <= maxPx) { callback(dataUrl); return; }
+    var scale = maxPx / Math.max(w, h);
+    var nw = Math.round(w * scale), nh = Math.round(h * scale);
+    var c = document.createElement('canvas');
+    c.width = nw; c.height = nh;
+    c.getContext('2d').drawImage(img, 0, 0, nw, nh);
+    callback(c.toDataURL('image/jpeg', 0.93));
+  };
+  img.src = dataUrl;
+}
+
+function onScaleChange() {
+  if(!_editOrigDataUrl) return;
+  applyScaleAndLoad(_editOrigDataUrl);
+}
+
+function updateScaleInfo() {
+  var w = parseInt(document.getElementById('edit-w-in').value) || 0;
+  var h = parseInt(document.getElementById('edit-h-in').value) || 0;
+  var el = document.getElementById('scale-info');
+  if(el && w && h) el.textContent = 'Do AI: ' + w + ' × ' + h + 'px';
 }
 
 function handleEditDrop(e) {
@@ -1127,7 +1207,6 @@ function handleEditDrop(e) {
 }
 
 function loadEditImage(dataUrl) {
-  _editSrcDataUrl = dataUrl;
   document.getElementById('edit-comparison').style.display='none';
   var img = document.getElementById('edit-src-img');
   img.onload = function() {
@@ -1138,6 +1217,7 @@ function loadEditImage(dataUrl) {
     document.getElementById('edit-h-in').value = img.naturalHeight;
     clearMask();
     initMaskCanvas();
+    updateScaleInfo();
   };
   img.src = dataUrl;
   _editImgB64 = dataUrl.indexOf(',') > -1 ? dataUrl.split(',')[1] : dataUrl;
@@ -1342,22 +1422,11 @@ function openInEditor(src) {
     var c=document.createElement('canvas');
     c.width=img.naturalWidth; c.height=img.naturalHeight;
     c.getContext('2d').drawImage(img,0,0);
-    _editImgB64=c.toDataURL('image/png').split(',')[1];
-    var ei=document.getElementById('edit-src-img');
-    ei.onload=function(){
-      var canvas=document.getElementById('mask-canvas');
-      canvas.width=img.naturalWidth; canvas.height=img.naturalHeight;
-      document.getElementById('edit-w-in').value=img.naturalWidth;
-      document.getElementById('edit-h-in').value=img.naturalHeight;
-      clearMask();
-      initMaskCanvas();
-    };
-    ei.src=src;
-    document.getElementById('upload-area').style.display='none';
-    document.getElementById('edit-canvas-wrap').style.display='';
-    document.getElementById('mask-toolbar').style.display='';
-    document.getElementById('mask-hint').style.display='';
+    var dataUrl = c.toDataURL('image/jpeg', 0.95);
+    _editOrigDataUrl = dataUrl;
+    _editSrcDataUrl  = dataUrl;
     switchView('edit');
+    applyScaleAndLoad(dataUrl);
   };
   img.onerror=function(){ toast('Nie można załadować zdjęcia','err'); };
   img.src=src;
@@ -1410,6 +1479,14 @@ function toggleEditHist() {
 /* ── Init ── */
 applyPreset('portrait');
 loadHistory();
+
+/* Auto-detect mobile — większy pędzel i bezpieczna skala */
+if('ontouchstart' in window || window.innerWidth < 640) {
+  var bsEl = document.getElementById('brush-size');
+  if(bsEl) { bsEl.value = 40; document.getElementById('brush-sz-lbl').textContent = '40px'; }
+  var scEl = document.getElementById('scale-sel');
+  if(scEl) scEl.value = '1024';
+}
 </script>
 </body>
 </html>'''
