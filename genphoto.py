@@ -388,7 +388,21 @@ SYSTEM_PROMPT = (
     'Do not write anything else — just the two lines starting with POSITIVE: and NEGATIVE:'
 )
 
-def ai_prompt(description):
+VIDEO_SYSTEM_PROMPT = (
+    'You are an expert AnimateDiff / Stable Diffusion 1.5 prompt engineer specializing in short video clips.\n'
+    'The user will describe a motion or scene in any language. Generate an optimized SD1.5 prompt for AnimateDiff.\n\n'
+    'Always answer with exactly two lines:\n'
+    'POSITIVE: [comma-separated tags]\n'
+    'NEGATIVE: [comma-separated tags]\n\n'
+    'For POSITIVE: describe the subject clearly (animal, object, landscape — NO "real person" or skin tags), '
+    'then motion keywords (walking, jumping, flowing, swaying, smooth motion, cinematic), '
+    'then style (photorealistic, detailed, 8k, natural lighting). Keep it under 80 words.\n\n'
+    'For NEGATIVE always include: (worst quality:2), (low quality:2), (blurry:1.3), deformed, '
+    'watermark, text, cartoon, anime, 3d render, static, frozen, jerky motion.\n\n'
+    'Do not write anything else — just the two lines starting with POSITIVE: and NEGATIVE:'
+)
+
+def ai_prompt(description, mode='photo'):
     provider = AI_PROVIDER
     
     if provider == 'openrouter':
@@ -412,10 +426,11 @@ def ai_prompt(description):
         }
         model = DEEPSEEK_MODEL
     
+    sys_prompt = VIDEO_SYSTEM_PROMPT if mode == 'video' else SYSTEM_PROMPT
     raw = json.dumps({
         'model': model,
         'messages': [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'system', 'content': sys_prompt},
             {'role': 'user',   'content': description},
         ],
         'temperature': 0.6,
@@ -980,11 +995,11 @@ select{resize:none;cursor:pointer}
       </div>
       <div class="field" style="margin-top:12px">
         <label>Siła animacji</label>
-        <input type="range" id="vid-denoise-sl" min="0.5" max="1.0" step="0.05" value="0.8"
+        <input type="range" id="vid-denoise-sl" min="0.5" max="1.0" step="0.05" value="0.6"
                oninput="document.getElementById(\'vid-denoise-val\').textContent=parseFloat(this.value).toFixed(2)" style="width:100%;accent-color:#7c3aed">
         <div class="denoising-labels">
           <span>Subtelna</span>
-          <span id="vid-denoise-val" style="color:#c4b5fd;font-weight:600">0.80</span>
+          <span id="vid-denoise-val" style="color:#c4b5fd;font-weight:600">0.60</span>
           <span>Dynamiczna</span>
         </div>
       </div>
@@ -1836,7 +1851,7 @@ function genVidAiPrompt() {
   btn.disabled=true; btn.innerHTML='&#8987; AI<br>Prompt';
   fetch('/api/ai-prompt', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({description: desc})
+    body: JSON.stringify({description: desc, mode: 'video'})
   }).then(function(r){return r.json();}).then(function(d){
     btn.disabled=false; btn.innerHTML='&#10024; AI<br>Prompt';
     if(d.ok) {
@@ -2217,9 +2232,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 desc = data.get('description', '').strip()
+                mode = data.get('mode', 'photo')
                 if not desc:
                     self._json({'ok': False, 'error': 'Brak opisu'}); return
-                pos, neg = ai_prompt(desc)
+                pos, neg = ai_prompt(desc, mode=mode)
                 self._json({'ok': True, 'positive': pos, 'negative': neg})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
