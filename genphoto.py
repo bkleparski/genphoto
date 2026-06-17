@@ -476,7 +476,7 @@ VISION_STYLE_HINTS = {
     'portrait': 'RAW photo, portrait, photorealistic, professional studio lighting, 8k uhd',
 }
 
-INSTANTID_IP_MODEL   = 'ip-adapter-instantid-sdxl'
+INSTANTID_IP_MODEL   = 'ip-adapter-instantid-sdxl [eb2d3ec0]'
 INSTANTID_CN_MODEL   = 'instantid-controlnet [c5c25a50]'
 
 def forge_instantid_thread(params, jid):
@@ -507,7 +507,7 @@ def forge_instantid_thread(params, jid):
                             'module':       'InsightFace (InstantID)',
                             'model':        INSTANTID_IP_MODEL,
                             'weight':       float(params.get('face_strength', 0.8)),
-                            'control_mode': 0,
+                            'control_mode': 2,
                             'resize_mode':  1,
                         },
                         {
@@ -516,7 +516,7 @@ def forge_instantid_thread(params, jid):
                             'module':       'instant_id_face_keypoints',
                             'model':        INSTANTID_CN_MODEL,
                             'weight':       float(params.get('pose_strength', 0.5)),
-                            'control_mode': 0,
+                            'control_mode': 2,
                             'resize_mode':  1,
                         },
                     ]
@@ -1417,7 +1417,7 @@ select{resize:none;cursor:pointer}
 
   <div class="field">
     <label>Negative prompt</label>
-    <textarea id="portrait-negative" rows="2" placeholder="ugly, deformed, blurry, low quality" style="width:100%;background:var(--inp);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--fg);font-size:.9rem;resize:vertical">ugly, deformed, blurry, low quality, watermark</textarea>
+    <textarea id="portrait-negative" rows="2" placeholder="ugly, deformed, blurry, low quality" style="width:100%;background:var(--inp);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--fg);font-size:.9rem;resize:vertical">ugly, deformed, blurry, low quality, watermark, hair, beard, stubble, facial hair, added hair, different hairstyle</textarea>
   </div>
 
   <div class="field">
@@ -1481,6 +1481,7 @@ select{resize:none;cursor:pointer}
   <div id="portrait-progress-wrap" style="display:none;margin-top:10px">
     <div class="progress-label"><span id="portrait-prog-label">Generowanie portretu...</span><span id="portrait-prog-pct"></span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="portrait-prog-fill"></div></div>
+    <div id="portrait-prog-detail" style="font-size:.75rem;color:var(--muted);margin-top:4px;min-height:1em"></div>
   </div>
 
 </div><!-- /left-panel -->
@@ -1584,6 +1585,7 @@ select{resize:none;cursor:pointer}
   <div id="pose-progress-wrap" style="display:none;margin-top:10px">
     <div class="progress-label"><span>Generowanie z pozą...</span><span id="pose-prog-pct"></span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="pose-prog-fill"></div></div>
+    <div id="pose-prog-detail" style="font-size:.75rem;color:var(--muted);margin-top:4px;min-height:1em"></div>
   </div>
 </div>
 
@@ -2027,18 +2029,52 @@ function repeatGen(g) {
 
 /* ── Forge progress ── */
 var _fpTimer = null;
-function startForgeProgress(fillId, pctId) {
+function _translateForgeMsg(msg) {
+  if (!msg) return '';
+  var m = msg.toLowerCase();
+  if (m.includes('insightface') || m.includes('instantid')) return 'Wykrywanie twarzy (InsightFace)...';
+  if (m.includes('ipadapter') || m.includes('ip-adapter') || m.includes('ip_adapter') || m.includes('ipadapterpatcher')) return 'Ładowanie IP-Adapter (tożsamość twarzy)...';
+  if (m.includes('controlnetpatcher') || m.includes('controlnet')) return 'Ładowanie ControlNet (keypoints twarzy)...';
+  if (m.includes('autoencoder') || m.includes('vae')) return 'Dekodowanie obrazu (VAE)...';
+  if (m.includes('textencode') || m.includes('text encoder') || m.includes('encoder')) return 'Ładowanie encodera tekstu...';
+  if (m.includes('loading model') || m.includes('load model') || m.includes('kmodel') || m.includes('k-model')) return 'Ładowanie modelu SD do GPU...';
+  if (m.includes('unload')) return 'Zwalnianie pamięci GPU...';
+  if (m.includes('memory')) return 'Zarządzanie pamięcią GPU...';
+  return '';
+}
+
+function startForgeProgress(fillId, pctId, labelId) {
   clearTimeout(_fpTimer);
+  var _phaseIdx = 0;
+  var _phases = [
+    'Inicjalizacja...', 'Ładowanie modelu SD...',
+    'Ładowanie IP-Adapter...', 'Wykrywanie twarzy...',
+    'Ładowanie ControlNet...', 'Przygotowanie do samplingу...'
+  ];
   (function tick(){
     fetch('/api/forge-progress').then(function(r){return r.json();}).then(function(d){
       var pct = Math.round(d.progress * 100);
-      if(pct > 2) {
-        var f = document.getElementById(fillId);
-        if(f) f.style.width = pct + '%';
-        var p = pctId ? document.getElementById(pctId) : null;
-        if(p) { p.textContent = pct + '%' + (d.eta > 0 ? ' · ETA ' + d.eta + 's' : ''); }
+      var f = document.getElementById(fillId);
+      if (pct > 2 && f) f.style.width = pct + '%';
+      var p = pctId ? document.getElementById(pctId) : null;
+      if (p && pct > 2) {
+        p.textContent = pct + '%' + (d.eta > 0 ? ' · ETA ' + d.eta + 's' : '');
       }
-      _fpTimer = setTimeout(tick, 2500);
+      if (labelId) {
+        var lbl = document.getElementById(labelId);
+        if (lbl) {
+          var msg = _translateForgeMsg(d.textinfo);
+          if (!msg && d.step > 0 && d.steps > 0) {
+            msg = 'Próbkowanie: krok ' + d.step + ' / ' + d.steps;
+          }
+          if (!msg && pct < 2) {
+            _phaseIdx = (_phaseIdx + 1) % _phases.length;
+            msg = _phases[_phaseIdx];
+          }
+          if (msg) lbl.textContent = msg;
+        }
+      }
+      _fpTimer = setTimeout(tick, 2000);
     }).catch(function(){ _fpTimer = setTimeout(tick, 5000); });
   })();
 }
@@ -2159,7 +2195,7 @@ function startPortrait() {
   .then(function(r){return r.json();})
   .then(function(d){
     if (!d.ok) { toast(d.error||'Błąd', 'err'); btn.disabled=false; btn.textContent='👤 GENERUJ PORTRET'; status.textContent=''; return; }
-    startForgeProgress('portrait-prog-fill', 'portrait-prog-pct');
+    startForgeProgress('portrait-prog-fill', 'portrait-prog-pct', 'portrait-prog-detail');
     document.getElementById('portrait-progress-wrap').style.display = 'block';
     pollPortrait(d.job_id, btn, status);
   })
@@ -2591,7 +2627,7 @@ function startPose() {
   .then(function(r){return r.json();})
   .then(function(d){
     if (!d.ok) { toast(d.error||'Błąd', 'err'); btn.disabled=false; btn.textContent='\U0001f6b4 GENERUJ Z POZĄ'; status.textContent=''; return; }
-    startForgeProgress('pose-prog-fill', 'pose-prog-pct');
+    startForgeProgress('pose-prog-fill', 'pose-prog-pct', 'pose-prog-detail');
     document.getElementById('pose-progress-wrap').style.display = 'block';
     pollPose(d.job_id, btn, status);
   })
@@ -2813,9 +2849,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/forge-progress':
             prog = forge_get('/sdapi/v1/progress') or {}
+            state = prog.get('state', {}) or {}
             self._json({
                 'progress': round(prog.get('progress', 0), 3),
-                'eta': int(prog.get('eta_relative', 0)),
+                'eta':      int(prog.get('eta_relative', 0)),
+                'textinfo': prog.get('textinfo', '') or '',
+                'step':     state.get('sampling_step', 0),
+                'steps':    state.get('sampling_steps', 0),
             })
             return
 
