@@ -2164,11 +2164,33 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
   }
 
   window.vramFree = function() {
+    if (!confirm('Spowoduje to restart Forge (~30s przerwy). Kontynuować?')) return;
     var btn = document.getElementById('vram-free-btn');
-    if (btn) { btn.disabled = true; btn.textContent = '...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Restart...'; }
+    var nums = document.getElementById('vram-nums');
     fetch('/api/vram-free', {method:'POST'}).then(function(r){ return r.json(); }).then(function(d) {
-      if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
-      toast(d.ok ? 'Pamięć GPU zwolniona' : 'Błąd: ' + (d.error || '?'), d.ok ? 'success' : 'error');
+      if (!d.ok) {
+        if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+        toast('Błąd: ' + (d.error || '?'), 'error');
+        return;
+      }
+      toast('Forge restartuje — ~30s przerwy', 'info');
+      // polling aż Forge wróci
+      var tries = 0;
+      (function waitForge(){
+        setTimeout(function(){
+          tries++;
+          fetch('/api/vram').then(function(r){ return r.json(); }).then(function(v){
+            if (v.ok) {
+              if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+              toast('Forge gotowy · VRAM wolny: ' + v.free_gb + ' GB', 'success');
+            } else if (tries < 20) { waitForge(); }
+            else {
+              if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+            }
+          }).catch(function(){ if (tries < 20) waitForge(); else { if(btn){btn.disabled=false;btn.textContent='ZWOLNIJ';} } });
+        }, 3000);
+      })();
     }).catch(function() {
       if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
     });
@@ -2950,31 +2972,33 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/api/vram':
-            mem = forge_get('/sdapi/v1/memory') or {}
-            cuda = mem.get('cuda', {}) or {}
-            system = cuda.get('system', {}) or {}
-            total_b = system.get('total', 0)
-            used_b  = system.get('used',  0)
-            free_b  = system.get('free',  0)
-            GB = 1024**3
-            self._json({
-                'ok':       True,
-                'total_gb': round(total_b / GB, 2),
-                'used_gb':  round(used_b  / GB, 2),
-                'free_gb':  round(free_b  / GB, 2),
-            })
+            try:
+                import subprocess as _sp
+                r = _sp.run(
+                    ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total',
+                     '--format=csv,noheader,nounits'],
+                    capture_output=True, text=True, timeout=5
+                )
+                parts = [int(x.strip()) for x in r.stdout.strip().split(',')]
+                used_mb, free_mb, total_mb = parts
+                self._json({
+                    'ok':       True,
+                    'used_gb':  round(used_mb  / 1024, 2),
+                    'free_gb':  round(free_mb  / 1024, 2),
+                    'total_gb': round(total_mb / 1024, 2),
+                })
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
 
         if path == '/api/vram-free':
             try:
-                import urllib.request as _ur
-                req = _ur.Request(
-                    'http://127.0.0.1:7860/sdapi/v1/unload-checkpoint',
-                    data=b'{}', method='POST',
-                    headers={'Content-Type': 'application/json'},
+                import subprocess as _sp
+                _sp.Popen(
+                    ['systemctl', '--user', 'restart', 'forge'],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
                 )
-                _ur.urlopen(req, timeout=30)
-                self._json({'ok': True})
+                self._json({'ok': True, 'msg': 'Forge restartuje — ~30s przerwy'})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
