@@ -2843,7 +2843,7 @@ class Handler(BaseHTTPRequestHandler):
     def _build_page(self):
         # Fetch models from Forge
         with _models_lock:
-            raw_models = list(_models_cache)
+            raw_models = [m for m in _models_cache if 'flux' not in m.get('model_name','').lower()]
         model_opts = ''
         for m in raw_models:
             n = html.escape(m.get('model_name',''))
