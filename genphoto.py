@@ -907,6 +907,12 @@ select{resize:none;cursor:pointer}
 .adv-toggle svg{transition:transform .2s}
 .adv-toggle.open svg{transform:rotate(180deg)}
 #adv-section{display:block;margin-top:14px;padding-top:14px;border-top:1px solid #334155}
+.meta-import-box{background:#0c1e35;border:1.5px dashed #1e3a5f;border-radius:10px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;cursor:pointer;transition:border-color .2s}
+.meta-import-box:hover,.meta-import-box.drag{border-color:#3b82f6;background:#0f2744}
+.meta-import-icon{font-size:1.3rem;flex-shrink:0}
+.meta-import-label{font-size:.78rem;color:#64748b;flex:1}
+.meta-import-label strong{display:block;color:#93c5fd;margin-bottom:2px;font-size:.82rem}
+.meta-import-status{font-size:.75rem;color:#22d3ee;white-space:nowrap}
 #adv-section.open{display:block}
 
 /* Generate button */
@@ -1095,6 +1101,21 @@ select{resize:none;cursor:pointer}
     <div class="pb-item"><span>Wymiary</span><strong id="pb-size">—</strong></div>
     <div class="pb-sep"></div>
     <div class="pb-item"><span>Batch</span><strong id="pb-batch">—</strong></div>
+  </div>
+
+  <div class="meta-import-box" id="meta-import-box"
+       onclick="document.getElementById('meta-import-file').click()"
+       ondragover="event.preventDefault();this.classList.add('drag')"
+       ondragleave="this.classList.remove('drag')"
+       ondrop="event.preventDefault();this.classList.remove('drag');metaImportFile(event.dataTransfer.files[0])">
+    <span class="meta-import-icon">&#128228;</span>
+    <div class="meta-import-label">
+      <strong>Wczytaj metadane ze zdjęcia</strong>
+      Przeciągnij PNG lub kliknij — automatycznie wypełni prompt i parametry
+    </div>
+    <span class="meta-import-status" id="meta-import-status"></span>
+    <input type="file" id="meta-import-file" accept="image/png,image/jpeg,image/webp" style="display:none"
+           onchange="metaImportFile(this.files[0])">
   </div>
 
   <div class="field">
@@ -2056,6 +2077,58 @@ function openMetaModal(g) {
   document.getElementById('meta-modal').classList.add('open');
   document.body.style.overflow='hidden';
 }
+function metaImportFile(file) {
+  if (!file) return;
+  var status = document.getElementById('meta-import-status');
+  if (status) status.textContent = 'Wczytuję...';
+  var fd = new FormData();
+  fd.append('file', file);
+  fetch('/api/image-meta-upload', {method:'POST', body:fd})
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (!d.ok) { if(status) status.textContent = 'Brak metadanych'; return; }
+      _fillFormFromMeta(d);
+      if(status) status.textContent = '✓ Wczytano';
+      setTimeout(function(){ if(status) status.textContent=''; }, 3000);
+      toast('Metadane wczytane z ' + file.name, 'ok');
+    })
+    .catch(function(){ if(status) status.textContent = 'Błąd'; });
+}
+
+function _fillFormFromMeta(d) {
+  if (d.positive) document.getElementById('positive-ta').value = d.positive;
+  if (d.negative) document.getElementById('negative-ta').value = d.negative;
+  if (d.model) {
+    var sel = document.getElementById('model-sel');
+    for(var i=0;i<sel.options.length;i++){
+      if(sel.options[i].value===d.model||sel.options[i].text===d.model){sel.selectedIndex=i;break;}
+    }
+  }
+  if (d.sampler)    setVal('sampler-sel', d.sampler);
+  if (d.scheduler)  setVal('sched-sel', d.scheduler);
+  if (d.steps)      document.getElementById('steps-in').value = d.steps;
+  if (d.cfg_scale)  document.getElementById('cfg-in').value   = d.cfg_scale;
+  if (d.width)      document.getElementById('w-in').value     = d.width;
+  if (d.height)     document.getElementById('h-in').value     = d.height;
+  if (d.seed)       document.getElementById('seed-in') && (document.getElementById('seed-in').value = d.seed);
+  updateParamsBar && updateParamsBar();
+}
+
+/* URL params prefill: genphoto.ebartnet.pl/?positive=...&model=... */
+(function(){
+  try {
+    var p = new URLSearchParams(window.location.search);
+    if (p.get('positive') || p.get('model')) {
+      var d = {};
+      ['positive','negative','model','sampler','scheduler','steps','cfg_scale','width','height','seed'].forEach(function(k){
+        if(p.get(k)) d[k] = p.get(k);
+      });
+      setTimeout(function(){ _fillFormFromMeta(d); toast('Parametry załadowane z galerii','ok'); }, 800);
+      window.history.replaceState({}, '', '/');
+    }
+  } catch(_){}
+})();
+
 function closeMetaModal() {
   document.getElementById('meta-modal').classList.remove('open');
   document.body.style.overflow='';
@@ -3138,6 +3211,41 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._authed():
             self._json({'ok': False, 'error': 'unauthorized'}, 401)
+            return
+
+        if self.path == '/api/image-meta-upload':
+            try:
+                import cgi as _cgi, tempfile as _tf
+                ctype = self.headers.get('Content-Type','')
+                fs = _cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={'REQUEST_METHOD':'POST','CONTENT_TYPE':ctype,
+                             'CONTENT_LENGTH':self.headers.get('Content-Length',0)}
+                )
+                f = fs['file']
+                data = f.file.read()
+                with _tf.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    tmp.write(data); tmp_path = tmp.name
+                from PIL import Image as _Img
+                with _Img.open(tmp_path) as im:
+                    params_str = im.info.get('parameters','')
+                import os as _os; _os.unlink(tmp_path)
+                result = {'ok': bool(params_str), 'raw': params_str}
+                if params_str:
+                    lines = params_str.split('\n')
+                    result['positive'] = lines[0].strip() if lines else ''
+                    neg = next((l.replace('Negative prompt:','').strip() for l in lines if l.startswith('Negative prompt:')), '')
+                    result['negative'] = neg
+                    meta_line = next((l for l in lines if 'Steps:' in l), '')
+                    for kv in meta_line.split(','):
+                        kv = kv.strip()
+                        if ': ' in kv:
+                            k, v = kv.split(': ', 1)
+                            result[k.strip().lower().replace(' ','_')] = v.strip()
+                self._json(result)
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
 
         if self.path == '/api/generate':
