@@ -856,6 +856,14 @@ header{background:#1e293b;border-bottom:1px solid #334155;padding:0 20px;height:
 .preset-btn:hover{border-color:#60a5fa;color:#e2e8f0}
 .preset-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
 .hdr-links{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.vram-widget{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:4px 10px;flex-shrink:0}
+.vram-canvas{display:block;border-radius:4px}
+.vram-info{display:flex;flex-direction:column;align-items:flex-end;line-height:1.2;min-width:70px}
+.vram-nums{font-size:.78rem;font-weight:600;font-family:monospace;color:#93c5fd}
+.vram-label{font-size:.62rem;color:#475569;white-space:nowrap}
+.vram-free-btn{background:#7f1d1d;border:1px solid #991b1b;color:#fca5a5;padding:3px 9px;border-radius:5px;font-size:.72rem;cursor:pointer;white-space:nowrap;transition:all .15s}
+.vram-free-btn:hover{background:#991b1b;border-color:#ef4444;color:#fff}
+.vram-free-btn:disabled{opacity:.5;cursor:default}
 .hdr-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 12px;border-radius:6px;font-size:.78rem;cursor:pointer;transition:all .2s;white-space:nowrap}
 .hdr-btn:hover{border-color:#475569;color:#e2e8f0}
 .hdr-btn.primary{background:#3b82f6;border-color:#3b82f6;color:#fff;font-weight:600}
@@ -1036,6 +1044,14 @@ select{resize:none;cursor:pointer}
     <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
     <button class="view-tab-btn" id="tab-portrait" onclick="switchView(\'portrait\')">&#128100; Portret</button>
     <button class="view-tab-btn" id="tab-pose" onclick="switchView(\'pose\')">&#128694; Poza</button>
+  </div>
+  <div class="vram-widget" id="vram-widget">
+    <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
+    <div class="vram-info">
+      <span class="vram-nums" id="vram-nums">-- / --</span>
+      <span class="vram-label">GB zajęte / wolne</span>
+    </div>
+    <button class="vram-free-btn" id="vram-free-btn" onclick="vramFree()">ZWOLNIJ</button>
   </div>
   <div class="hdr-links">
     <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
@@ -2080,6 +2096,92 @@ function startForgeProgress(fillId, pctId, labelId) {
 }
 function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
 
+/* ── VRAM widget ── */
+(function(){
+  var _history = [];
+  var _maxPts  = 60;
+  var _timer   = null;
+
+  function _drawChart(usedPct) {
+    var canvas = document.getElementById('vram-canvas');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // tło
+    ctx.fillStyle = 'rgba(15,23,42,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    if (_history.length < 2) return;
+
+    // kolor w zależności od użycia
+    function barColor(pct) {
+      if (pct >= 0.95) return '#ef4444';
+      if (pct >= 0.80) return '#f59e0b';
+      return '#22d3ee';
+    }
+
+    // linia wykresu
+    var pts = _history;
+    var step = W / (_maxPts - 1);
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var x = i * step;
+      var y = H - pts[i] * (H - 2) - 1;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = barColor(usedPct);
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // fill pod linią
+    ctx.lineTo((pts.length - 1) * step, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fillStyle = barColor(usedPct).replace(')', ', 0.15)').replace('rgb', 'rgba');
+    ctx.fill();
+  }
+
+  function _tick() {
+    fetch('/api/vram').then(function(r){ return r.json(); }).then(function(d) {
+      if (!d.ok) return;
+      var used  = d.used_gb,  free = d.free_gb, total = d.total_gb;
+      var pct   = total > 0 ? used / total : 0;
+
+      _history.push(pct);
+      if (_history.length > _maxPts) _history.shift();
+
+      _drawChart(pct);
+
+      var nums = document.getElementById('vram-nums');
+      if (nums) {
+        nums.textContent = used.toFixed(1) + ' / ' + free.toFixed(1);
+        nums.style.color = pct >= 0.95 ? '#ef4444' : pct >= 0.80 ? '#f59e0b' : '#93c5fd';
+      }
+    }).catch(function(){});
+    _timer = setTimeout(_tick, 4000);
+  }
+
+  window.vramFree = function() {
+    var btn = document.getElementById('vram-free-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '...'; }
+    fetch('/api/vram-free', {method:'POST'}).then(function(r){ return r.json(); }).then(function(d) {
+      if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+      toast(d.ok ? 'Pamięć GPU zwolniona' : 'Błąd: ' + (d.error || '?'), d.ok ? 'success' : 'error');
+    }).catch(function() {
+      if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+    });
+  };
+
+  // start po załadowaniu DOM
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _tick);
+  } else {
+    _tick();
+  }
+})();
+
 /* ── Toast ── */
 function toast(msg,type){ var t=document.getElementById('toast'); t.textContent=msg; t.className='show '+(type||''); clearTimeout(t._t); t._t=setTimeout(function(){t.className='';},3000); }
 
@@ -2845,6 +2947,36 @@ class Handler(BaseHTTPRequestHandler):
                         'SELECT * FROM edits ORDER BY ts DESC LIMIT 50'
                     ).fetchall()
             self._json([dict(r) for r in rows])
+            return
+
+        if path == '/api/vram':
+            mem = forge_get('/sdapi/v1/memory') or {}
+            cuda = mem.get('cuda', {}) or {}
+            system = cuda.get('system', {}) or {}
+            total_b = system.get('total', 0)
+            used_b  = system.get('used',  0)
+            free_b  = system.get('free',  0)
+            GB = 1024**3
+            self._json({
+                'ok':       True,
+                'total_gb': round(total_b / GB, 2),
+                'used_gb':  round(used_b  / GB, 2),
+                'free_gb':  round(free_b  / GB, 2),
+            })
+            return
+
+        if path == '/api/vram-free':
+            try:
+                import urllib.request as _ur
+                req = _ur.Request(
+                    'http://127.0.0.1:7860/sdapi/v1/unload-checkpoint',
+                    data=b'{}', method='POST',
+                    headers={'Content-Type': 'application/json'},
+                )
+                _ur.urlopen(req, timeout=30)
+                self._json({'ok': True})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
 
         if path == '/api/forge-progress':
