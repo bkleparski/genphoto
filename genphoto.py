@@ -2081,18 +2081,25 @@ function metaImportFile(file) {
   if (!file) return;
   var status = document.getElementById('meta-import-status');
   if (status) status.textContent = 'Wczytuję...';
-  var fd = new FormData();
-  fd.append('file', file);
-  fetch('/api/image-meta-upload', {method:'POST', body:fd})
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var b64 = e.target.result.split(',')[1];
+    fetch('/api/image-meta-upload', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({data: b64})
+    })
     .then(function(r){ return r.json(); })
     .then(function(d) {
-      if (!d.ok) { if(status) status.textContent = 'Brak metadanych'; return; }
+      if (!d.ok) { if(status) status.textContent = 'Brak metadanych SD'; return; }
       _fillFormFromMeta(d);
       if(status) status.textContent = '✓ Wczytano';
       setTimeout(function(){ if(status) status.textContent=''; }, 3000);
       toast('Metadane wczytane z ' + file.name, 'ok');
     })
     .catch(function(){ if(status) status.textContent = 'Błąd'; });
+  };
+  reader.readAsDataURL(file);
 }
 
 function _fillFormFromMeta(d) {
@@ -3215,22 +3222,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == '/api/image-meta-upload':
             try:
-                import cgi as _cgi, tempfile as _tf
-                ctype = self.headers.get('Content-Type','')
-                fs = _cgi.FieldStorage(
-                    fp=self.rfile,
-                    headers=self.headers,
-                    environ={'REQUEST_METHOD':'POST','CONTENT_TYPE':ctype,
-                             'CONTENT_LENGTH':self.headers.get('Content-Length',0)}
-                )
-                f = fs['file']
-                data = f.file.read()
-                with _tf.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    tmp.write(data); tmp_path = tmp.name
+                import base64 as _b64, io as _io
+                payload = json.loads(body)
+                data = _b64.b64decode(payload['data'])
                 from PIL import Image as _Img
-                with _Img.open(tmp_path) as im:
+                with _Img.open(_io.BytesIO(data)) as im:
                     params_str = im.info.get('parameters','')
-                import os as _os; _os.unlink(tmp_path)
                 result = {'ok': bool(params_str), 'raw': params_str}
                 if params_str:
                     lines = params_str.split('\n')
