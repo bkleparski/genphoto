@@ -833,6 +833,28 @@ button:hover{background:#2563eb}
     <button type="submit">Zaloguj</button>
   </form>
 </div>
+<div id="meta-modal" onclick="if(event.target===this)closeMetaModal()">
+  <div class="meta-box">
+    <button class="meta-close" onclick="closeMetaModal()">✕</button>
+    <h3>&#128247; Metadane generowania</h3>
+    <div class="meta-grid">
+      <div class="meta-field full"><span class="meta-label">Opis</span><div class="meta-val" id="md-desc"></div></div>
+      <div class="meta-field full"><span class="meta-label">Prompt pozytywny</span><div class="meta-val prompt" id="md-pos"></div></div>
+      <div class="meta-field full"><span class="meta-label">Prompt negatywny</span><div class="meta-val prompt" id="md-neg"></div></div>
+      <div class="meta-field"><span class="meta-label">Model</span><div class="meta-val" id="md-model"></div></div>
+      <div class="meta-field"><span class="meta-label">Sampler / Scheduler</span><div class="meta-val" id="md-sampler"></div></div>
+      <div class="meta-field"><span class="meta-label">Steps</span><div class="meta-val" id="md-steps"></div></div>
+      <div class="meta-field"><span class="meta-label">CFG Scale</span><div class="meta-val" id="md-cfg"></div></div>
+      <div class="meta-field"><span class="meta-label">Rozmiar</span><div class="meta-val" id="md-size"></div></div>
+      <div class="meta-field"><span class="meta-label">Seed</span><div class="meta-val" id="md-seed"></div></div>
+      <div class="meta-field"><span class="meta-label">Ilość obrazów</span><div class="meta-val" id="md-batch"></div></div>
+      <div class="meta-field"><span class="meta-label">Data</span><div class="meta-val" id="md-date"></div></div>
+    </div>
+    <div class="meta-actions">
+      <button class="meta-load-btn" id="md-load-btn">&#8635; Wczytaj do formularza</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>'''
 
@@ -947,6 +969,23 @@ select{resize:none;cursor:pointer}
 .hist-btn:hover{border-color:#475569;color:#e2e8f0}
 .hist-btn.del{color:#f87171}
 .hist-btn.del:hover{border-color:#ef4444;color:#ef4444;background:#1e293b}
+.hist-btn.info{color:#60a5fa}
+.hist-btn.info:hover{border-color:#3b82f6;color:#93c5fd}
+#meta-modal{display:none;position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.75);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+#meta-modal.open{display:flex}
+.meta-box{background:#0f172a;border:1px solid #334155;border-radius:14px;padding:24px;max-width:680px;width:95%;max-height:90vh;overflow-y:auto;position:relative}
+.meta-box h3{margin:0 0 16px;color:#93c5fd;font-size:1rem;display:flex;align-items:center;gap:8px}
+.meta-close{position:absolute;top:14px;right:16px;background:none;border:none;color:#64748b;font-size:1.3rem;cursor:pointer;line-height:1}
+.meta-close:hover{color:#f1f5f9}
+.meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;margin-bottom:16px}
+.meta-field{display:flex;flex-direction:column;gap:2px}
+.meta-field.full{grid-column:1/-1}
+.meta-label{font-size:.65rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em}
+.meta-val{font-size:.8rem;color:#e2e8f0;background:#1e293b;border-radius:6px;padding:5px 8px;word-break:break-all;line-height:1.45;min-height:26px}
+.meta-val.prompt{font-size:.77rem;max-height:100px;overflow-y:auto}
+.meta-actions{display:flex;gap:8px;margin-top:4px}
+.meta-load-btn{flex:1;background:#1e3a5f;border:1px solid #2563eb;color:#93c5fd;padding:7px 14px;border-radius:8px;font-size:.8rem;cursor:pointer;transition:all .2s}
+.meta-load-btn:hover{background:#2563eb;color:#fff}
 .no-hist{color:#334155;text-align:center;padding:20px;font-size:.85rem}
 
 /* Lightbox */
@@ -1982,6 +2021,9 @@ function loadHistory() {
       tags.textContent = [g.model, g.sampler, g.width+'x'+g.height, g.batch+' img', dt].join(' · ');
 
       var actions = document.createElement('div'); actions.className='hist-actions';
+      var infoBtn = document.createElement('button'); infoBtn.className='hist-btn info';
+      infoBtn.textContent='ℹ Metadane';
+      infoBtn.onclick=(function(gen){return function(){openMetaModal(gen);};})(g);
       var btn = document.createElement('button'); btn.className='hist-btn';
       btn.textContent='↺ Powtórz';
       btn.onclick=(function(gen){return function(){repeatGen(gen);};})(g);
@@ -1991,7 +2033,7 @@ function loadHistory() {
       var delBtn = document.createElement('button'); delBtn.className='hist-btn del';
       delBtn.textContent='🗑 Usuń';
       delBtn.onclick=(function(id,el){return function(){deleteHist(id,el);};})(g.id,item);
-      actions.appendChild(btn); actions.appendChild(editBtn); actions.appendChild(delBtn);
+      actions.appendChild(infoBtn); actions.appendChild(btn); actions.appendChild(editBtn); actions.appendChild(delBtn);
 
       meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
       item.appendChild(thumbsDiv); item.appendChild(meta);
@@ -2018,6 +2060,27 @@ function deleteEditHist(id, el) {
       if(d.ok){ el.remove(); loadEditHistory(); }
       else { el.style.opacity='1'; toast('Błąd usuwania','err'); }
     }).catch(function(){ el.style.opacity='1'; toast('Błąd połączenia','err'); });
+}
+
+function openMetaModal(g) {
+  document.getElementById('md-desc').textContent    = g.description || '—';
+  document.getElementById('md-pos').textContent     = g.positive    || '—';
+  document.getElementById('md-neg').textContent     = g.negative    || '—';
+  document.getElementById('md-model').textContent   = g.model       || '—';
+  document.getElementById('md-sampler').textContent = (g.sampler||'') + ' / ' + (g.scheduler||'');
+  document.getElementById('md-steps').textContent   = g.steps       || '—';
+  document.getElementById('md-cfg').textContent     = g.cfg         || '—';
+  document.getElementById('md-size').textContent    = (g.width||'?') + ' × ' + (g.height||'?') + ' px';
+  document.getElementById('md-seed').textContent    = g.seed        || '—';
+  document.getElementById('md-batch').textContent   = g.batch       || '—';
+  document.getElementById('md-date').textContent    = g.ts ? new Date(g.ts*1000).toLocaleString('pl') : '—';
+  document.getElementById('md-load-btn').onclick    = function(){ closeMetaModal(); repeatGen(g); };
+  document.getElementById('meta-modal').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeMetaModal() {
+  document.getElementById('meta-modal').classList.remove('open');
+  document.body.style.overflow='';
 }
 
 function repeatGen(g) {
@@ -2969,6 +3032,36 @@ class Handler(BaseHTTPRequestHandler):
                         'SELECT * FROM edits ORDER BY ts DESC LIMIT 50'
                     ).fetchall()
             self._json([dict(r) for r in rows])
+            return
+
+        if path == '/api/image-meta':
+            import urllib.parse as _up
+            qs = _up.parse_qs(_up.urlparse(self.path).query)
+            img_path = qs.get('path',[''])[0]
+            if not img_path:
+                self._json({'ok': False, 'error': 'brak parametru path'})
+                return
+            try:
+                from PIL import Image as _Img
+                full = Path(img_path) if img_path.startswith('/') else OUTPUTS_DIR / img_path
+                with _Img.open(full) as im:
+                    params_str = im.info.get('parameters', '')
+                result = {'ok': True, 'raw': params_str, 'path': str(full)}
+                # Parse SD parameters string
+                if params_str:
+                    lines = params_str.split('\n')
+                    result['positive'] = lines[0] if lines else ''
+                    neg = next((l.replace('Negative prompt:','').strip() for l in lines if l.startswith('Negative prompt:')), '')
+                    result['negative'] = neg
+                    meta_line = next((l for l in lines if 'Steps:' in l), '')
+                    for kv in meta_line.split(','):
+                        kv = kv.strip()
+                        if ': ' in kv:
+                            k, v = kv.split(': ', 1)
+                            result[k.strip().lower().replace(' ', '_')] = v.strip()
+                self._json(result)
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
 
         if path == '/api/vram':
