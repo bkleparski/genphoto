@@ -833,28 +833,6 @@ button:hover{background:#2563eb}
     <button type="submit">Zaloguj</button>
   </form>
 </div>
-<div id="meta-modal" onclick="if(event.target===this)closeMetaModal()">
-  <div class="meta-box">
-    <button class="meta-close" onclick="closeMetaModal()">✕</button>
-    <h3>&#128247; Metadane generowania</h3>
-    <div class="meta-grid">
-      <div class="meta-field full"><span class="meta-label">Opis</span><div class="meta-val" id="md-desc"></div></div>
-      <div class="meta-field full"><span class="meta-label">Prompt pozytywny</span><div class="meta-val prompt" id="md-pos"></div></div>
-      <div class="meta-field full"><span class="meta-label">Prompt negatywny</span><div class="meta-val prompt" id="md-neg"></div></div>
-      <div class="meta-field"><span class="meta-label">Model</span><div class="meta-val" id="md-model"></div></div>
-      <div class="meta-field"><span class="meta-label">Sampler / Scheduler</span><div class="meta-val" id="md-sampler"></div></div>
-      <div class="meta-field"><span class="meta-label">Steps</span><div class="meta-val" id="md-steps"></div></div>
-      <div class="meta-field"><span class="meta-label">CFG Scale</span><div class="meta-val" id="md-cfg"></div></div>
-      <div class="meta-field"><span class="meta-label">Rozmiar</span><div class="meta-val" id="md-size"></div></div>
-      <div class="meta-field"><span class="meta-label">Seed</span><div class="meta-val" id="md-seed"></div></div>
-      <div class="meta-field"><span class="meta-label">Ilość obrazów</span><div class="meta-val" id="md-batch"></div></div>
-      <div class="meta-field"><span class="meta-label">Data</span><div class="meta-val" id="md-date"></div></div>
-    </div>
-    <div class="meta-actions">
-      <button class="meta-load-btn" id="md-load-btn">&#8635; Wczytaj do formularza</button>
-    </div>
-  </div>
-</div>
 </body>
 </html>'''
 
