@@ -666,7 +666,7 @@ def _vision_call(url, model, image_b64, style_prefix, style, headers_extra=None)
         'temperature': 0.4,
         'max_tokens': 600,
     }).encode()
-    headers = {'Content-Type': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'GenPhoto/1.0'}
     if headers_extra:
         headers.update(headers_extra)
     req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
