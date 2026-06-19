@@ -666,7 +666,6 @@ def ai_vision_describe(image_b64, style='anime'):
         }],
         'temperature': 0.4,
         'max_tokens': 600,
-        'provider': {'order': ['Parasail'], 'allow_fallbacks': False},
     }).encode()
     req = urllib.request.Request(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -1790,19 +1789,26 @@ function describeRef() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({image_b64: _refImageB64, style: style})
   }).then(function(r){return r.json();}).then(function(d){
-    if (d.positive) document.getElementById('positive-ta').value = d.positive;
-    if (d.negative) document.getElementById('negative-ta').value = d.negative;
-    btn.textContent = '✅ Prompt gotowy — kliknij GENERUJ';
-    btn.style.background = '#064e3b';
-    btn.style.color = '#6ee7b7';
-    setTimeout(function(){
+    if (d.positive) {
+      document.getElementById('positive-ta').value = d.positive;
+      if (d.negative) document.getElementById('negative-ta').value = d.negative;
+      btn.textContent = '✅ Prompt gotowy — kliknij GENERUJ';
+      btn.style.background = '#064e3b';
+      btn.style.color = '#6ee7b7';
+      setTimeout(function(){
+        btn.textContent = '🔍 Opisz zdjęcie i wygeneruj prompt';
+        btn.style.background = '';
+        btn.style.color = '';
+        btn.disabled = false;
+      }, 3000);
+    } else {
+      toast('Błąd analizy: ' + (d.error || 'brak odpowiedzi'), 'err');
       btn.textContent = '🔍 Opisz zdjęcie i wygeneruj prompt';
-      btn.style.background = '';
-      btn.style.color = '';
       btn.disabled = false;
-    }, 3000);
+    }
   }).catch(function(err){
-    btn.textContent = '❌ Błąd — spróbuj ponownie';
+    toast('Błąd połączenia z API vision', 'err');
+    btn.textContent = '🔍 Opisz zdjęcie i wygeneruj prompt';
     btn.disabled = false;
     console.error(err);
   });
