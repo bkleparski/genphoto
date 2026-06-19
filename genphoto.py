@@ -21,6 +21,8 @@ AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
 OR_KEY         = os.environ.get('GP_OR_KEY', '')
 OR_MODEL       = os.environ.get('GP_OR_MODEL', 'nousresearch/hermes-4-405b')
 OR_VISION_MODEL = os.environ.get('GP_OR_VISION_MODEL', 'qwen/qwen2.5-vl-72b-instruct')
+LOCAL_VISION_URL   = os.environ.get('GP_LOCAL_VISION_URL', '').rstrip('/')
+LOCAL_VISION_MODEL = os.environ.get('GP_LOCAL_VISION_MODEL', 'qwen2.5vl:32b')
 DB_PATH      = Path(os.environ.get('GP_DB_PATH', '/home/bartek/genphoto.db'))
 GP_USERNAME  = os.environ.get('GP_USERNAME', 'admin')
 GP_PW_HASH   = os.environ.get('GP_PASSWORD_HASH', '')
@@ -641,14 +643,11 @@ def forge_pose_thread(params, jid):
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
-def ai_vision_describe(image_b64, style='anime'):
-    if not OR_KEY:
-        raise RuntimeError('GP_OR_KEY not set')
-    style_prefix = VISION_STYLE_HINTS.get(style, VISION_STYLE_HINTS['anime'])
+def _vision_call(url, model, image_b64, style_prefix, style, headers_extra=None):
     mime = 'image/jpeg'
     data_url = f'data:{mime};base64,{image_b64}'
     payload = json.dumps({
-        'model': OR_VISION_MODEL,
+        'model': model,
         'messages': [{
             'role': 'user',
             'content': [
@@ -667,20 +666,15 @@ def ai_vision_describe(image_b64, style='anime'):
         'temperature': 0.4,
         'max_tokens': 600,
     }).encode()
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/v1/chat/completions',
-        data=payload,
-        headers={
-            'Content-Type':  'application/json',
-            'Authorization': f'Bearer {OR_KEY}',
-            'HTTP-Referer':  'https://ebartnet.pl',
-            'X-Title':       'GenPhoto',
-        },
-        method='POST'
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
+    headers = {'Content-Type': 'application/json'}
+    if headers_extra:
+        headers.update(headers_extra)
+    req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+    with urllib.request.urlopen(req, timeout=90) as r:
         resp = json.loads(r.read())
-    text = (resp['choices'][0]['message'].get('content') or '').strip()
+    return (resp['choices'][0]['message'].get('content') or '').strip()
+
+def _parse_vision_text(text):
     pos = neg = ''
     for line in text.splitlines():
         l = line.strip()
@@ -688,9 +682,37 @@ def ai_vision_describe(image_b64, style='anime'):
             pos = l[9:].strip().lstrip(':').strip()
         elif l.upper().startswith('NEGATIVE:'):
             neg = l[9:].strip().lstrip(':').strip()
+    return pos, neg
+
+def ai_vision_describe(image_b64, style='anime'):
+    style_prefix = VISION_STYLE_HINTS.get(style, VISION_STYLE_HINTS['anime'])
+    if LOCAL_VISION_URL:
+        try:
+            text = _vision_call(
+                f'{LOCAL_VISION_URL}/v1/chat/completions',
+                LOCAL_VISION_MODEL, image_b64, style_prefix, style
+            )
+            pos, neg = _parse_vision_text(text)
+            if pos:
+                return pos, neg
+        except Exception:
+            pass
+    if not OR_KEY:
+        raise RuntimeError('GP_OR_KEY not set i GP_LOCAL_VISION_URL nie skonfigurowany')
+    text = _vision_call(
+        'https://openrouter.ai/api/v1/chat/completions',
+        OR_VISION_MODEL, image_b64, style_prefix, style,
+        headers_extra={
+            'Authorization': f'Bearer {OR_KEY}',
+            'HTTP-Referer':  'https://ebartnet.pl',
+            'X-Title':       'GenPhoto',
+        }
+    )
+    pos, neg = _parse_vision_text(text)
     if not pos:
         raise RuntimeError(f'Vision API returned: {text[:200]}')
     return pos, neg
+
 
 # ── DeepSeek AI Prompter ──────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
