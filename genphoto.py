@@ -25,6 +25,8 @@ GP_USERNAME  = os.environ.get('GP_USERNAME', 'admin')
 GP_PW_HASH   = os.environ.get('GP_PASSWORD_HASH', '')
 COOKIE_NAME  = 'gp_sess'
 GALLERY_URL  = os.environ.get('GP_GALLERY_URL', 'https://gallery.ebartnet.pl')
+PORTAL_URL   = os.environ.get('GP_PORTAL_URL', 'https://images.ebartnet.pl')
+PORTAL_KEY   = os.environ.get('GP_PORTAL_KEY', '')
 
 if not GP_PW_HASH:
     raise SystemExit(
@@ -771,6 +773,8 @@ select{resize:none;cursor:pointer}
 .hist-btn:hover{border-color:#475569;color:#e2e8f0}
 .hist-btn.del{color:#f87171}
 .hist-btn.del:hover{border-color:#ef4444;color:#ef4444;background:#1e293b}
+.hist-btn.pub{color:#a5b4fc;border-color:#4f46e5}
+.hist-btn.pub:hover{background:#4f46e5;color:#fff}
 .no-hist{color:#334155;text-align:center;padding:20px;font-size:.85rem}
 
 /* Lightbox */
@@ -870,9 +874,24 @@ select{resize:none;cursor:pointer}
   </div>
   <div class="hdr-links">
     <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
+    <a href="__PORTAL_URL__" target="_blank" class="hdr-btn">&#9889; Portal</a>
     <a href="/logout" class="hdr-btn">&#10155;</a>
   </div>
 </header>
+
+<div id="publish-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:22px 24px;max-width:360px;width:90%;">
+    <div style="font-size:16px;font-weight:700;color:#e2e8f0;margin:0 0 8px;">&#9889; Opublikuj zdjęcie</div>
+    <div style="color:#94a3b8;font-size:13px;margin:0 0 18px;">Zdjęcie będzie widoczne publicznie na <b>images.ebartnet.pl</b></div>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button onclick="doPublish(false)" style="padding:10px;background:#6366f1;border:none;border-radius:7px;color:#fff;cursor:pointer;font-size:14px;font-weight:600;">&#128444; Opublikuj normalnie</button>
+      <button onclick="doPublish(true)" style="padding:10px;background:#7f1d1d;border:1px solid #991b1b;border-radius:7px;color:#fca5a5;cursor:pointer;font-size:14px;font-weight:600;">&#128286; Opublikuj jako XXX</button>
+      <button onclick="document.getElementById(\'publish-modal\').style.display=\'none\'" style="padding:8px;background:transparent;border:1px solid #334155;border-radius:7px;color:#94a3b8;cursor:pointer;font-size:13px;">Anuluj</button>
+    </div>
+    <input type="hidden" id="publish-gen-id">
+    <input type="hidden" id="publish-path-idx">
+  </div>
+</div>
 
 <div id="view-generate">
 <main>
@@ -1519,13 +1538,45 @@ function loadHistory() {
       var delBtn = document.createElement('button'); delBtn.className='hist-btn del';
       delBtn.textContent='🗑 Usuń';
       delBtn.onclick=(function(id,el){return function(){deleteHist(id,el);};})(g.id,item);
-      actions.appendChild(btn); actions.appendChild(editBtn); actions.appendChild(delBtn);
+      var pubBtn = document.createElement('button'); pubBtn.className='hist-btn pub';
+      pubBtn.textContent='⚡ Opublikuj';
+      pubBtn.onclick=(function(gen){return function(){publishGen(gen);};})(g);
+      actions.appendChild(btn); actions.appendChild(editBtn); actions.appendChild(delBtn); actions.appendChild(pubBtn);
 
       meta.appendChild(desc); meta.appendChild(tags); meta.appendChild(actions);
       item.appendChild(thumbsDiv); item.appendChild(meta);
       body.appendChild(item);
     });
   });
+}
+
+var PORTAL_URL = '__PORTAL_URL__';
+
+function publishGen(gen) {
+  var paths = JSON.parse(gen.paths||'[]');
+  if(!paths.length){toast('Brak zdjęcia','err');return;}
+  document.getElementById('publish-gen-id').value = gen.id;
+  document.getElementById('publish-path-idx').value = '0';
+  document.getElementById('publish-modal').style.display='flex';
+}
+
+function doPublish(isXxx) {
+  var genId = document.getElementById('publish-gen-id').value;
+  var pathIdx = parseInt(document.getElementById('publish-path-idx').value)||0;
+  document.getElementById('publish-modal').style.display='none';
+  toast('Publikowanie…','ok');
+  fetch('/api/publish_to_portal',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gen_id:genId,path_idx:pathIdx,is_xxx:isXxx})
+  }).then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      var link='<a href="'+PORTAL_URL+d.url+'" target="_blank" style="color:#a5b4fc">Zobacz →</a>';
+      toast('✓ Opublikowano! '+link,'ok');
+    } else {
+      toast('Błąd: '+d.error,'err');
+    }
+  }).catch(function(){toast('Błąd sieci','err');});
 }
 
 function openHistLb(paths, idx) { _lbImgs=paths; openLb(idx); }
@@ -2266,7 +2317,8 @@ class Handler(BaseHTTPRequestHandler):
                 .replace('__EDIT_MODEL_OPTIONS__', model_opts)
                 .replace('__VID_MODEL_OPTIONS__', sd15_opts)
                 .replace('__PRESETS_JSON__', presets_json)
-                .replace('__GALLERY_URL__', GALLERY_URL))
+                .replace('__GALLERY_URL__', GALLERY_URL)
+                .replace('__PORTAL_URL__', PORTAL_URL))
 
     def do_GET(self):
         path = self.path.split('?')[0]
@@ -2474,6 +2526,72 @@ class Handler(BaseHTTPRequestHandler):
                 t = threading.Thread(target=target, args=(params, jid), daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
+            return
+
+        if self.path == '/api/publish_to_portal':
+            try:
+                data = json.loads(body)
+                gen_id   = data.get('gen_id', '').strip()
+                path_idx = int(data.get('path_idx', 0))
+                is_xxx   = 1 if data.get('is_xxx') else 0
+                if not gen_id:
+                    self._json({'ok': False, 'error': 'Brak gen_id'}); return
+                with _db_lock:
+                    with db() as con:
+                        row = con.execute('SELECT * FROM generations WHERE id=?', (gen_id,)).fetchone()
+                if not row:
+                    self._json({'ok': False, 'error': 'Nie znaleziono generacji'}); return
+                g = dict(row)
+                paths = json.loads(g.get('paths') or '[]')
+                if not paths or path_idx >= len(paths):
+                    self._json({'ok': False, 'error': 'Brak pliku o tym indeksie'}); return
+                file_path = OUTPUTS_DIR / paths[path_idx]
+                if not file_path.exists():
+                    self._json({'ok': False, 'error': f'Plik nie istnieje: {paths[path_idx]}'}); return
+
+                boundary = uuid.uuid4().hex
+                meta_fields = {
+                    'ts':        str(g.get('ts', '')),
+                    'positive':  g.get('positive', ''),
+                    'negative':  g.get('negative', ''),
+                    'model':     g.get('model', ''),
+                    'sampler':   g.get('sampler', ''),
+                    'scheduler': g.get('scheduler', ''),
+                    'steps':     str(g.get('steps', '')),
+                    'cfg':       str(g.get('cfg', '')),
+                    'width':     str(g.get('width', '')),
+                    'height':    str(g.get('height', '')),
+                    'seed':      str(g.get('seed', '')),
+                    'preset':    g.get('preset', ''),
+                    'source':    'genphoto',
+                    'is_xxx':    str(is_xxx),
+                }
+                parts = bytearray()
+                for k, v in meta_fields.items():
+                    parts += (
+                        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+                    ).encode()
+                with open(file_path, 'rb') as f:
+                    file_data = f.read()
+                parts += (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+                    f'filename="image.png"\r\nContent-Type: image/png\r\n\r\n'
+                ).encode() + file_data + f'\r\n--{boundary}--\r\n'.encode()
+
+                req = urllib.request.Request(
+                    PORTAL_URL.rstrip('/') + '/api/publish',
+                    data=bytes(parts),
+                    headers={
+                        'Content-Type': f'multipart/form-data; boundary={boundary}',
+                        'X-Api-Key': PORTAL_KEY,
+                    },
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read())
+                self._json({'ok': True, 'url': result.get('url', ''), 'uuid': result.get('uuid', '')})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
