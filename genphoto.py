@@ -142,6 +142,8 @@ def krea_post(path, data, timeout=120):
 # Cache modeli Forge — odnawiany w tle co 30s
 _models_cache = []
 _models_lock  = threading.Lock()
+_downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size}
+MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
 
 def _refresh_models_once():
     global _models_cache
@@ -156,6 +158,53 @@ def _refresh_models_once():
         pass
     with _models_lock:
         _models_cache = data
+
+
+def _download_model_thread(job_id, url):
+    import time as _t
+    d = _downloads[job_id]
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://civitai.red/'
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            cd = resp.headers.get('Content-Disposition', '')
+            fname = ''
+            for part in cd.split(';'):
+                part = part.strip()
+                if part.startswith('filename=') or part.startswith('filename*='):
+                    fname = part.split('=', 1)[1].strip().strip('"').split("''")[-1]
+                    break
+            if not fname:
+                fname = url.split('?')[0].rstrip('/').split('/')[-1]
+            if not (fname.endswith('.safetensors') or fname.endswith('.ckpt') or fname.endswith('.pt')):
+                fname += '.safetensors'
+            fname = fname.replace('/', '_').replace('\\', '_')
+            dest  = MODELS_DIR / fname
+            d['filename'] = fname
+            d['status']   = 'downloading'
+            size = int(resp.headers.get('Content-Length', 0) or 0)
+            d['size'] = size
+            done = 0
+            chunk = 1024 * 256
+            with open(dest, 'wb') as f:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf: break
+                    f.write(buf)
+                    done += len(buf)
+                    d['bytes_done'] = done
+                    d['percent'] = int(done * 100 / size) if size else -1
+        d['percent'] = 100
+        d['status']  = 'done'
+        _refresh_models_once()
+    except Exception as e:
+        d['status'] = 'error'
+        d['error']  = str(e)
+        if d.get('filename'):
+            p = MODELS_DIR / d['filename']
+            if p.exists(): p.unlink()
 
 def _models_cache_worker():
     import time as _time
@@ -1095,6 +1144,28 @@ select{resize:none;cursor:pointer}
 #toast.ok{border-color:#22c55e;color:#86efac}
 #toast.err{border-color:#ef4444;color:#fca5a5}
 #toast.info{border-color:#3b82f6;color:#93c5fd}
+#model-mgr-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9000;align-items:center;justify-content:center}
+#model-mgr-modal.open{display:flex}
+.mgr-box{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:22px 24px;width:min(560px,95vw);max-height:80vh;display:flex;flex-direction:column;gap:12px}
+.mgr-title{font-size:1rem;font-weight:700;color:#e2e8f0}
+.mgr-dl-row{display:flex;gap:8px}
+.mgr-dl-row input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 12px;color:#e2e8f0;font-size:.85rem}
+.mgr-dl-row input:focus{outline:none;border-color:#3b82f6}
+.mgr-dl-btn{background:#1e3a5f;border:1px solid #3b82f6;color:#93c5fd;padding:8px 16px;border-radius:8px;font-size:.83rem;cursor:pointer;white-space:nowrap}
+.mgr-dl-btn:hover{background:#2563eb;color:#fff}
+.dl-progress{background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:10px 14px;display:none}
+.dl-progress.show{display:block}
+.dl-bar-bg{background:#1e293b;border-radius:4px;height:8px;margin:6px 0;overflow:hidden}
+.dl-bar-fill{background:linear-gradient(90deg,#3b82f6,#06b6d4);height:100%;width:0%;transition:width .4s;border-radius:4px}
+.dl-info{font-size:.75rem;color:#64748b}
+.mgr-list{overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:6px}
+.mgr-item{display:flex;align-items:center;gap:10px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:8px 12px}
+.mgr-item-name{flex:1;font-size:.82rem;color:#e2e8f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mgr-item-size{font-size:.72rem;color:#64748b;flex-shrink:0}
+.mgr-del-btn{background:transparent;border:1px solid #7f1d1d;color:#f87171;padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer;flex-shrink:0}
+.mgr-del-btn:hover{background:#7f1d1d;color:#fff}
+.mgr-manage-btn{background:transparent;border:none;color:#475569;font-size:.72rem;cursor:pointer;padding:4px 8px;margin-top:2px;display:block;width:100%;text-align:left}
+.mgr-manage-btn:hover{color:#94a3b8}
 
 /* View tabs */
 .view-tabs{display:flex;gap:4px;flex-shrink:0}
@@ -1198,6 +1269,35 @@ select{resize:none;cursor:pointer}
   </div>
 </header>
 
+
+<!-- Modal zarządzania modelami -->
+<div id="model-mgr-modal">
+  <div class="mgr-box">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div class="mgr-title">&#128194; Zarządzaj modelami</div>
+      <button onclick="closeMgrModal()" style="background:none;border:none;color:#64748b;font-size:1.2rem;cursor:pointer">&#10005;</button>
+    </div>
+    <div>
+      <div style="font-size:.75rem;color:#64748b;margin-bottom:6px">Pobierz model z Civitai (wklej link pobierania):</div>
+      <div class="mgr-dl-row">
+        <input id="mgr-url-input" type="url" placeholder="https://civitai.red/api/download/models/...">
+        <button class="mgr-dl-btn" onclick="startDownload()">&#11015; Pobierz</button>
+      </div>
+      <div class="dl-progress" id="dl-progress">
+        <div class="dl-info" id="dl-info">Przygotowywanie...</div>
+        <div class="dl-bar-bg"><div class="dl-bar-fill" id="dl-bar-fill"></div></div>
+        <div class="dl-info" id="dl-bytes">0 MB / 0 MB</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div style="font-size:.75rem;color:#64748b">Zainstalowane modele:</div>
+      <button onclick="refreshMgrList()" style="background:none;border:1px solid #334155;color:#94a3b8;padding:3px 10px;border-radius:6px;font-size:.72rem;cursor:pointer">&#8635; Odśwież</button>
+    </div>
+    <div class="mgr-list" id="mgr-list">
+      <div style="color:#475569;font-size:.82rem">Ładowanie...</div>
+    </div>
+  </div>
+</div>
 <div id="publish-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;">
   <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:22px 24px;max-width:360px;width:90%;">
     <div style="font-size:16px;font-weight:700;color:#e2e8f0;margin:0 0 8px;">&#9889; Opublikuj zdjęcie</div>
@@ -1322,6 +1422,7 @@ select{resize:none;cursor:pointer}
         <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
         <button class="auto-btn auto-model-btn" onclick="autoModel()" title="AI dobierze najlepszy model do promptu">&#129302; Model</button>
       </div>
+      <button class="mgr-manage-btn" onclick="openMgrModal()">&#9881; Zarządzaj modelami / pobierz nowy</button>
     </div>
     <div class="row2">
       <div class="field krea2-hide">
@@ -1844,6 +1945,106 @@ function applyAutoResult(s, fromCache) {
   toast(msg, 'ok');
 }
 
+
+/* ── Zarządzaj modelami ── */
+var _dlJobId = null, _dlTimer = null;
+
+function openMgrModal() {
+  document.getElementById('model-mgr-modal').classList.add('open');
+  refreshMgrList();
+}
+function closeMgrModal() {
+  document.getElementById('model-mgr-modal').classList.remove('open');
+  if (_dlTimer) { clearInterval(_dlTimer); _dlTimer = null; }
+}
+
+function refreshMgrList() {
+  fetch('/api/models/refresh').then(function(){ return fetch('/api/models'); })
+    .then(function(r){ return r.json(); })
+    .then(function(models) {
+      var list = document.getElementById('mgr-list');
+      if (!models.length) { list.innerHTML = '<div style="color:#475569;font-size:.82rem">Brak modeli</div>'; return; }
+      list.innerHTML = '';
+      models.forEach(function(m) {
+        var name = (m.model_name || m.title || '').replace(/\.[^.]+$/, '');
+        var fname = (m.filename || m.model_name || '') + '';
+        if (!fname.match(/\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
+        var div = document.createElement('div'); div.className = 'mgr-item';
+        div.innerHTML = '<div class="mgr-item-name" title="' + fname + '">' + name + '</div>'
+          + '<button class="mgr-del-btn" onclick="deleteModel(' + JSON.stringify(fname) + ',this)">&#128465; Usuń</button>';
+        list.appendChild(div);
+      });
+      // też odśwież select modeli
+      fetch('/api/models').then(function(r){return r.json();}).then(function(ms){
+        var sel = document.getElementById('model-sel');
+        if (!sel) return;
+        var cur = sel.value;
+        sel.innerHTML = ms.map(function(m){
+          var v = m.model_name || m.title || '';
+          return '<option value="' + v + '"' + (v===cur?' selected':'') + '>' + v + '</option>';
+        }).join('');
+      });
+    });
+}
+
+function deleteModel(fname, btn) {
+  if (!confirm('Usunąć model ' + fname + '?')) return;
+  btn.disabled = true; btn.textContent = '...';
+  fetch('/api/model-delete/' + encodeURIComponent(fname))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) { toast('Usunięto: ' + fname, 'ok'); refreshMgrList(); }
+      else { toast('Błąd: ' + d.error, 'err'); btn.disabled=false; btn.textContent='\uD83D\uDDD1 Usuń'; }
+    });
+}
+
+function startDownload() {
+  var url = document.getElementById('mgr-url-input').value.trim();
+  if (!url) { toast('Wklej URL pobierania', 'err'); return; }
+  var prog = document.getElementById('dl-progress');
+  prog.classList.add('show');
+  document.getElementById('dl-info').textContent = 'Łączenie...';
+  document.getElementById('dl-bar-fill').style.width = '0%';
+  document.getElementById('dl-bytes').textContent = '';
+  fetch('/api/download-model', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({url: url})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { toast('Błąd: ' + d.error, 'err'); prog.classList.remove('show'); return; }
+      _dlJobId = d.job_id;
+      _dlTimer = setInterval(pollDownload, 800);
+    })
+    .catch(function(e){ toast('Błąd: ' + e, 'err'); prog.classList.remove('show'); });
+}
+
+function pollDownload() {
+  if (!_dlJobId) return;
+  fetch('/api/download-progress/' + _dlJobId)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) return;
+      var pct  = d.percent >= 0 ? d.percent : 0;
+      var done = d.bytes_done || 0;
+      var size = d.size || 0;
+      document.getElementById('dl-bar-fill').style.width = (d.percent >= 0 ? pct : 50) + '%';
+      document.getElementById('dl-info').textContent = (d.filename || 'Pobieranie...') + (d.percent >= 0 ? '  ' + pct + '%' : '');
+      document.getElementById('dl-bytes').textContent = size > 0
+        ? (done/1048576).toFixed(1) + ' MB / ' + (size/1048576).toFixed(1) + ' MB'
+        : (done/1048576).toFixed(1) + ' MB pobranych';
+      if (d.status === 'done') {
+        clearInterval(_dlTimer); _dlTimer = null;
+        document.getElementById('dl-bar-fill').style.width = '100%';
+        document.getElementById('dl-info').textContent = '\u2705 Pobrano: ' + d.filename;
+        toast('Pobrano model: ' + d.filename, 'ok');
+        document.getElementById('mgr-url-input').value = '';
+        refreshMgrList();
+      } else if (d.status === 'error') {
+        clearInterval(_dlTimer); _dlTimer = null;
+        document.getElementById('dl-info').textContent = '\u274C Błąd: ' + d.error;
+        toast('Błąd pobierania: ' + d.error, 'err');
+      }
+    });
+}
 
 function autoModel() {
   var sel = document.getElementById('model-sel');
@@ -3317,6 +3518,30 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
             return
+        if path == '/api/models/refresh':
+            _refresh_models_once()
+            self._json({'ok': True})
+            return
+
+        if path.startswith('/api/download-progress/'):
+            job_id = path[23:]
+            d = _downloads.get(job_id)
+            if not d: self._json({'ok': False, 'error': 'brak job'}); return
+            self._json({'ok': True, **d})
+            return
+
+        if path.startswith('/api/model-delete/'):
+            fname = unquote(path[18:])
+            if '/' in fname or '\\' in fname or not fname:
+                self._json({'ok': False, 'error': 'nieprawidłowa nazwa'}); return
+            fpath = MODELS_DIR / fname
+            if not fpath.exists():
+                self._json({'ok': False, 'error': 'plik nie istnieje'}); return
+            fpath.unlink()
+            _refresh_models_once()
+            self._json({'ok': True})
+            return
+
         if path.startswith('/api/auto-model'):
             from urllib.parse import urlparse, parse_qs as pqs
             qs     = pqs(urlparse(self.path).query)
@@ -3581,6 +3806,20 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length).decode('utf-8', errors='replace')
 
+        if self.path == '/api/download-model':
+            try:
+                data = json.loads(body)
+                url = data.get('url', '').strip()
+            except:
+                self._json({'ok': False, 'error': 'bad JSON'}); return
+            if not url or not (url.startswith('http://') or url.startswith('https://')):
+                self._json({'ok': False, 'error': 'nieprawidłowy URL'}); return
+            job_id = uuid.uuid4().hex[:12]
+            _downloads[job_id] = {'url': url, 'filename': '', 'percent': 0,
+                                   'status': 'starting', 'error': '', 'bytes_done': 0, 'size': 0}
+            threading.Thread(target=_download_model_thread, args=(job_id, url), daemon=True).start()
+            self._json({'ok': True, 'job_id': job_id})
+            return
         if self.path == '/login':
             params   = parse_qs(body)
             username = params.get('username', [''])[0].strip()
