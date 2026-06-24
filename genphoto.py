@@ -944,9 +944,9 @@ body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;min-heigh
 a{color:inherit;text-decoration:none}
 
 /* Header */
-header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-height:52px;display:flex;align-items:center;gap:8px;flex-wrap:nowrap;position:sticky;top:0;z-index:100}
+header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-height:52px;display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:100}
 .logo{font-size:1.05rem;font-weight:700;color:#93c5fd;white-space:nowrap;flex-shrink:0}
-.hdr-row2{display:flex;align-items:center;gap:6px;flex:1;overflow:hidden}
+.hdr-body{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
 .preset-tabs{display:flex;gap:5px;overflow-x:auto;scrollbar-width:none;flex-shrink:0}
 .preset-tabs::-webkit-scrollbar{display:none}
 .preset-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:4px}
@@ -954,7 +954,7 @@ header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-hei
 .preset-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
 .auto-btn{background:#0f2b4d;border:1px solid #2563eb;color:#93c5fd;padding:5px 13px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;flex-shrink:0;font-weight:600}
 .auto-btn:hover{border-color:#60a5fa;color:#e2e8f0;background:#1e3a5f}
-.hdr-row2-sep{flex:1}
+.hdr-spacer{flex:1}
 .hdr-links{display:flex;gap:6px;align-items:center;flex-shrink:0}
 .vram-widget{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:4px 10px;flex-shrink:0}
 .vram-canvas{display:block;border-radius:4px}
@@ -1130,13 +1130,15 @@ select{resize:none;cursor:pointer}
 
 /* ── Mobile responsive ── */
 @media(max-width:640px){
-  header{flex-wrap:wrap;gap:0;padding:5px 10px;column-gap:6px;row-gap:0}
-  .logo{font-size:.9rem;flex-shrink:0;order:1}
-  .hdr-links{flex-shrink:0;order:2;margin-left:auto}
-  .vram-widget{order:3;flex-shrink:0;display:none}
-  .hdr-row2{order:10;width:100%;border-top:1px solid #1e3a5f;padding-top:6px;margin-top:5px;overflow-x:auto;flex-wrap:nowrap;gap:4px}
-  .hdr-row2-sep{display:none}
-  .view-tab-btn{padding:5px 10px;font-size:.76rem}
+  header{flex-wrap:wrap;height:auto;padding:5px 8px;column-gap:8px;row-gap:0}
+  /* Linia 1: logo po lewej, links po prawej */
+  .logo{flex-shrink:0;font-size:.9rem}
+  .hdr-links{flex-shrink:0;margin-left:auto}
+  /* Linia 2: hdr-body — pełna szerokość, scroll poziomy */
+  .hdr-body{width:100%;border-top:1px solid #1e3a5f;padding-top:6px;margin-top:5px;overflow-x:auto;flex-wrap:nowrap;gap:5px}
+  .hdr-spacer{display:none}
+  .vram-widget{display:none}
+  .view-tab-btn{padding:5px 9px;font-size:.75rem;white-space:nowrap}
   .hdr-btn{padding:4px 8px;font-size:.74rem}
   main{padding:12px 10px;gap:14px}
   .edit-layout{padding:12px 10px;gap:14px}
@@ -1160,24 +1162,24 @@ select{resize:none;cursor:pointer}
 
 <header>
   <div class="logo">&#127912; GenPhoto</div>
-  <div class="preset-tabs" id="preset-tabs">
-    __PRESET_TABS__
-  </div>
-  <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
-  <div class="hdr-row2-sep" style="flex:1"></div>
-  <div class="view-tabs">
-    <button class="view-tab-btn active" id="tab-gen" onclick="switchView(\'generate\')">&#127912; Generuj</button>
-    <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
-    <button class="view-tab-btn" id="tab-portrait" onclick="switchView(\'portrait\')">&#128100; Portret</button>
-    <button class="view-tab-btn" id="tab-pose" onclick="switchView(\'pose\')">&#128694; Poza</button>
-  </div>
-  <div class="vram-widget" id="vram-widget">
-    <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
-    <div class="vram-info">
-      <span class="vram-nums" id="vram-nums">-- / --</span>
-      <span class="vram-label">GB zajęte / wolne</span>
+  <div class="hdr-body">
+    <div class="preset-tabs" id="preset-tabs">__PRESET_TABS__</div>
+    <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
+    <div class="hdr-spacer"></div>
+    <div class="view-tabs">
+      <button class="view-tab-btn active" id="tab-gen" onclick="switchView(\'generate\')">&#127912; Generuj</button>
+      <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
+      <button class="view-tab-btn" id="tab-portrait" onclick="switchView(\'portrait\')">&#128100; Portret</button>
+      <button class="view-tab-btn" id="tab-pose" onclick="switchView(\'pose\')">&#128694; Poza</button>
     </div>
-    <button class="vram-free-btn" id="vram-free-btn" onclick="vramFree()">ZWOLNIJ</button>
+    <div class="vram-widget" id="vram-widget">
+      <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
+      <div class="vram-info">
+        <span class="vram-nums" id="vram-nums">-- / --</span>
+        <span class="vram-label">GB zajęte / wolne</span>
+      </div>
+      <button class="vram-free-btn" id="vram-free-btn" onclick="vramFree()">ZWOLNIJ</button>
+    </div>
   </div>
   <div class="hdr-links">
     <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
