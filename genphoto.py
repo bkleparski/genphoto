@@ -2041,7 +2041,8 @@ function refreshMgrList() {
       var sorted = _sortByOrder(models);
       sorted.forEach(function(m) {
         var name = (m.model_name || m.title || '').replace(/\.[^.]+$/, '');
-        var fname = (m.filename || m.model_name || '') + '';
+        var fullpath = m.filename || '';
+        var fname = fullpath ? fullpath.replace(/.*[\/\\]/, '') : (m.model_name || '') + '.safetensors';
         if (!fname.match(/\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
         var div = document.createElement('div');
         div.className = 'mgr-item';
