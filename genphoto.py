@@ -147,6 +147,7 @@ MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
 
 def _refresh_models_once():
     global _models_cache
+    forge_post('/sdapi/v1/refresh-checkpoints', {})
     data = forge_get('/sdapi/v1/sd-models') or []
     try:
         krea_health = json.loads(urllib.request.urlopen(f'{KREA2_URL}/health', timeout=3).read())
