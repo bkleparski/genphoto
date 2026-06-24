@@ -983,6 +983,8 @@ textarea,input[type=text],input[type=number],select{width:100%;background:#0f172
 textarea:focus,input:focus,select:focus{border-color:#3b82f6}
 select{resize:none;cursor:pointer}
 .field{margin-bottom:14px}
+.model-row{display:flex;gap:8px;align-items:center}
+.model-row select{flex:1;min-width:0}
 .field label{display:block;font-size:.75rem;color:#94a3b8;margin-bottom:5px;font-weight:500}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
@@ -1172,7 +1174,6 @@ select{resize:none;cursor:pointer}
   <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate')">&#127912; Generuj</button>
   <div class="hdr-body">
     <div class="preset-tabs" id="preset-tabs">__PRESET_TABS__</div>
-    <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
     <div class="hdr-spacer"></div>
     <div class="view-tabs">
       <button class="view-tab-btn" id="tab-edit" onclick="switchView('edit')">&#9999;&#65039; Edytuj</button>
@@ -1314,7 +1315,10 @@ select{resize:none;cursor:pointer}
     </div>
     <div class="field">
       <label>Model</label>
-      <select id="model-sel" onchange="markCustom();onModelChange(this.value)">__MODEL_OPTIONS__</select>
+      <div class="model-row">
+        <select id="model-sel" onchange="markCustom();onModelChange(this.value)">__MODEL_OPTIONS__</select>
+        <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
+      </div>
     </div>
     <div class="row2">
       <div class="field krea2-hide">
