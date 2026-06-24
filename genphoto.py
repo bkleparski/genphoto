@@ -1994,7 +1994,7 @@ function deleteModel(fname, btn) {
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (d.ok) { toast('Usunięto: ' + fname, 'ok'); refreshMgrList(); }
-      else { toast('Błąd: ' + d.error, 'err'); btn.disabled=false; btn.textContent='\uD83D\uDDD1 Usuń'; }
+      else { toast('Błąd: ' + d.error, 'err'); btn.disabled=false; btn.textContent='🗑 Usu\u0144';; }
     });
 }
 
