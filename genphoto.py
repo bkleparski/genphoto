@@ -1164,6 +1164,10 @@ select{resize:none;cursor:pointer}
 .mgr-item-size{font-size:.72rem;color:#64748b;flex-shrink:0}
 .mgr-del-btn{background:transparent;border:1px solid #7f1d1d;color:#f87171;padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer;flex-shrink:0}
 .mgr-del-btn:hover{background:#7f1d1d;color:#fff}
+.mgr-drag-handle{color:#334155;cursor:grab;font-size:1rem;flex-shrink:0;user-select:none;padding:0 4px}
+.mgr-drag-handle:active{cursor:grabbing}
+.mgr-item.dnd-dragging{opacity:.4}
+.mgr-item.dnd-over{border-color:#3b82f6;background:#0f2847}
 .mgr-manage-btn{background:transparent;border:none;color:#475569;font-size:.72rem;cursor:pointer;padding:4px 8px;margin-top:2px;display:block;width:100%;text-align:left}
 .mgr-manage-btn:hover{color:#94a3b8}
 
@@ -1958,6 +1962,74 @@ function closeMgrModal() {
   if (_dlTimer) { clearInterval(_dlTimer); _dlTimer = null; }
 }
 
+/* ── Model order helpers ── */
+function _getModelOrder() {
+  try { return JSON.parse(localStorage.getItem('model-order') || '[]'); } catch(e) { return []; }
+}
+function _saveModelOrder(names) {
+  localStorage.setItem('model-order', JSON.stringify(names));
+}
+function _sortByOrder(models) {
+  var order = _getModelOrder();
+  if (!order.length) return models;
+  var map = {};
+  models.forEach(function(m){ map[m.model_name || m.title || ''] = m; });
+  var sorted = [];
+  order.forEach(function(n){ if (map[n]) { sorted.push(map[n]); delete map[n]; } });
+  Object.values(map).forEach(function(m){ sorted.push(m); });
+  return sorted;
+}
+function _applyOrderToSelect(models) {
+  var sel = document.getElementById('model-sel');
+  if (!sel) return;
+  var cur = sel.value;
+  var sorted = _sortByOrder(models);
+  sel.innerHTML = sorted.map(function(m){
+    var v = m.model_name || m.title || '';
+    return '<option value="' + v + '"' + (v===cur?' selected':'') + '>' + v + '</option>';
+  }).join('');
+}
+
+/* drag-and-drop state */
+var _dndSrc = null;
+
+function _initDnd(list) {
+  list.querySelectorAll('.mgr-item').forEach(function(item) {
+    item.addEventListener('dragstart', function(e) {
+      _dndSrc = item;
+      e.dataTransfer.effectAllowed = 'move';
+      setTimeout(function(){ item.classList.add('dnd-dragging'); }, 0);
+    });
+    item.addEventListener('dragend', function() {
+      item.classList.remove('dnd-dragging');
+      list.querySelectorAll('.mgr-item').forEach(function(i){ i.classList.remove('dnd-over'); });
+      /* zapisz nową kolejność */
+      var names = [];
+      list.querySelectorAll('.mgr-item').forEach(function(i){
+        names.push(i.dataset.fname);
+      });
+      _saveModelOrder(names);
+      /* zastosuj do selektu */
+      fetch('/api/models').then(function(r){return r.json();}).then(_applyOrderToSelect);
+    });
+    item.addEventListener('dragover', function(e) {
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+      list.querySelectorAll('.mgr-item').forEach(function(i){ i.classList.remove('dnd-over'); });
+      item.classList.add('dnd-over');
+    });
+    item.addEventListener('drop', function(e) {
+      e.preventDefault();
+      if (_dndSrc && _dndSrc !== item) {
+        /* wstaw src przed target lub po (zależnie od pozycji kursora) */
+        var rect = item.getBoundingClientRect();
+        var after = e.clientY > rect.top + rect.height / 2;
+        if (after) list.insertBefore(_dndSrc, item.nextSibling);
+        else       list.insertBefore(_dndSrc, item);
+      }
+    });
+  });
+}
+
 function refreshMgrList() {
   fetch('/api/models/refresh').then(function(){ return fetch('/api/models'); })
     .then(function(r){ return r.json(); })
@@ -1965,25 +2037,22 @@ function refreshMgrList() {
       var list = document.getElementById('mgr-list');
       if (!models.length) { list.innerHTML = '<div style="color:#475569;font-size:.82rem">Brak modeli</div>'; return; }
       list.innerHTML = '';
-      models.forEach(function(m) {
+      var sorted = _sortByOrder(models);
+      sorted.forEach(function(m) {
         var name = (m.model_name || m.title || '').replace(/\.[^.]+$/, '');
         var fname = (m.filename || m.model_name || '') + '';
         if (!fname.match(/\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
-        var div = document.createElement('div'); div.className = 'mgr-item';
-        div.innerHTML = '<div class="mgr-item-name" title="' + fname + '">' + name + '</div>'
+        var div = document.createElement('div');
+        div.className = 'mgr-item';
+        div.draggable = true;
+        div.dataset.fname = fname;
+        div.innerHTML = '<span class="mgr-drag-handle" title="Przeciągnij aby zmienić kolejność">&#9776;</span>'
+          + '<div class="mgr-item-name" title="' + fname + '">' + name + '</div>'
           + '<button class="mgr-del-btn" onclick="deleteModel(' + JSON.stringify(fname) + ',this)">&#128465; Usuń</button>';
         list.appendChild(div);
       });
-      // też odśwież select modeli
-      fetch('/api/models').then(function(r){return r.json();}).then(function(ms){
-        var sel = document.getElementById('model-sel');
-        if (!sel) return;
-        var cur = sel.value;
-        sel.innerHTML = ms.map(function(m){
-          var v = m.model_name || m.title || '';
-          return '<option value="' + v + '"' + (v===cur?' selected':'') + '>' + v + '</option>';
-        }).join('');
-      });
+      _initDnd(list);
+      _applyOrderToSelect(models);
     });
 }
 
