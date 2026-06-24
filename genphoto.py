@@ -1818,21 +1818,19 @@ function autoSettings() {
   if (!sel) return;
   var val = sel.value.toLowerCase();
   var cfg, steps, sampler, sched, w, h, batch;
-  if (val.indexOf('flux') !== -1 || val.indexOf('unstableevolution') !== -1) {
+  // Wykrywanie architektury po nazwie modelu
+  var isFlux = val.indexOf('flux') !== -1 || val.indexOf('unstableevolution') !== -1 || val.indexOf('krea') !== -1;
+  // SDXL: tylko gdy nazwa JAWNIE zawiera xl, sdxl lub pony
+  var isSdxl = !isFlux && (val.indexOf('xl') !== -1 || val.indexOf('sdxl') !== -1 || val.indexOf('pony') !== -1);
+  if (isFlux) {
     // FLUX — minimalne CFG, Euler, Simple
     cfg=1.0; steps=20; sampler='Euler'; sched='Simple'; w=1024; h=1024; batch=1;
-  } else if (val.indexOf('xl') !== -1 || val.indexOf('pony') !== -1 ||
-             val.indexOf('juggernaut') !== -1 || val.indexOf('realvis') !== -1 ||
-             val.indexOf('illustrious') !== -1 || val.indexOf('cyber') !== -1 ||
-             val.indexOf('leosams') !== -1 || val.indexOf('biglov') !== -1 ||
-             val.indexOf('epicrealism') !== -1 || val.indexOf('intorealism') !== -1 ||
-             val.indexOf('pornmaster') !== -1 || val.indexOf('realisticlust') !== -1 ||
-             val.indexOf('animagine') !== -1) {
-    // SDXL — dobre dla portretów
+  } else if (isSdxl) {
+    // SDXL
     cfg=5.5; steps=28; sampler='DPM++ SDE'; sched='Karras'; w=1024; h=1024; batch=4;
   } else {
-    // SD 1.5
-    cfg=7.0; steps=25; sampler='DPM++ 2M'; sched='Karras'; w=512; h=768; batch=4;
+    // SD 1.5 (domyślne)
+    cfg=7.0; steps=28; sampler='DPM++ SDE'; sched='Karras'; w=832; h=1216; batch=4;
   }
   document.getElementById('cfg-in').value   = cfg;
   document.getElementById('steps-in').value = steps;
