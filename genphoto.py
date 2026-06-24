@@ -1276,7 +1276,7 @@ select{resize:none;cursor:pointer}
 
 
 <!-- Modal zarządzania modelami -->
-<div id="model-mgr-modal">
+<div id="model-mgr-modal" onclick="if(event.target===this)closeMgrModal()">
   <div class="mgr-box">
     <div style="display:flex;align-items:center;justify-content:space-between">
       <div class="mgr-title">&#128194; Zarządzaj modelami</div>
@@ -1956,6 +1956,7 @@ var _dlJobId = null, _dlTimer = null;
 
 function openMgrModal() {
   document.getElementById('model-mgr-modal').classList.add('open');
+  document.getElementById('mgr-list').innerHTML = '<div style="color:#475569;font-size:.82rem;padding:8px">Ładowanie...</div>';
   refreshMgrList();
 }
 function closeMgrModal() {
