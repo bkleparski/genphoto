@@ -1977,7 +1977,7 @@ function _sortByOrder(models) {
   models.forEach(function(m){ map[m.model_name || m.title || ''] = m; });
   var sorted = [];
   order.forEach(function(n){ if (map[n]) { sorted.push(map[n]); delete map[n]; } });
-  Object.values(map).forEach(function(m){ sorted.push(m); });
+  Object.keys(map).forEach(function(k){ sorted.push(map[k]); });
   return sorted;
 }
 function _applyOrderToSelect(models) {
@@ -2055,7 +2055,7 @@ function refreshMgrList() {
       });
       _initDnd(list);
       _applyOrderToSelect(models);
-    });
+    }).catch(function(e){ console.error('refreshMgrList error:', e); });
 }
 
 function deleteModel(fname, btn) {
