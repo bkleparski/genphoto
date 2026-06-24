@@ -106,12 +106,6 @@ PRESETS = [
      'steps':28, 'cfg':3.5,'width':1024, 'height':1024, 'batch':1,
      'prefix':'',
      'negative': ''},
-    {'id':'headshot',  'name':'Headshot',  'icon':'&#127919;',
-     'model':'juggernautXL_ragnarok','sampler':'DPM++ SDE',   'scheduler':'Karras',
-     'steps':30, 'cfg':5.5, 'width':1024, 'height':1024, 'batch':2,
-     'prefix':'RAW photo, real person, detailed skin texture, (photorealistic:1.4), (realistic:1.3), '
-              '8k uhd, professional headshot, 85mm lens, f/1.4, shallow depth of field, bokeh, ',
-     'negative': NEG},
 ]
 
 # ── Forge API ─────────────────────────────────────────────────────────────────
@@ -958,7 +952,7 @@ header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-hei
 .preset-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:4px}
 .preset-btn:hover{border-color:#60a5fa;color:#e2e8f0}
 .preset-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
-.auto-btn{background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;flex-shrink:0}
+.auto-btn{background:#0f2b4d;border:1px solid #2563eb;color:#93c5fd;padding:5px 13px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;flex-shrink:0;font-weight:600}
 .auto-btn:hover{border-color:#60a5fa;color:#e2e8f0;background:#1e3a5f}
 .hdr-row2-sep{flex:1}
 .hdr-links{display:flex;gap:6px;align-items:center;flex-shrink:0}
@@ -1169,6 +1163,8 @@ select{resize:none;cursor:pointer}
   <div class="preset-tabs" id="preset-tabs">
     __PRESET_TABS__
   </div>
+  <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
+  <div class="hdr-row2-sep" style="flex:1"></div>
   <div class="view-tabs">
     <button class="view-tab-btn active" id="tab-gen" onclick="switchView(\'generate\')">&#127912; Generuj</button>
     <button class="view-tab-btn" id="tab-edit" onclick="switchView(\'edit\')">&#9999;&#65039; Edytuj</button>
