@@ -66,6 +66,13 @@ with db() as _c:
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 SESSIONS = set()
+# Stały token sesji — ważny dopóki hasło się nie zmieni
+def _make_persistent_token():
+    import hashlib
+    h = os.environ.get('GP_PASSWORD_HASH', '')
+    if not h: return None
+    return hashlib.sha256(('gp-session-v1:' + h).encode()).hexdigest()
+_PERSISTENT_TOKEN = None  # wypełniane po starcie
 _auto_cache = {}  # model_name -> {settings, ts}
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
@@ -3488,7 +3495,8 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _authed(self):
-        return self._cookie() in SESSIONS
+        tok = self._cookie()
+        return tok in SESSIONS or (bool(_PERSISTENT_TOKEN) and tok == _PERSISTENT_TOKEN)
 
     def _json(self, d, code=200):
         body = json.dumps(d).encode()
@@ -4121,5 +4129,10 @@ if __name__ == '__main__':
             super().server_bind()
     server = _DualStack(('::', PORT), Handler)
     threading.Thread(target=_models_cache_worker, daemon=True).start()
+    _pt = _make_persistent_token()
+    if _pt:
+        _PERSISTENT_TOKEN = _pt  # noqa: global już zadeklarowane na poziomie modułu
+        SESSIONS.add(_pt)
+        print('Trwały token sesji aktywny')
     _refresh_models_once()  # zaladuj cache przed pierwszym requestem
     server.serve_forever()
