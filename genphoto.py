@@ -3297,7 +3297,7 @@ class Handler(BaseHTTPRequestHandler):
             req_body = json.dumps({
                 'model': DEEPSEEK_MODEL,
                 'messages': [{'role': 'user', 'content': prompt}],
-                'temperature': 0.1, 'max_tokens': 300
+                'temperature': 0.1, 'max_tokens': 1000
             }).encode()
             req = urllib.request.Request(
                 'https://api.deepseek.com/chat/completions',
