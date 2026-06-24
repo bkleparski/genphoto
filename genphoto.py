@@ -12,9 +12,11 @@ import urllib.request, urllib.error
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get('GP_PORT', '7862'))
 OUTPUTS_DIR  = Path(os.environ.get('GP_OUTPUTS_DIR', '/home/bartek/forge/outputs'))
+
 FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('/')
 COMFY_URL    = os.environ.get('GP_COMFY_URL', 'http://localhost:8189').rstrip('/')
 COMFY_OUTPUTS = Path(os.environ.get('GP_COMFY_OUTPUTS', '/home/bartek/comfyui/output'))
+KREA2_URL    = os.environ.get('GP_KREA2_URL', 'http://localhost:7870').rstrip('/')
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('GP_DEEPSEEK_MODEL', 'deepseek-v4-flash')
 AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
@@ -94,24 +96,16 @@ NEG = ('(worst quality:2), (low quality:2), (blurry:1.3), deformed, ugly, extra 
        'plastic skin, fake, overexposed, oversaturated, unnatural skin')
 
 PRESETS = [
-    {'id':'portrait',  'name':'Portrait',  'icon':'&#128100;',
-     'model':'RealVisXL_V5_fp16',   'sampler':'DPM++ SDE',    'scheduler':'Karras',
-     'steps':30, 'cfg':5.5, 'width':832,  'height':1216, 'batch':4,
-     'prefix':'RAW photo, real person, detailed skin texture, natural skin pores, (photorealistic:1.4), '
-              '(realistic:1.3), 8k uhd, sharp focus, natural lighting, ',
-     'negative': NEG},
-    {'id':'landscape', 'name':'Krajobraz', 'icon':'&#127748;',
-     'model':'juggernautXL_ragnarok','sampler':'DPM++ 2M SDE','scheduler':'Karras',
-     'steps':25, 'cfg':6.5, 'width':1216, 'height':832,  'batch':2,
-     'prefix':'RAW photo, (photorealistic:1.4), (realistic:1.3), 8k uhd, landscape photography, '
-              'dramatic lighting, high detail, sharp focus, ',
-     'negative': NEG},
-    {'id':'fashion',   'name':'Fashion',   'icon':'&#128247;',
-     'model':'RealVisXL_V5_fp16',   'sampler':'DPM++ SDE',    'scheduler':'Karras',
-     'steps':30, 'cfg':5.5, 'width':832,  'height':1216, 'batch':2,
-     'prefix':'RAW photo, real person, (photorealistic:1.4), (realistic:1.3), 8k uhd, '
-              'fashion photography, professional studio lighting, sharp focus, ',
-     'negative': NEG},
+    {'id':'krea_turbo','name':'Krea 2 Turbo','icon':'&#9889;',
+     'model':'krea2_oss_turbo','sampler':'','scheduler':'',
+     'steps':8, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
+     'prefix':'',
+     'negative': ''},
+    {'id':'krea_raw',  'name':'Krea 2 Raw',  'icon':'&#127922;',
+     'model':'krea2_oss_raw','sampler':'','scheduler':'',
+     'steps':28, 'cfg':3.5,'width':1024, 'height':1024, 'batch':1,
+     'prefix':'',
+     'negative': ''},
     {'id':'headshot',  'name':'Headshot',  'icon':'&#127919;',
      'model':'juggernautXL_ragnarok','sampler':'DPM++ SDE',   'scheduler':'Karras',
      'steps':30, 'cfg':5.5, 'width':1024, 'height':1024, 'batch':2,
@@ -139,6 +133,17 @@ def forge_post(path, data, timeout=600):
 
 _flux_cache = {}
 
+
+def krea_post(path, data, timeout=120):
+    """POST to Krea 2 API and return (binary_image_data, headers_dict)"""
+    raw = json.dumps(data).encode()
+    req = urllib.request.Request(
+        f'{KREA2_URL}{path}', data=raw,
+        headers={'Content-Type': 'application/json'}, method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), dict(r.headers)
+
 # Cache modeli Forge — odnawiany w tle co 30s
 _models_cache = []
 _models_lock  = threading.Lock()
@@ -146,6 +151,14 @@ _models_lock  = threading.Lock()
 def _refresh_models_once():
     global _models_cache
     data = forge_get('/sdapi/v1/sd-models') or []
+    try:
+        krea_health = json.loads(urllib.request.urlopen(f'{KREA2_URL}/health', timeout=3).read())
+        if krea_health.get('checkpoints'):
+            for name, info in krea_health['checkpoints'].items():
+                if info.get('exists'):
+                    data.append({'model_name': f'krea2_{name}', 'title': f'Krea 2 {name}', 'hash': ''})
+    except:
+        pass
     with _models_lock:
         _models_cache = data
 
@@ -246,7 +259,7 @@ FLUX_ADDITIONAL_MODULES = [
 ]
 
 def model_override_settings(title, filename=''):
-    s = {'sd_model_checkpoint': title}
+    s = {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': '', 'forge_additional_modules': []}
     flux = 'flux' in title.lower() or (filename and is_flux_checkpoint(filename))
     if flux:
         s['forge_additional_modules'] = FLUX_ADDITIONAL_MODULES
@@ -302,6 +315,72 @@ def forge_generate_thread(params, jid):
                      params.get('preset','custom'), json.dumps(paths))
                 )
         job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+def krea_generate_thread(params, jid):
+    """Generate using Krea 2 API."""
+    try:
+        job_set(jid, status='generating')
+        
+        # Determine checkpoint
+        model = params.get('model', 'oss_turbo')
+        
+        # Krea 2 parameters
+        body = {
+            'prompt': params['positive'],
+            'checkpoint': 'oss_turbo' if 'turbo' in model else 'oss_raw',
+            'width': min(int(params['width']), 2048),
+            'height': min(int(params['height']), 2048),
+            'num_images': int(params.get('batch', 1)),
+            'seed': int(params.get('seed', 0)),
+        }
+        
+        # Steps: default 8 for turbo, 52 for raw
+        if 'steps' in params and params['steps']:
+            body['steps'] = int(params['steps'])
+        
+        # CFG: default 0.0 for turbo, 3.5 for raw
+        if 'cfg' in params and params['cfg']:
+            body['cfg'] = float(params['cfg'])
+        
+        # Call Krea 2 API
+        img_data, headers = krea_post('/generate', body)
+        gen_time = headers.get('X-Generation-Time', '?')
+        seed = headers.get('X-Seed', str(body['seed']))
+        
+        # Save image
+        today = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        name = f'krea_{ts}_00_s{seed}.png'
+        (out_dir / name).write_bytes(img_data)
+        paths = [f'genphoto/{today}/{name}']
+        
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description',''),
+                     params['positive'], params.get('negative',''), model,
+                     params.get('sampler',''), params.get('scheduler',''),
+                     int(body.get('steps',8)), float(body.get('cfg',0.0)),
+                     int(body['width']), int(body['height']),
+                     int(seed), int(params.get('batch',1)),
+                     params.get('preset','krea'), json.dumps(paths))
+                )
+        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        
+        # Also generate on other batch images if requested
+        for i in range(1, int(params.get('batch', 1))):
+            body['seed'] = int(seed) + i
+            img_data2, _ = krea_post('/generate', body)
+            name2 = f'krea_{ts}_{i:02d}_s{int(seed)+i}.png'
+            (out_dir / name2).write_bytes(img_data2)
+            paths.append(f'genphoto/{today}/{name2}')
+            
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
@@ -871,14 +950,18 @@ body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;min-heigh
 a{color:inherit;text-decoration:none}
 
 /* Header */
-header{background:#1e293b;border-bottom:1px solid #334155;padding:0 20px;height:54px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100}
-.logo{font-size:1.05rem;font-weight:700;color:#93c5fd;white-space:nowrap}
-.preset-tabs{display:flex;gap:6px;flex:1;overflow-x:auto;scrollbar-width:none}
+header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-height:52px;display:flex;align-items:center;gap:8px;flex-wrap:nowrap;position:sticky;top:0;z-index:100}
+.logo{font-size:1.05rem;font-weight:700;color:#93c5fd;white-space:nowrap;flex-shrink:0}
+.hdr-row2{display:flex;align-items:center;gap:6px;flex:1;overflow:hidden}
+.preset-tabs{display:flex;gap:5px;overflow-x:auto;scrollbar-width:none;flex-shrink:0}
 .preset-tabs::-webkit-scrollbar{display:none}
-.preset-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 14px;border-radius:20px;font-size:.8rem;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:5px}
+.preset-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:4px}
 .preset-btn:hover{border-color:#60a5fa;color:#e2e8f0}
 .preset-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
-.hdr-links{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.auto-btn{background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;flex-shrink:0}
+.auto-btn:hover{border-color:#60a5fa;color:#e2e8f0;background:#1e3a5f}
+.hdr-row2-sep{flex:1}
+.hdr-links{display:flex;gap:6px;align-items:center;flex-shrink:0}
 .vram-widget{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:4px 10px;flex-shrink:0}
 .vram-canvas{display:block;border-radius:4px}
 .vram-info{display:flex;flex-direction:column;align-items:flex-end;line-height:1.2;min-width:70px}
@@ -1012,7 +1095,7 @@ select{resize:none;cursor:pointer}
 #toast.err{border-color:#ef4444;color:#fca5a5}
 
 /* View tabs */
-.view-tabs{display:flex;gap:4px;margin:0 10px;flex-shrink:0}
+.view-tabs{display:flex;gap:4px;flex-shrink:0}
 .view-tab-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 14px;border-radius:20px;font-size:.8rem;cursor:pointer;transition:all .2s;white-space:nowrap}
 .view-tab-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd;font-weight:600}
 .view-tab-btn:hover{border-color:#60a5fa;color:#e2e8f0}
@@ -1053,13 +1136,14 @@ select{resize:none;cursor:pointer}
 
 /* ── Mobile responsive ── */
 @media(max-width:640px){
-  header{flex-wrap:wrap;gap:6px;padding:8px 12px}
-  .logo{font-size:.9rem;flex-shrink:0}
-  .preset-tabs{order:20;width:100%;border-top:1px solid #1e3a5f;margin-top:4px;padding-top:6px}
-  .view-tabs{margin:0 2px;flex-shrink:0}
-  .view-tab-btn{padding:4px 10px;font-size:.74rem}
-  .hdr-links{flex-shrink:0}
-  .hdr-btn{padding:4px 9px;font-size:.74rem}
+  header{flex-wrap:wrap;gap:0;padding:5px 10px;column-gap:6px;row-gap:0}
+  .logo{font-size:.9rem;flex-shrink:0;order:1}
+  .hdr-links{flex-shrink:0;order:2;margin-left:auto}
+  .vram-widget{order:3;flex-shrink:0;display:none}
+  .hdr-row2{order:10;width:100%;border-top:1px solid #1e3a5f;padding-top:6px;margin-top:5px;overflow-x:auto;flex-wrap:nowrap;gap:4px}
+  .hdr-row2-sep{display:none}
+  .view-tab-btn{padding:5px 10px;font-size:.76rem}
+  .hdr-btn{padding:4px 8px;font-size:.74rem}
   main{padding:12px 10px;gap:14px}
   .edit-layout{padding:12px 10px;gap:14px}
   .panel{padding:14px 12px}
@@ -1217,11 +1301,18 @@ select{resize:none;cursor:pointer}
 
   <div id="adv-section" class="open">
     <div class="field">
+      <label>Backend</label>
+      <div style="display:flex;gap:8px">
+        <button id="backend-forge" class="backend-btn active" onclick="switchBackend('forge')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9881; Forge</button>
+        <button id="backend-krea2" class="backend-btn" onclick="switchBackend('krea2')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9889; Krea 2</button>
+      </div>
+    </div>
+    <div class="field">
       <label>Model</label>
       <select id="model-sel" onchange="markCustom();onModelChange(this.value)">__MODEL_OPTIONS__</select>
     </div>
     <div class="row2">
-      <div class="field">
+      <div class="field krea2-hide">
         <label>Sampler</label>
         <select id="sampler-sel" onchange="markCustom()">
           <option>DPM++ SDE</option>
@@ -1713,8 +1804,51 @@ var _curPreset = null;
 var _lbImgs = [], _lbIdx = 0;
 var _pollTimer = null;
 var _histOpen = false;
+var _backend = 'forge';
+function switchBackend(b) {
+  _backend = b;
+  document.querySelectorAll('.backend-btn').forEach(function(el) { el.classList.remove('active'); });
+  document.getElementById('backend-' + b).classList.add('active');
+  // Sampler + scheduler hidden in Krea 2 mode
+  document.querySelectorAll('.krea2-hide').forEach(function(el) {
+    el.style.display = (b === 'krea2') ? 'none' : '';
+  });
+}
 
 /* ── Presets ── */
+
+function autoSettings() {
+  var sel = document.getElementById('model-sel');
+  if (!sel) return;
+  var val = sel.value.toLowerCase();
+  var cfg, steps, sampler, sched, w, h, batch;
+  if (val.indexOf('flux') !== -1 || val.indexOf('unstableevolution') !== -1) {
+    // FLUX — minimalne CFG, Euler, Simple
+    cfg=1.0; steps=20; sampler='Euler'; sched='Simple'; w=1024; h=1024; batch=1;
+  } else if (val.indexOf('xl') !== -1 || val.indexOf('pony') !== -1 ||
+             val.indexOf('juggernaut') !== -1 || val.indexOf('realvis') !== -1 ||
+             val.indexOf('illustrious') !== -1 || val.indexOf('cyber') !== -1 ||
+             val.indexOf('leosams') !== -1 || val.indexOf('biglov') !== -1 ||
+             val.indexOf('epicrealism') !== -1 || val.indexOf('intorealism') !== -1 ||
+             val.indexOf('pornmaster') !== -1 || val.indexOf('realisticlust') !== -1 ||
+             val.indexOf('animagine') !== -1) {
+    // SDXL — dobre dla portretów
+    cfg=5.5; steps=28; sampler='DPM++ SDE'; sched='Karras'; w=1024; h=1024; batch=4;
+  } else {
+    // SD 1.5
+    cfg=7.0; steps=25; sampler='DPM++ 2M'; sched='Karras'; w=512; h=768; batch=4;
+  }
+  document.getElementById('cfg-in').value   = cfg;
+  document.getElementById('steps-in').value = steps;
+  document.getElementById('w-in').value     = w;
+  document.getElementById('h-in').value     = h;
+  document.getElementById('batch-in').value = batch;
+  setVal('sampler-sel', sampler);
+  setVal('sched-sel',   sched);
+  markCustom();
+  updateParamsBar();
+  toast('Auto: ' + sampler + ' · CFG ' + cfg + ' · ' + steps + ' steps · ' + w + '×' + h, 'ok');
+}
 function applyPreset(id) {
   var p = PRESETS.find(function(x){return x.id===id;});
   if(!p) return;
@@ -3041,7 +3175,7 @@ class Handler(BaseHTTPRequestHandler):
     def _build_page(self):
         # Fetch models from Forge
         with _models_lock:
-            raw_models = [m for m in _models_cache if 'flux' not in m.get('model_name','').lower()]
+            raw_models = [m for m in _models_cache if not m.get('model_name','').lower().startswith('flux')]
         model_opts = ''
         for m in raw_models:
             n = html.escape(m.get('model_name',''))
@@ -3328,7 +3462,10 @@ class Handler(BaseHTTPRequestHandler):
                 params = json.loads(body)
                 params['gen_id'] = uuid.uuid4().hex
                 jid = job_create()
-                if params.get('init_image'):
+                backend = params.get('backend', 'forge')
+                if backend == 'krea2':
+                    target = krea_generate_thread
+                elif params.get('init_image'):
                     target = forge_img2img_ref_thread
                 else:
                     target = forge_generate_thread
