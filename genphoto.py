@@ -941,6 +941,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <title>GenPhoto</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
+html{overflow-x:hidden}
 body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
 a{color:inherit;text-decoration:none}
 
@@ -1044,13 +1045,13 @@ select{resize:none;cursor:pointer}
 .hist-header{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none}
 .hist-header h2{font-size:.9rem;font-weight:600;color:#94a3b8;display:flex;align-items:center;gap:8px}
 #hist-body{margin-top:16px;display:flex;flex-direction:column;gap:10px}
-.hist-item{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px 16px;display:flex;gap:14px;align-items:flex-start}
+.hist-item{background:#0f172a;border:1px solid #334155;border-radius:10px;padding:14px 16px;display:flex;gap:14px;align-items:flex-start;overflow:hidden;min-width:0}
 .hist-thumbs{display:flex;gap:4px;flex-shrink:0}
 .hist-thumb{width:48px;height:48px;object-fit:cover;border-radius:6px;cursor:pointer;border:1px solid #334155}
 .hist-meta{flex:1;min-width:0}
 .hist-desc{font-size:.85rem;color:#e2e8f0;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:3px}
 .hist-tags{font-size:.72rem;color:#64748b;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hist-actions{display:flex;gap:6px}
+.hist-actions{display:flex;gap:6px;flex-wrap:wrap}
 .hist-btn{background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer;transition:all .2s}
 .hist-btn:hover{border-color:#475569;color:#e2e8f0}
 .hist-btn.del{color:#f87171}
