@@ -3276,8 +3276,8 @@ class Handler(BaseHTTPRequestHandler):
             cached = _auto_cache.get(mname)
             if cached and (_t.time() - cached['ts']) < 86400 * 7:
                 self._json({'ok': True, 'settings': cached['settings'], 'cached': True}); return
-            if not DEEPSEEK_KEY:
-                self._json({'ok': False, 'error': 'GP_DEEPSEEK_KEY not set'}); return
+            if not OR_KEY:
+                self._json({'ok': False, 'error': 'GP_OR_KEY not set'}); return
             prompt = (
                 "You are an expert in Stable Diffusion image generation parameters.\n"
                 "Given a model filename, return the optimal generation settings.\n\n"
@@ -3295,14 +3295,14 @@ class Handler(BaseHTTPRequestHandler):
                 "Available schedulers: Automatic, Karras, Simple, Normal, Exponential"
             )
             req_body = json.dumps({
-                'model': DEEPSEEK_MODEL,
+                'model': OR_MODEL,
                 'messages': [{'role': 'user', 'content': prompt}],
                 'temperature': 0.1, 'max_tokens': 1000
             }).encode()
             req = urllib.request.Request(
-                'https://api.deepseek.com/chat/completions',
+                'https://openrouter.ai/api/v1/chat/completions',
                 data=req_body,
-                headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_KEY}'},
+                headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {OR_KEY}', 'HTTP-Referer': 'https://genphoto.ebartnet.pl'},
                 method='POST'
             )
             try:
