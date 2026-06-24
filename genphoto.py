@@ -957,6 +957,8 @@ header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-hei
 .auto-btn{background:#0f2b4d;border:1px solid #2563eb;color:#93c5fd;padding:5px 13px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;flex-shrink:0;font-weight:600}
 .hdr-gen-btn{flex-shrink:0}
 .auto-btn:hover{border-color:#60a5fa;color:#e2e8f0;background:#1e3a5f}
+.auto-model-btn{background:#1a0f2e;border-color:#7c3aed;color:#c4b5fd}
+.auto-model-btn:hover{background:#2d1b69;border-color:#a78bfa;color:#ede9fe}
 .hdr-spacer{flex:1}
 .hdr-links{display:flex;gap:6px;align-items:center;flex-shrink:0}
 .vram-widget{display:flex;align-items:center;gap:8px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:4px 10px;flex-shrink:0}
@@ -1318,6 +1320,7 @@ select{resize:none;cursor:pointer}
       <div class="model-row">
         <select id="model-sel" onchange="markCustom();onModelChange(this.value)">__MODEL_OPTIONS__</select>
         <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
+        <button class="auto-btn auto-model-btn" onclick="autoModel()" title="AI dobierze najlepszy model do promptu">&#129302; Model</button>
       </div>
     </div>
     <div class="row2">
@@ -1841,6 +1844,50 @@ function applyAutoResult(s, fromCache) {
   toast(msg, 'ok');
 }
 
+
+function autoModel() {
+  var sel = document.getElementById('model-sel');
+  if (!sel) return;
+  var models = Array.from(sel.options).map(function(o){ return o.value; }).filter(Boolean);
+  if (!models.length) { toast('Brak modeli na liście', 'err'); return; }
+
+  var promptTxt = (document.getElementById('pos-prompt') || {}).value || '';
+  var descTxt   = (document.getElementById('desc-in') || {}).value || '';
+  var combined  = (descTxt + ' ' + promptTxt).trim();
+  if (!combined) { toast('Wpisz najpierw opis lub prompt', 'err'); return; }
+
+  var cacheKey = 'auto_mdl_' + combined.slice(0, 80) + '|' + models.slice(0, 5).join(',');
+  try {
+    var cached = localStorage.getItem(cacheKey);
+    if (cached) {
+      var obj = JSON.parse(cached);
+      if (obj && obj.ts && (Date.now() - obj.ts) < 3600000) {
+        setVal('model-sel', obj.model);
+        onModelChange(obj.model);
+        toast('Model (cache): ' + obj.model + ' — ' + (obj.reason || ''), 'ok');
+        return;
+      }
+    }
+  } catch(e) {}
+
+  toast('\u23f3 AI dobiera model...', 'info');
+  var url = '/api/auto-model?prompt=' + encodeURIComponent(combined.slice(0, 400))
+          + '&models=' + encodeURIComponent(models.join(','));
+  fetch(url)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { toast('Błąd AI: ' + (d.error || '?'), 'err'); return; }
+      if (d.model) {
+        setVal('model-sel', d.model);
+        onModelChange(d.model);
+        try { localStorage.setItem(cacheKey, JSON.stringify({model: d.model, reason: d.reason, ts: Date.now()})); } catch(e){}
+        toast('Model AI: ' + d.model + (d.reason ? ' — ' + d.reason : ''), 'ok');
+      } else {
+        toast('AI nie wybrało modelu', 'err');
+      }
+    })
+    .catch(function(e){ toast('Błąd: ' + e, 'err'); });
+}
 function autoSettings() {
   var sel = document.getElementById('model-sel');
   if (!sel) return;
@@ -3269,6 +3316,61 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             else:
                 self.send_error(404)
+            return
+        if path.startswith('/api/auto-model'):
+            from urllib.parse import urlparse, parse_qs as pqs
+            qs     = pqs(urlparse(self.path).query)
+            prompt = qs.get('prompt', [''])[0].strip()
+            models = qs.get('models', [''])[0].strip()
+            if not prompt or not models:
+                self._json({'ok': False, 'error': 'brak prompt lub models'}); return
+            if not OR_KEY:
+                self._json({'ok': False, 'error': 'GP_OR_KEY not set'}); return
+            import time as _t
+            cache_key = 'mdl:' + prompt[:80] + '|' + models[:120]
+            cached = _auto_cache.get(cache_key)
+            if cached and (_t.time() - cached['ts']) < 3600:
+                self._json({'ok': True, 'model': cached['model'], 'reason': cached['reason'], 'cached': True}); return
+            model_list = [m.strip() for m in models.split(',') if m.strip()]
+            llm_prompt = (
+                "You are an expert in Stable Diffusion models.\n"
+                "Given an image generation prompt and a list of available checkpoint models,\n"
+                "choose the single best model for the prompt.\n\n"
+                f"Prompt: {prompt[:400]}\n\n"
+                "Available models:\n" +
+                '\n'.join(f'- {m}' for m in model_list) +
+                "\n\nRespond ONLY with valid JSON (no markdown):\n"
+                '{"model": "exact_model_name_from_list", "reason": "one sentence why"}'
+            )
+            req_body = json.dumps({
+                'model': OR_MODEL,
+                'messages': [{'role': 'user', 'content': llm_prompt}],
+                'temperature': 0.2, 'max_tokens': 200
+            }).encode()
+            req = urllib.request.Request(
+                'https://openrouter.ai/api/v1/chat/completions',
+                data=req_body,
+                headers={'Content-Type': 'application/json',
+                         'Authorization': f'Bearer {OR_KEY}',
+                         'HTTP-Referer': 'https://genphoto.ebartnet.pl'},
+                method='POST'
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read().decode())
+                raw = data['choices'][0]['message']['content'].strip().strip('`').strip()
+                if raw.startswith('json'): raw = raw[4:].strip()
+                result = json.loads(raw)
+                chosen = result.get('model', '').strip()
+                reason = result.get('reason', '')
+                if chosen not in model_list:
+                    for m in model_list:
+                        if chosen.lower() in m.lower() or m.lower() in chosen.lower():
+                            chosen = m; break
+                _auto_cache[cache_key] = {'model': chosen, 'reason': reason, 'ts': _t.time()}
+                self._json({'ok': True, 'model': chosen, 'reason': reason, 'cached': False})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
         if path.startswith('/api/auto-settings'):
             from urllib.parse import urlparse, parse_qs as pqs
