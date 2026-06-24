@@ -66,6 +66,7 @@ with db() as _c:
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 SESSIONS = set()
+_auto_cache = {}  # model_name -> {settings, ts}
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 JOBS = {}
@@ -1088,6 +1089,7 @@ select{resize:none;cursor:pointer}
 #toast.show{transform:translateX(-50%) translateY(0)}
 #toast.ok{border-color:#22c55e;color:#86efac}
 #toast.err{border-color:#ef4444;color:#fca5a5}
+#toast.info{border-color:#3b82f6;color:#93c5fd}
 
 /* View tabs */
 .view-tabs{display:flex;gap:4px;flex-shrink:0}
@@ -1819,35 +1821,48 @@ function switchBackend(b) {
 
 /* ── Presets ── */
 
+function applyAutoResult(s, fromCache) {
+  if (s.steps)    document.getElementById('steps-in').value = s.steps;
+  if (s.cfg !== undefined) document.getElementById('cfg-in').value = s.cfg;
+  if (s.width)    document.getElementById('w-in').value   = s.width;
+  if (s.height)   document.getElementById('h-in').value   = s.height;
+  if (s.sampler)  setVal('sampler-sel', s.sampler);
+  if (s.scheduler) setVal('sched-sel',  s.scheduler);
+  markCustom();
+  updateParamsBar();
+  var src = fromCache ? ' (cache)' : ' (AI)';
+  var msg = 'Auto' + src + ': ' + (s.sampler||'') + ' · CFG ' + s.cfg + ' · ' + s.steps + ' steps · ' + (s.width||'?') + '\u00d7' + (s.height||'?');
+  if (s.notes) msg += ' — ' + s.notes;
+  toast(msg, 'ok');
+}
+
 function autoSettings() {
   var sel = document.getElementById('model-sel');
   if (!sel) return;
-  var val = sel.value.toLowerCase();
-  var cfg, steps, sampler, sched, w, h, batch;
-  // Wykrywanie architektury po nazwie modelu
-  var isFlux = val.indexOf('flux') !== -1 || val.indexOf('unstableevolution') !== -1 || val.indexOf('krea') !== -1;
-  // SDXL: tylko gdy nazwa JAWNIE zawiera xl, sdxl lub pony
-  var isSdxl = !isFlux && (val.indexOf('xl') !== -1 || val.indexOf('sdxl') !== -1 || val.indexOf('pony') !== -1);
-  if (isFlux) {
-    // FLUX — minimalne CFG, Euler, Simple
-    cfg=1.0; steps=20; sampler='Euler'; sched='Simple'; w=1024; h=1024; batch=1;
-  } else if (isSdxl) {
-    // SDXL
-    cfg=5.5; steps=28; sampler='DPM++ SDE'; sched='Karras'; w=1024; h=1024; batch=4;
-  } else {
-    // SD 1.5 (domyślne)
-    cfg=7.0; steps=28; sampler='DPM++ SDE'; sched='Karras'; w=832; h=1216; batch=4;
-  }
-  document.getElementById('cfg-in').value   = cfg;
-  document.getElementById('steps-in').value = steps;
-  document.getElementById('w-in').value     = w;
-  document.getElementById('h-in').value     = h;
-  document.getElementById('batch-in').value = batch;
-  setVal('sampler-sel', sampler);
-  setVal('sched-sel',   sched);
-  markCustom();
-  updateParamsBar();
-  toast('Auto: ' + sampler + ' · CFG ' + cfg + ' · ' + steps + ' steps · ' + w + '×' + h, 'ok');
+  var modelName = sel.value;
+  if (!modelName) { toast('Wybierz model', 'err'); return; }
+
+  var cacheKey = 'auto_s_' + modelName;
+  try {
+    var cached = localStorage.getItem(cacheKey);
+    if (cached) {
+      var obj = JSON.parse(cached);
+      if (obj && obj.ts && (Date.now() - obj.ts) < 7 * 86400000) {
+        applyAutoResult(obj.s, true);
+        return;
+      }
+    }
+  } catch(e) {}
+
+  toast('\u23f3 Analizuję model przez AI...', 'info');
+  fetch('/api/auto-settings?model=' + encodeURIComponent(modelName))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { toast('Błąd AI: ' + (d.error||'?'), 'err'); return; }
+      try { localStorage.setItem(cacheKey, JSON.stringify({s: d.settings, ts: Date.now()})); } catch(e){}
+      applyAutoResult(d.settings, d.cached || false);
+    })
+    .catch(function(e){ toast('Błąd sieci: ' + e, 'err'); });
 }
 function applyPreset(id) {
   var p = PRESETS.find(function(x){return x.id===id;});
@@ -3247,9 +3262,59 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', 'public, max-age=3600')
                 self.end_headers()
                 self.wfile.write(data)
-            else:
-                self.send_error(404)
+            self.send_error(404)
+        return
+        if path.startswith('/api/auto-settings'):
+            from urllib.parse import urlparse, parse_qs as pqs
+            qs    = pqs(urlparse(self.path).query)
+            mname = qs.get('model', [''])[0].strip()
+            if not mname:
+                self._json({'ok': False, 'error': 'brak model'}); return
+            import time as _t
+            cached = _auto_cache.get(mname)
+            if cached and (_t.time() - cached['ts']) < 86400 * 7:
+                self._json({'ok': True, 'settings': cached['settings'], 'cached': True}); return
+            if not DEEPSEEK_KEY:
+                self._json({'ok': False, 'error': 'GP_DEEPSEEK_KEY not set'}); return
+            prompt = (
+                "You are an expert in Stable Diffusion image generation parameters.\n"
+                "Given a model filename, return the optimal generation settings.\n\n"
+                f"Model filename: \"{mname}\"\n\n"
+                "Respond ONLY with a valid JSON object (no markdown, no extra text):\n"
+                '{"sampler":"...","scheduler":"...","steps":20,"cfg":1.0,"width":1024,"height":1024,"notes":"..."}\n\n'
+                "Key rules:\n"
+                "- FLUX/.gguf models: Euler, Simple, steps 20, cfg 1.0, 1024x1024\n"
+                "- LCM/Turbo/Lightning/Hyper/Ultra: Euler, Simple, steps 8-12, cfg 1.0-2.0\n"
+                "- SDXL/XL/Pony: DPM++ SDE, Karras, steps 28, cfg 5.5, 1024x1024\n"
+                "- SD 1.5 realistic: DPM++ SDE, Karras, steps 28, cfg 7.0, 832x1216\n"
+                "- SD 1.5 anime: DPM++ 2M, Karras, steps 30, cfg 7.0, 512x768\n"
+                "- krea2/krea: Euler, Simple, steps 20, cfg 1.0, 1024x1024\n"
+                "Available samplers: Euler a, Euler, DPM++ 2M, DPM++ SDE, DPM++ SDE Karras, DPM++ 2M Karras\n"
+                "Available schedulers: Automatic, Karras, Simple, Normal, Exponential"
+            )
+            req_body = json.dumps({
+                'model': DEEPSEEK_MODEL,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.1, 'max_tokens': 300
+            }).encode()
+            req = urllib.request.Request(
+                'https://api.deepseek.com/chat/completions',
+                data=req_body,
+                headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {DEEPSEEK_KEY}'},
+                method='POST'
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+                raw = data['choices'][0]['message']['content'].strip().strip('`').strip()
+                if raw.startswith('json'): raw = raw[4:].strip()
+                settings = json.loads(raw)
+                _auto_cache[mname] = {'settings': settings, 'ts': _t.time()}
+                self._json({'ok': True, 'settings': settings, 'cached': False})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
             return
+        self.send_error(404)
 
         # Logout
         if path == '/logout':
