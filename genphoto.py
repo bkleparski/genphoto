@@ -4041,7 +4041,13 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     print(f'GenPhoto running on http://0.0.0.0:{PORT}')
-    server = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
+    import socket as _sock
+    class _DualStack(ThreadingHTTPServer):
+        address_family = _sock.AF_INET6
+        def server_bind(self):
+            self.socket.setsockopt(_sock.IPPROTO_IPV6, _sock.IPV6_V6ONLY, 0)
+            super().server_bind()
+    server = _DualStack(('::', PORT), Handler)
     threading.Thread(target=_models_cache_worker, daemon=True).start()
     _refresh_models_once()  # zaladuj cache przed pierwszym requestem
     server.serve_forever()
