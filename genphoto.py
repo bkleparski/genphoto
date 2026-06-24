@@ -3262,8 +3262,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Cache-Control', 'public, max-age=3600')
                 self.end_headers()
                 self.wfile.write(data)
-            self.send_error(404)
-        return
+            else:
+                self.send_error(404)
+            return
         if path.startswith('/api/auto-settings'):
             from urllib.parse import urlparse, parse_qs as pqs
             qs    = pqs(urlparse(self.path).query)
@@ -3314,8 +3315,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
-        self.send_error(404)
-
         # Logout
         if path == '/logout':
             tok = self._cookie()
