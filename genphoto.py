@@ -1851,8 +1851,8 @@ function autoModel() {
   var models = Array.from(sel.options).map(function(o){ return o.value; }).filter(Boolean);
   if (!models.length) { toast('Brak modeli na liście', 'err'); return; }
 
-  var promptTxt = (document.getElementById('pos-prompt') || {}).value || '';
-  var descTxt   = (document.getElementById('desc-in') || {}).value || '';
+  var promptTxt = (document.getElementById('positive-ta') || {}).value || '';
+  var descTxt   = (document.getElementById('desc-ta') || {}).value || '';
   var combined  = (descTxt + ' ' + promptTxt).trim();
   if (!combined) { toast('Wpisz najpierw opis lub prompt', 'err'); return; }
 
