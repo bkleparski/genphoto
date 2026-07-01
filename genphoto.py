@@ -392,13 +392,31 @@ def forge_generate_thread(params, jid):
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
+# Ścieżki wewnątrz kontenera ravnet-forge na DGX (bind mounty /forge/models/...)
+RAVNET_FLUX1_MODULES = [
+    '/forge/models/text_encoder/clip_l.safetensors',
+    '/forge/models/text_encoder/t5xxl_fp8_e4m3fn.safetensors',
+    '/forge/models/VAE/ae.safetensors',
+]
+RAVNET_FLUX2_MODULES = [
+    '/forge/models/text_encoder/mistral_3_small_flux2_bf16.safetensors',
+    '/forge/models/VAE/full_encoder_small_decoder.safetensors',
+]
+
+def ravnet_model_override_settings(title):
+    s = {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': '', 'forge_additional_modules': []}
+    t = title.lower()
+    if 'flux2' in t or 'klein' in t:
+        s['forge_additional_modules'] = RAVNET_FLUX2_MODULES
+    elif 'flux' in t:
+        s['forge_additional_modules'] = RAVNET_FLUX1_MODULES
+    return s
+
 def ravnet_forge_generate_thread(params, jid):
     """Generate using remote Forge on Ravnet DGX (forge-ravnet.ebartnet.pl)."""
     try:
         job_set(jid, status='generating')
         title, fname = resolve_ravnet_model(params['model'])
-        # Uwaga: bez forge_additional_modules — układ katalogów modeli na DGX
-        # jest inny niż lokalnie, więc override FLUX text-encoder/VAE pomijamy.
         data = forge_post('/sdapi/v1/txt2img', {
             'prompt':          params['positive'],
             'negative_prompt': params['negative'],
@@ -411,7 +429,7 @@ def ravnet_forge_generate_thread(params, jid):
             'seed':            int(params.get('seed', -1)),
             'batch_size':      int(params.get('batch', 1)),
             'n_iter':          1,
-            'override_settings': {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': ''},
+            'override_settings': ravnet_model_override_settings(title),
             'override_settings_restore_afterwards': True,
             'save_images': False,
         }, timeout=600, base_url=RAVNET_FORGE_URL)
