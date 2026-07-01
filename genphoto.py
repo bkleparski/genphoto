@@ -111,10 +111,14 @@ PRESETS = [
 ]
 
 # ── Forge API ─────────────────────────────────────────────────────────────────
+# Cloudflare (forge-ravnet.ebartnet.pl) blokuje domyślny UA urllib jako bota — udajemy przeglądarkę.
+_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
 def forge_get(path, timeout=10, base_url=None):
     base_url = base_url or FORGE_URL
     try:
-        with urllib.request.urlopen(f'{base_url}{path}', timeout=timeout) as r:
+        req = urllib.request.Request(f'{base_url}{path}', headers={'User-Agent': _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except:
         return None
@@ -124,7 +128,7 @@ def forge_post(path, data, timeout=600, base_url=None):
     raw = json.dumps(data).encode()
     req = urllib.request.Request(
         f'{base_url}{path}', data=raw,
-        headers={'Content-Type': 'application/json'}, method='POST'
+        headers={'Content-Type': 'application/json', 'User-Agent': _UA}, method='POST'
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
