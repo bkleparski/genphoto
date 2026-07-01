@@ -17,6 +17,7 @@ FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('
 COMFY_URL    = os.environ.get('GP_COMFY_URL', 'http://localhost:8189').rstrip('/')
 COMFY_OUTPUTS = Path(os.environ.get('GP_COMFY_OUTPUTS', '/home/bartek/comfyui/output'))
 KREA2_URL    = os.environ.get('GP_KREA2_URL', 'http://localhost:7870').rstrip('/')
+RAVNET_FORGE_URL = os.environ.get('GP_RAVNET_FORGE_URL', 'https://forge-ravnet.ebartnet.pl').rstrip('/')
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('GP_DEEPSEEK_MODEL', 'deepseek-v4-flash')
 AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
@@ -110,17 +111,19 @@ PRESETS = [
 ]
 
 # ── Forge API ─────────────────────────────────────────────────────────────────
-def forge_get(path, timeout=10):
+def forge_get(path, timeout=10, base_url=None):
+    base_url = base_url or FORGE_URL
     try:
-        with urllib.request.urlopen(f'{FORGE_URL}{path}', timeout=timeout) as r:
+        with urllib.request.urlopen(f'{base_url}{path}', timeout=timeout) as r:
             return json.loads(r.read())
     except:
         return None
 
-def forge_post(path, data, timeout=600):
+def forge_post(path, data, timeout=600, base_url=None):
+    base_url = base_url or FORGE_URL
     raw = json.dumps(data).encode()
     req = urllib.request.Request(
-        f'{FORGE_URL}{path}', data=raw,
+        f'{base_url}{path}', data=raw,
         headers={'Content-Type': 'application/json'}, method='POST'
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -145,6 +148,10 @@ _models_lock  = threading.Lock()
 _downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size}
 MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
 
+# Cache modeli Ravnet Forge (DGX, zdalny) — odnawiany w tle co 30s
+_ravnet_models_cache = []
+_ravnet_models_lock  = threading.Lock()
+
 def _refresh_models_once():
     global _models_cache
     forge_post('/sdapi/v1/refresh-checkpoints', {})
@@ -159,6 +166,12 @@ def _refresh_models_once():
         pass
     with _models_lock:
         _models_cache = data
+
+def _refresh_ravnet_models_once():
+    global _ravnet_models_cache
+    data = forge_get('/sdapi/v1/sd-models', timeout=15, base_url=RAVNET_FORGE_URL) or []
+    with _ravnet_models_lock:
+        _ravnet_models_cache = data
 
 
 def _download_model_thread(job_id, url):
@@ -212,6 +225,10 @@ def _models_cache_worker():
     while True:
         try:
             _refresh_models_once()
+        except Exception:
+            pass
+        try:
+            _refresh_ravnet_models_once()
         except Exception:
             pass
         _time.sleep(30)
@@ -297,6 +314,14 @@ def resolve_model(model_name):
             return m['title'], m.get('filename', '')
     return model_name, ''
 
+def resolve_ravnet_model(model_name):
+    with _ravnet_models_lock:
+        models = list(_ravnet_models_cache)
+    for m in models:
+        if m.get('model_name') == model_name:
+            return m['title'], m.get('filename', '')
+    return model_name, ''
+
 FLUX_ADDITIONAL_MODULES = [
     '/home/bartek/forge/models/text_encoder/clip_l.safetensors',
     '/home/bartek/forge/models/text_encoder/t5xxl_fp8_e4m3fn.safetensors',
@@ -358,6 +383,62 @@ def forge_generate_thread(params, jid):
                      int(params['width']), int(params['height']),
                      seed, int(params.get('batch',1)),
                      params.get('preset','custom'), json.dumps(paths))
+                )
+        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+def ravnet_forge_generate_thread(params, jid):
+    """Generate using remote Forge on Ravnet DGX (forge-ravnet.ebartnet.pl)."""
+    try:
+        job_set(jid, status='generating')
+        title, fname = resolve_ravnet_model(params['model'])
+        # Uwaga: bez forge_additional_modules — układ katalogów modeli na DGX
+        # jest inny niż lokalnie, więc override FLUX text-encoder/VAE pomijamy.
+        data = forge_post('/sdapi/v1/txt2img', {
+            'prompt':          params['positive'],
+            'negative_prompt': params['negative'],
+            'sampler_name':    params['sampler'],
+            'scheduler':       params.get('scheduler', 'Karras'),
+            'steps':           int(params['steps']),
+            'cfg_scale':       float(params['cfg']),
+            'width':           int(params['width']),
+            'height':          int(params['height']),
+            'seed':            int(params.get('seed', -1)),
+            'batch_size':      int(params.get('batch', 1)),
+            'n_iter':          1,
+            'override_settings': {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': ''},
+            'override_settings_restore_afterwards': True,
+            'save_images': False,
+        }, timeout=600, base_url=RAVNET_FORGE_URL)
+        imgs_b64 = data.get('images', [])
+        info     = json.loads(data.get('info', '{}'))
+        seed     = info.get('seed', -1)
+        seeds    = info.get('all_seeds', [seed] * len(imgs_b64))
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        paths = []
+        for i, b64 in enumerate(imgs_b64):
+            s    = seeds[i] if i < len(seeds) else seed
+            name = f'gp_ravnet_{ts}_{i:02d}_s{s}.png'
+            (out_dir / name).write_bytes(base64.b64decode(b64))
+            paths.append(f'genphoto/{today}/{name}')
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description',''),
+                     params['positive'], params['negative'], params['model'],
+                     params['sampler'], params.get('scheduler','Karras'),
+                     int(params['steps']), float(params['cfg']),
+                     int(params['width']), int(params['height']),
+                     seed, int(params.get('batch',1)),
+                     params.get('preset','ravnet_forge'), json.dumps(paths))
                 )
         job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
     except Exception as e:
@@ -1264,7 +1345,8 @@ select{resize:none;cursor:pointer}
 
 <header>
   <div class="logo">&#127912; GenPhoto</div>
-  <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate')">&#127912; Generuj</button>
+  <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate');switchBackend('forge');document.getElementById('tab-ravnet').classList.remove('active');this.classList.add('active');">&#127912; Generuj</button>
+  <button class="view-tab-btn hdr-gen-btn" id="tab-ravnet" onclick="switchView('generate');switchBackend('ravnet');document.getElementById('tab-gen').classList.remove('active');this.classList.add('active');">&#128640; RAVNET-FORGE</button>
   <div class="hdr-body">
     <div class="preset-tabs" id="preset-tabs">__PRESET_TABS__</div>
     <div class="hdr-spacer"></div>
@@ -1433,6 +1515,7 @@ select{resize:none;cursor:pointer}
       <div style="display:flex;gap:8px">
         <button id="backend-forge" class="backend-btn active" onclick="switchBackend('forge')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9881; Forge</button>
         <button id="backend-krea2" class="backend-btn" onclick="switchBackend('krea2')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9889; Krea 2</button>
+        <button id="backend-ravnet" class="backend-btn" onclick="switchBackend('ravnet')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#128640; Ravnet</button>
       </div>
     </div>
     <div class="field">
@@ -1944,11 +2027,17 @@ var _backend = 'forge';
 function switchBackend(b) {
   _backend = b;
   document.querySelectorAll('.backend-btn').forEach(function(el) { el.classList.remove('active'); });
-  document.getElementById('backend-' + b).classList.add('active');
+  var btn = document.getElementById('backend-' + b);
+  if (btn) btn.classList.add('active');
   // Sampler + scheduler hidden in Krea 2 mode
   document.querySelectorAll('.krea2-hide').forEach(function(el) {
     el.style.display = (b === 'krea2') ? 'none' : '';
   });
+  if (b === 'ravnet') {
+    fetch('/api/ravnet-models').then(function(r){return r.json();}).then(_applyOrderToSelect);
+  } else if (b === 'forge') {
+    fetch('/api/models').then(function(r){return r.json();}).then(_applyOrderToSelect);
+  }
 }
 
 /* ── Presets ── */
@@ -2434,6 +2523,7 @@ function startGenerate() {
     seed:        parseInt(document.getElementById('seed-in').value),
     batch:       parseInt(document.getElementById('batch-in').value),
     preset:      _curPreset || 'custom',
+    backend:     _backend,
   };
   if (_refImageB64) {
     params.init_image = _refImageB64;
@@ -3815,6 +3905,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json([{'name': m.get('model_name',''), 'title': m.get('title','')} for m in raw])
             return
 
+        if path == '/api/ravnet-models':
+            with _ravnet_models_lock:
+                raw = list(_ravnet_models_cache)
+            self._json([{'name': m.get('model_name',''), 'title': m.get('title','')} for m in raw])
+            return
+
         if path == '/api/edit-history':
             with _db_lock:
                 with db() as con:
@@ -3999,6 +4095,8 @@ class Handler(BaseHTTPRequestHandler):
                 backend = params.get('backend', 'forge')
                 if backend == 'krea2':
                     target = krea_generate_thread
+                elif backend == 'ravnet':
+                    target = ravnet_forge_generate_thread
                 elif params.get('init_image'):
                     target = forge_img2img_ref_thread
                 else:
