@@ -1130,14 +1130,27 @@ select{resize:none;cursor:pointer}
 .no-hist{color:#334155;text-align:center;padding:20px;font-size:.85rem}
 
 /* Lightbox */
-#lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:2000;align-items:center;justify-content:center;flex-direction:column}
+#lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:2000;align-items:center;justify-content:center;flex-direction:row;gap:0}
 #lb.open{display:flex}
-#lb-img{max-width:90vw;max-height:86vh;object-fit:contain;border-radius:8px}
+#lb-main{display:flex;flex-direction:column;align-items:center;flex-shrink:0}
+#lb-img{max-width:70vw;max-height:86vh;object-fit:contain;border-radius:8px}
 #lb-nav{display:flex;gap:16px;margin-top:14px;align-items:center}
 #lb-nav button{background:#1e293b;border:1px solid #475569;color:#e2e8f0;padding:6px 18px;border-radius:8px;cursor:pointer;font-size:.85rem}
 #lb-nav button:hover{background:#334155}
 #lb-dl{background:#3b82f6;border-color:#3b82f6;color:#fff}
 #lb-close{position:absolute;top:14px;right:18px;background:none;border:none;color:#64748b;font-size:1.6rem;cursor:pointer;line-height:1}
+#lb-meta{width:300px;min-width:260px;max-width:320px;height:90vh;overflow-y:auto;background:#0f172a;border-left:1px solid #1e293b;padding:16px 14px;display:flex;flex-direction:column;gap:10px;flex-shrink:0}
+#lb-meta h4{color:#94a3b8;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin:0 0 2px}
+.lb-meta-val{font-size:.78rem;color:#e2e8f0;background:#1e293b;border-radius:6px;padding:6px 8px;word-break:break-all;line-height:1.5;white-space:pre-wrap}
+.lb-meta-val.prompt{max-height:130px;overflow-y:auto}
+.lb-meta-copy{background:none;border:none;color:#64748b;cursor:pointer;font-size:.75rem;padding:2px 4px;border-radius:4px;float:right}
+.lb-meta-copy:hover{color:#e2e8f0;background:#1e293b}
+.lb-meta-badge{display:inline-block;background:#1e3a5f;color:#93c5fd;border-radius:4px;padding:2px 8px;font-size:.75rem}
+.lb-meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.lb-meta-kv{background:#1e293b;border-radius:6px;padding:5px 8px}
+.lb-meta-kv span:first-child{display:block;font-size:.65rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em}
+.lb-meta-kv span:last-child{font-size:.78rem;color:#e2e8f0}
+#lb-meta-empty{color:#334155;font-size:.8rem;text-align:center;margin-top:20px}
 
 /* Toast */
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:10px 20px;border-radius:8px;font-size:.85rem;z-index:3000;transition:transform .3s;pointer-events:none}
@@ -1233,7 +1246,9 @@ select{resize:none;cursor:pointer}
   .edit-hist-wrap{padding:0 10px 16px}
   .row2{grid-template-columns:1fr 1fr}
   .row3{grid-template-columns:1fr 1fr 1fr}
-  #lb-img{max-width:96vw;max-height:78vh}
+  #lb{flex-direction:column}
+  #lb-img{max-width:96vw;max-height:55vh}
+  #lb-meta{width:96vw;max-width:100%;height:auto;max-height:30vh;border-left:none;border-top:1px solid #1e293b}
   #lb-nav{gap:8px;flex-wrap:wrap;justify-content:center}
   #lb-nav button{padding:6px 12px;font-size:.8rem}
   #lb-close{font-size:1.3rem;top:10px;right:12px}
@@ -1901,15 +1916,18 @@ select{resize:none;cursor:pointer}
 <!-- ── FLUX1 Image ── -->
 
 <!-- ── Lightbox ── -->
-<div id="lb">
+<div id="lb" onclick="if(event.target===this)closeLb()">
   <button id="lb-close" onclick="closeLb()">&#10005;</button>
-  <img id="lb-img" src="" alt="">
-  <div id="lb-nav">
-    <button onclick="navLb(-1)">&#8592; Poprzednie</button>
-    <button id="lb-dl" onclick="dlLb()">&#8595; Pobierz</button>
-    <button onclick="editFromLb()" style="background:#059669;border-color:#059669;color:#fff">&#9999;&#65039; Edytuj</button>
-    <button onclick="navLb(1)">Następne &#8594;</button>
+  <div id="lb-main">
+    <img id="lb-img" src="" alt="">
+    <div id="lb-nav">
+      <button onclick="navLb(-1)">&#8592; Poprzednie</button>
+      <button id="lb-dl" onclick="dlLb()">&#8595; Pobierz</button>
+      <button onclick="editFromLb()" style="background:#059669;border-color:#059669;color:#fff">&#9999;&#65039; Edytuj</button>
+      <button onclick="navLb(1)">Następne &#8594;</button>
+    </div>
   </div>
+  <div id="lb-meta"><span id="lb-meta-empty">Ładowanie metadanych…</span></div>
 </div>
 
 <div id="toast"></div>
@@ -2490,8 +2508,44 @@ function showImages(paths, seed) {
 function openLb(idx) { _lbIdx=idx; updLb(); document.getElementById('lb').classList.add('open'); document.body.style.overflow='hidden'; }
 function closeLb()   { document.getElementById('lb').classList.remove('open'); document.body.style.overflow=''; }
 function navLb(d)    { _lbIdx=(_lbIdx+d+_lbImgs.length)%_lbImgs.length; updLb(); }
-function updLb()     { document.getElementById('lb-img').src='/img/'+_lbImgs[_lbIdx]; }
 function dlLb()      { var a=document.createElement('a'); a.href='/img/'+_lbImgs[_lbIdx]; a.download=_lbImgs[_lbIdx].split('/').pop(); a.click(); }
+function updLb() {
+  var path = _lbImgs[_lbIdx];
+  document.getElementById('lb-img').src = '/img/' + path;
+  var meta = document.getElementById('lb-meta');
+  meta.innerHTML = '<span id="lb-meta-empty">Ładowanie…</span>';
+  fetch('/api/image-meta?path=' + encodeURIComponent(path))
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (!d.ok || !d.raw) { meta.innerHTML='<span id="lb-meta-empty">Brak metadanych</span>'; return; }
+      var html = '';
+      if (d.positive) {
+        html += '<div><h4>Prompt <button class="lb-meta-copy" onclick="navigator.clipboard.writeText('+JSON.stringify(d.positive)+')">kopiuj</button></h4>';
+        html += '<div class="lb-meta-val prompt">'+escHtml(d.positive)+'</div></div>';
+      }
+      if (d.negative) {
+        html += '<div><h4>Negative prompt</h4>';
+        html += '<div class="lb-meta-val prompt">'+escHtml(d.negative)+'</div></div>';
+      }
+      var modelVal = d.model || '';
+      if (modelVal) {
+        html += '<div><h4>Model</h4><div><span class="lb-meta-badge">'+escHtml(modelVal)+'</span></div></div>';
+      }
+      var keys = ['steps','sampler','scheduler','cfg_scale','seed','size'];
+      var labels = {steps:'Steps',sampler:'Sampler',scheduler:'Scheduler',cfg_scale:'CFG Scale',seed:'Seed',size:'Size'};
+      var gridItems = keys.filter(function(k){ return d[k]; });
+      if (gridItems.length) {
+        html += '<div><h4>Parametry</h4><div class="lb-meta-grid">';
+        gridItems.forEach(function(k){
+          html += '<div class="lb-meta-kv"><span>'+labels[k]+'</span><span>'+escHtml(d[k])+'</span></div>';
+        });
+        html += '</div></div>';
+      }
+      meta.innerHTML = html || '<span id="lb-meta-empty">Brak metadanych</span>';
+    })
+    .catch(function(){ meta.innerHTML='<span id="lb-meta-empty">Błąd ładowania</span>'; });
+}
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 /* ── History ── */
 function toggleHist() {
