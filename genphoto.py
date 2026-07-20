@@ -221,6 +221,13 @@ def _ensure_backend_running(backend):
         return False
     ok = _wait_backend_health(backend, timeout_s=150)
     metric('backend_autostart_done', backend=backend, ok=ok)
+    if ok:
+        try:
+            # Odśwież cache modeli — auto-start w tle oznaczał, że dropdown
+            # na stronie nie miał wpisów tego backendu (np. krea2_oss_turbo).
+            _refresh_models_once()
+        except Exception:
+            pass
     return ok
 
 def _stop_other_backends(backend):
@@ -958,15 +965,27 @@ def krea_generate_thread(params, jid):
     try:
         job_set(jid, status='generating')
         
-        # Determine checkpoint
-        model = params.get('model', 'oss_turbo')
-        
+        # Determine checkpoint — jawne mapowanie. Poprzednio: cokolwiek bez
+        # 'turbo' w nazwie lądowało w oss_raw (pusty model z presetu przy
+        # nieodświeżonej liście modeli ładował 26 GB RAW zamiast Turbo).
+        model = (params.get('model') or '').strip()
+        if 'turbo' in model:
+            checkpoint = 'oss_turbo'
+        elif 'raw' in model:
+            checkpoint = 'oss_raw'
+        else:
+            raise RuntimeError(
+                f'Nieznany model Krea 2: {model!r}. '
+                f'Odśwież stronę (lista modeli mogła być nieaktualna) i wybierz '
+                f'krea2_oss_turbo albo krea2_oss_raw z listy modeli.'
+            )
+
         # Krea 2 parameters — num_images always 1: a batched forward pass
         # doubles VAE-decode activation memory and OOMs on 12 GB VRAM once
         # the quantized model is loaded, so images are generated one at a time.
         body = {
             'prompt': params['positive'],
-            'checkpoint': 'oss_turbo' if 'turbo' in model else 'oss_raw',
+            'checkpoint': checkpoint,
             'width': min(int(params['width']), 2048),
             'height': min(int(params['height']), 2048),
             'num_images': 1,
@@ -992,7 +1011,10 @@ def krea_generate_thread(params, jid):
 
         for i in range(batch):
             body['seed'] = base_seed + i
-            img_data, headers = krea_post('/generate', body)
+            # timeout 600s: pierwsze wywołanie po starcie krea2 ładuje pipeline
+            # z dysku + kwantyzacja bnb — przy współdzielonym GPU to ~4 min,
+            # domyślne 120s zabijało nawet udane generowanie.
+            img_data, headers = krea_post('/generate', body, timeout=600)
             seed = headers.get('X-Seed', str(body['seed']))
             if first_seed is None:
                 first_seed = seed
