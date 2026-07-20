@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """GenPhoto — AI photo generation studio (frontend for Stable Diffusion Forge)"""
 
-import base64, hashlib, html, json, mimetypes, os, secrets, shutil, sqlite3
-import threading, time, uuid
+import base64, collections, hashlib, html, json, mimetypes, os, re, secrets, shutil, sqlite3
+import contextlib, threading, time, uuid
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -16,14 +16,22 @@ OUTPUTS_DIR  = Path(os.environ.get('GP_OUTPUTS_DIR', '/home/bartek/forge/outputs
 FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('/')
 COMFY_URL    = os.environ.get('GP_COMFY_URL', 'http://localhost:8189').rstrip('/')
 COMFY_OUTPUTS = Path(os.environ.get('GP_COMFY_OUTPUTS', '/home/bartek/comfyui/output'))
+
+# WAN 2.2 T2V-A14B (MoE, GGUF Q3_K_M) — txt2vid
+WAN_HIGH_NOISE_UNET = 'Wan2.2-T2V-A14B-HighNoise-Q3_K_M.gguf'
+WAN_LOW_NOISE_UNET  = 'Wan2.2-T2V-A14B-LowNoise-Q3_K_M.gguf'
+WAN_HIGH_NOISE_LORA = 'wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors'
+WAN_LOW_NOISE_LORA  = 'wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors'
+WAN_CLIP_NAME       = 'umt5_xxl_fp8_e4m3fn_scaled.safetensors'
+WAN_VAE_NAME        = 'Wan2.1_VAE.safetensors'
+
 KREA2_URL    = os.environ.get('GP_KREA2_URL', 'http://localhost:7870').rstrip('/')
-RAVNET_FORGE_URL = os.environ.get('GP_RAVNET_FORGE_URL', 'https://forge-ravnet.ebartnet.pl').rstrip('/')
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('GP_DEEPSEEK_MODEL', 'deepseek-v4-flash')
 AI_PROVIDER    = os.environ.get('GP_AI_PROVIDER', 'deepseek')
 OR_KEY         = os.environ.get('GP_OR_KEY', '')
 OR_MODEL       = os.environ.get('GP_OR_MODEL', 'nousresearch/hermes-4-405b')
-OR_VISION_MODEL = os.environ.get('GP_OR_VISION_MODEL', 'qwen/qwen2.5-vl-72b-instruct')
+OR_VISION_MODEL = os.environ.get('GP_OR_VISION_MODEL', 'qwen/qwen3-vl-235b-a22b-instruct')
 LOCAL_VISION_URL   = os.environ.get('GP_LOCAL_VISION_URL', '').rstrip('/')
 LOCAL_VISION_MODEL = os.environ.get('GP_LOCAL_VISION_MODEL', 'qwen2.5vl:32b')
 DB_PATH      = Path(os.environ.get('GP_DB_PATH', '/home/bartek/genphoto.db'))
@@ -43,10 +51,19 @@ if not GP_PW_HASH:
 # ── Database ──────────────────────────────────────────────────────────────────
 _db_lock = threading.Lock()
 
+@contextlib.contextmanager
 def db():
+    # UWAGA: sqlite3.Connection jako context manager zarzadza tylko transakcja
+    # (commit/rollback), NIE zamyka polaczenia. Bez jawnego close() kazde
+    # 'with db() as con' przecieka deskryptor pliku -> po ~1000 zapytaniach
+    # proces uderza w limit 'open files' i pada z 'unable to open database file'.
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 with db() as _c:
     _c.execute('''CREATE TABLE IF NOT EXISTS generations (
@@ -63,6 +80,15 @@ with db() as _c:
         steps INTEGER, cfg REAL, denoising REAL,
         width INTEGER, height INTEGER, seed INTEGER,
         paths TEXT, source_path TEXT
+    )''')
+    # Trwałe ustawienia generowania per model — przeżywają restart procesu
+    # (w przeciwieństwie do _auto_cache, który jest tylko w pamięci).
+    # source: 'manual' (Bartek ręcznie zapisał) | 'civitai' (tag Base Model z Civitai)
+    # | 'llm' (zgadnięte przez model językowy, fallback).
+    _c.execute('''CREATE TABLE IF NOT EXISTS model_settings (
+        model_name TEXT PRIMARY KEY,
+        sampler TEXT, scheduler TEXT, steps INTEGER, cfg REAL,
+        width INTEGER, height INTEGER, source TEXT, updated_ts INTEGER
     )''')
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -91,6 +117,210 @@ def job_get(jid):
     with _jlock:
         return dict(JOBS.get(jid, {}))
 
+# ── GPU orchestration (RTX 3060 12 GB) ───────────────────────────────────────
+# Jeden job GPU na raz + kolejka FIFO (max 1 oczekujący) + pre-flight VRAM.
+# Mutex obejmuje pre-flight ORAZ całą generację — atomowo, bez race między
+# sprawdzeniem wolnego VRAM a startem joba. Watchdog zwalnia mutex awaryjnie,
+# gdy job się zawiesi (threading.Lock — w przeciwieństwie do RLock — może
+# zwolnić dowolny wątek; release() na odblokowanym rzuca RuntimeError, łapiemy).
+_gpu_lock  = threading.Lock()
+_gpu_wlock = threading.Lock()
+_gpu_waiters = 0             # liczba jobów oczekujących na mutex
+GPU_QUEUE_MAX_WAIT_S = 120   # timeout oczekiwania w kolejce
+GPU_QUEUE_MAX_DEPTH  = 1     # 1 job w toku + 1 w kolejce = "max 2"
+
+# Watchdog per typ joba (s) — powyżej najdłuższego legalnego czasu danego typu.
+GPU_WATCHDOG_S = {
+    'forge':     900,    # txt2img/img2img/edit/instantid/pose (forge_post timeout 600s + zapas)
+    'krea2':     900,    # pętla batch po 1 obrazie
+    'zimage':    600,    # 8 kroków turbo + ewentualny reload GGUF
+    'wanvideo':  1500,   # wewnętrzny deadline wątku WAN to 900s + ładowanie ~12GB GGUF
+    'batch_all': 3600,   # ~20 modeli × (load + generowanie + unload)
+}
+
+# Minimalny wolny VRAM (MB) przed startem joba.
+# "cold" = backend nie działa/nie trzyma modelu; "hot" = backend już jest w VRAM
+# (załadowany model nie musi alokować ponownie — wymóg dodatkowej pamięci niższy).
+VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 4500, 'zimage': 6500, 'wanvideo': 8000}
+VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000}
+
+# ── Metryki (ring buffer, endpoint /api/metrics) ─────────────────────────────
+_metrics = collections.deque(maxlen=200)
+_mlock   = threading.Lock()
+
+def _free_vram_mb():
+    import subprocess as _sp
+    r = _sp.run(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5)
+    return int(r.stdout.strip().splitlines()[0].strip())
+
+def metric(event, **kw):
+    entry = {'ts': int(time.time()), 'event': event}
+    entry.update(kw)
+    try:
+        entry['vram_free_mb'] = _free_vram_mb()
+    except Exception:
+        pass
+    with _mlock:
+        _metrics.append(entry)
+
+def _service_for_backend(backend):
+    return {'forge': 'forge', 'krea2': 'krea2',
+            'zimage': 'comfyui', 'wanvideo': 'comfyui'}.get(backend)
+
+def _backend_health_url(backend, deep=False):
+    if backend == 'forge':
+        return FORGE_URL + '/sdapi/v1/sd-models'
+    if backend == 'krea2':
+        return KREA2_URL + '/health'
+    if backend in ('zimage', 'wanvideo'):
+        # deep=True → /object_info: po restarcie ComfyUI port otwiera się wcześniej
+        # niż kończy się inicjalizacja nodów — bez tego health-check daje false-OK.
+        return COMFY_URL + ('/object_info' if deep else '/system_stats')
+    return None
+
+def _backend_alive(backend, timeout=4):
+    url = _backend_health_url(backend)
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def _wait_backend_health(backend, timeout_s=120):
+    url = _backend_health_url(backend, deep=True)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': _UA})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+def _ensure_backend_running(backend):
+    """Backend nie odpowiada → start serwisu systemd + czekanie na health."""
+    if _backend_alive(backend):
+        return True
+    svc = _service_for_backend(backend)
+    if not svc:
+        return False
+    import subprocess as _sp
+    metric('backend_autostart', backend=backend, service=svc)
+    try:
+        _sp.run(['systemctl', '--user', 'start', svc], timeout=20,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    except Exception:
+        metric('backend_autostart_done', backend=backend, ok=False)
+        return False
+    ok = _wait_backend_health(backend, timeout_s=150)
+    metric('backend_autostart_done', backend=backend, ok=ok)
+    return ok
+
+def _stop_other_backends(backend):
+    """Zatrzymaj serwisy niepotrzebne dla tego joba (flaga stop_other_backends)."""
+    import subprocess as _sp
+    keep = _service_for_backend(backend)
+    for svc in ('forge', 'krea2', 'comfyui'):
+        if svc == keep:
+            continue
+        try:
+            _sp.run(['systemctl', '--user', 'stop', svc], timeout=15,
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            metric('backend_autostop', service=svc, for_backend=backend)
+        except Exception:
+            pass
+
+def gpu_preflight(backend):
+    """Warunki startu joba. Wywoływane W TRAKCIE trzymania _gpu_lock (atomowo
+    ze startem). Zwraca None gdy OK, albo string z komunikatem błędu."""
+    hot  = _backend_alive(backend)
+    need = (VRAM_NEED_HOT_MB if hot else VRAM_NEED_COLD_MB).get(backend, 4000)
+    try:
+        free = _free_vram_mb()
+    except Exception:
+        free = None
+    if free is not None and free < need:
+        return (f'Za mało wolnego VRAM: {free/1024:.1f} GB wolne, '
+                f'wymagane ~{need/1024:.1f} GB. '
+                f'Zatrzymaj inne backendy (przycisk ZWOLNIJ) i spróbuj ponownie.')
+    if not _ensure_backend_running(backend):
+        return f'Backend {backend} nie odpowiada (auto-start serwisu nie powiódł się).'
+    return None
+
+def gpu_run(kind, backend, target, params, jid):
+    """FIFO + mutex + watchdog dla wszystkich jobów GPU."""
+    global _gpu_waiters
+    with _gpu_wlock:
+        if _gpu_lock.locked() and _gpu_waiters >= GPU_QUEUE_MAX_DEPTH:
+            job_set(jid, status='error',
+                    error='GPU zajęte, a kolejka pełna (1 job w toku + 1 oczekujący). '
+                          'Spróbuj za chwilę.')
+            metric('queue_reject', backend=backend)
+            return
+        _gpu_waiters += 1
+    t0 = time.time()
+    acquired = _gpu_lock.acquire(timeout=GPU_QUEUE_MAX_WAIT_S)
+    with _gpu_wlock:
+        _gpu_waiters -= 1
+    if not acquired:
+        job_set(jid, status='error',
+                error=f'Przekroczono czas oczekiwania na GPU ({GPU_QUEUE_MAX_WAIT_S}s).')
+        metric('queue_timeout', backend=backend, waited_s=int(time.time() - t0))
+        return
+    if time.time() - t0 > 1:
+        metric('queue_wait', backend=backend, waited_s=int(time.time() - t0))
+    # Od tego miejsca trzymamy mutex — pre-flight i job atomowo.
+    done_evt  = threading.Event()
+    fired_evt = threading.Event()
+    watchdog_s = GPU_WATCHDOG_S.get(kind, 900)
+    def _watch():
+        if not done_evt.wait(watchdog_s):
+            fired_evt.set()
+            job_set(jid, status='error',
+                    error=f'Watchdog: job przekroczył {watchdog_s}s — mutex GPU zwolniony awaryjnie.')
+            metric('watchdog_fire', backend=backend, kind=kind)
+            try:
+                _gpu_lock.release()
+            except RuntimeError:
+                pass
+    threading.Thread(target=_watch, daemon=True).start()
+    try:
+        if params.get('stop_other_backends'):
+            _stop_other_backends(backend)
+        err = gpu_preflight(backend)
+        if err:
+            job_set(jid, status='error', error=err)
+            metric('preflight_fail', backend=backend)
+            return
+        metric('job_start', backend=backend, kind=kind, model=str(params.get('model', '')))
+        tj = time.time()
+        target(params, jid)
+        if fired_evt.is_set():
+            # Wątek odwiesił się PO strzeleniu watchdogu — nie pozwól, aby
+            # status 'done' z końca wątku nadpisał awaryjny 'error'.
+            job_set(jid, status='error',
+                    error=f'Watchdog: job przekroczył {watchdog_s}s — wątek zwolnił się '
+                          f'po awaryjnym zwolnieniu mutexa (wynik joba wątpliwy).')
+        metric('job_end', backend=backend, kind=kind, duration_s=int(time.time() - tj),
+               final_status=job_get(jid).get('status'))
+    finally:
+        done_evt.set()
+        try:
+            _gpu_lock.release()
+        except RuntimeError:
+            pass
+
+def gpu_queue_full():
+    with _gpu_wlock:
+        return _gpu_lock.locked() and _gpu_waiters >= GPU_QUEUE_MAX_DEPTH
+
 # ── Presets ───────────────────────────────────────────────────────────────────
 NEG = ('(worst quality:2), (low quality:2), (blurry:1.3), deformed, ugly, extra limbs, '
        'mutated hands, (bad anatomy:1.3), watermark, text, signature, cropped, '
@@ -108,7 +338,64 @@ PRESETS = [
      'steps':28, 'cfg':3.5,'width':1024, 'height':1024, 'batch':1,
      'prefix':'',
      'negative': ''},
+    {'id':'zimage_turbo', 'name':'Z-Image Turbo', 'icon':'&#127916;',
+     'model':'zimage_turbo','sampler':'','scheduler':'',
+     'steps':8, 'cfg':1.0, 'width':832, 'height':1216, 'batch':1,
+     'prefix':'',
+     'negative': ''},
 ]
+
+# ── Kategorie i opisy modeli (dla dropdownu — optgroup + tooltip) ─────────────
+MODEL_CATEGORIES = ['Fotorealizm', 'Anime / Stylizowane', 'Krea 2', 'Z-Image', 'Inne']
+
+MODEL_INFO = {
+    'animagine-xl-3.1': {'cat': 'Anime / Stylizowane', 'desc': 'Anime/ilustracje — żywe kolory, dobre do postaci 2D'},
+    'illustriousXL_v01': {'cat': 'Anime / Stylizowane', 'desc': 'Baza anime/ilustracje, mocna stylizacja, dobre do postaci 2D'},
+    'BigLove_fp16': {'cat': 'Fotorealizm', 'desc': 'Realistyczne portrety, kobiece sylwetki, miękkie oświetlenie'},
+    'CyberRealisticPony_V8': {'cat': 'Fotorealizm', 'desc': 'Baza Pony, realistyczne twarze i ciała, dobra elastyczność promptów'},
+    'CyberRealisticXLPlay_V10.0_FP16': {'cat': 'Fotorealizm', 'desc': 'Wariant CyberRealistic pod sceny bardziej stylizowane/NSFW'},
+    'epicphotogasm_lastUnicorn': {'cat': 'Fotorealizm', 'desc': 'SD1.5, bardzo realistyczna skóra i portrety, mniejszy VRAM'},
+    'epicrealism_pureEvolutionV5': {'cat': 'Fotorealizm', 'desc': 'SD1.5, uniwersalny realizm, dobry balans jakość/szybkość'},
+    'epicrealismXL_vxviiCrystalclear': {'cat': 'Fotorealizm', 'desc': 'SDXL, ostry czysty realizm, dobre światło i tekstury skóry'},
+    'intorealismUltra_v40': {'cat': 'Fotorealizm', 'desc': 'Najnowsza wersja IntoRealism, wysoka wierność portretów'},
+    'intorealismUltra_Asian_v10': {'cat': 'Fotorealizm', 'desc': 'Wariant pod urodę azjatycką, DMD2+Light, wspiera negative prompt'},
+    'juggernautXL_ragnarok': {'cat': 'Fotorealizm', 'desc': 'Bardzo wszechstronny — pełne sceny, editorial, nie tylko portrety'},
+    'leosamsHelloworldXL_helloworldXL70': {'cat': 'Fotorealizm', 'desc': 'Popularny do portretów, naturalne oświetlenie'},
+    'ponyRealism_V23ULTRA': {'cat': 'Fotorealizm', 'desc': 'Baza Pony, realizm + elastyczność promptów w stylu Pony'},
+    'pornmaster_proSDXLV7': {'cat': 'Fotorealizm', 'desc': 'NSFW, sceny erotyczne, wysoka szczegółowość'},
+    'realisticLustXL_v09': {'cat': 'Fotorealizm', 'desc': 'NSFW, realistyczna skóra i anatomia'},
+    'RealVisXL_V5_fp16': {'cat': 'Fotorealizm', 'desc': 'Najostrzejszy detal twarzy spośród modeli SDXL, najlepszy do portretów'},
+}
+
+def get_model_info(name):
+    info = MODEL_INFO.get(name)
+    if info:
+        return info
+    nl = name.lower()
+    if nl.startswith('krea2_'):
+        return {'cat': 'Krea 2', 'desc': 'Model Krea 2 (MMDiT + Qwen3-VL)'}
+    if nl.startswith('zimage'):
+        return {'cat': 'Z-Image', 'desc': 'Z-Image Turbo — szybki, dobre portrety, GGUF przez ComfyUI'}
+    return {'cat': 'Inne', 'desc': ''}
+
+def build_model_optgroups(models):
+    buckets = {c: [] for c in MODEL_CATEGORIES}
+    for m in models:
+        name = m.get('model_name', '')
+        info = get_model_info(name)
+        buckets.get(info['cat'], buckets['Inne']).append((name, info.get('desc', '')))
+    out = ''
+    for cat in MODEL_CATEGORIES:
+        items = buckets[cat]
+        if not items:
+            continue
+        out += f'<optgroup label="{html.escape(cat)}">'
+        for name, desc in sorted(items, key=lambda x: x[0].lower()):
+            n = html.escape(name)
+            d = html.escape(desc)
+            out += f'<option value="{n}" title="{d}">{n}</option>'
+        out += '</optgroup>'
+    return out
 
 # ── Forge API ─────────────────────────────────────────────────────────────────
 # Cloudflare (forge-ravnet.ebartnet.pl) blokuje domyślny UA urllib jako bota — udajemy przeglądarkę.
@@ -151,35 +438,163 @@ _models_cache = []
 _models_lock  = threading.Lock()
 _downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size}
 MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
+LORAS_DIR     = Path(os.environ.get('GP_LORAS_DIR', '/home/bartek/comfyui/models/loras'))
+FORGE_LORAS_DIR = Path('/home/bartek/forge/models/Lora')
 
-# Cache modeli Ravnet Forge (DGX, zdalny) — odnawiany w tle co 30s
-_ravnet_models_cache = []
-_ravnet_models_lock  = threading.Lock()
-
-def _refresh_models_once():
+def _refresh_models_once(rescan_disk=False):
+    # rescan_disk=True wymusza na Forge pełny skan katalogu modeli
+    # (/sdapi/v1/refresh-checkpoints) — kosztowne I/O, więc tylko event-driven
+    # (upload/download/ręczny refresh/start procesu), NIE w cyklicznym workerze.
     global _models_cache
-    forge_post('/sdapi/v1/refresh-checkpoints', {})
-    data = forge_get('/sdapi/v1/sd-models') or []
+    data = []
+    try:
+        if rescan_disk:
+            forge_post('/sdapi/v1/refresh-checkpoints', {})
+        data = forge_get('/sdapi/v1/sd-models') or []
+    except Exception:
+        pass
     try:
         krea_health = json.loads(urllib.request.urlopen(f'{KREA2_URL}/health', timeout=3).read())
-        if krea_health.get('checkpoints'):
-            for name, info in krea_health['checkpoints'].items():
-                if info.get('exists'):
-                    data.append({'model_name': f'krea2_{name}', 'title': f'Krea 2 {name}', 'hash': ''})
+        for name, exists in (krea_health.get('models') or {}).items():
+            if exists:
+                data.append({'model_name': f'krea2_{name}', 'title': f'Krea 2 {name}', 'hash': ''})
+    except:
+        pass
+    try:
+        urllib.request.urlopen(f'{COMFY_URL}/system_stats', timeout=3).read()
+        data.append({'model_name': 'zimage_turbo', 'title': 'Z-Image Turbo', 'hash': ''})
     except:
         pass
     with _models_lock:
         _models_cache = data
 
-def _refresh_ravnet_models_once():
-    global _ravnet_models_cache
-    data = forge_get('/sdapi/v1/sd-models', timeout=15, base_url=RAVNET_FORGE_URL) or []
-    with _ravnet_models_lock:
-        _ravnet_models_cache = data
 
+# Reguły ustawień per "Base Model" z Civitai — deterministyczne, oparte na
+# realnym tagu z metadanych modelu, nie na zgadywaniu z nazwy pliku.
+CIVITAI_BASE_MODEL_RULES = [
+    (('pony',),                {'sampler': 'DPM++ SDE', 'scheduler': 'Karras', 'steps': 28, 'cfg': 5.5, 'width': 1024, 'height': 1024}),
+    (('illustrious',),         {'sampler': 'DPM++ 2M',  'scheduler': 'Karras', 'steps': 30, 'cfg': 7.0, 'width': 1024, 'height': 1024}),
+    (('flux',),                {'sampler': 'Euler',     'scheduler': 'Simple', 'steps': 20, 'cfg': 1.0, 'width': 1024, 'height': 1024}),
+    (('sdxl', 'xl'),           {'sampler': 'DPM++ SDE', 'scheduler': 'Karras', 'steps': 28, 'cfg': 5.5, 'width': 1024, 'height': 1024}),
+    (('sd 1.5', 'sd1.5'),      {'sampler': 'DPM++ SDE', 'scheduler': 'Karras', 'steps': 28, 'cfg': 7.0, 'width': 832,  'height': 1216}),
+]
 
-def _download_model_thread(job_id, url):
+def _civitai_settings_for_base_model(base_model):
+    bl = (base_model or '').lower()
+    for keys, settings in CIVITAI_BASE_MODEL_RULES:
+        if any(k in bl for k in keys):
+            return settings
+    return None
+
+def _extract_civitai_settings(data):
+    """Z odpowiedzi Civitai (model-version) wyciągnij najlepsze dostępne ustawienia:
+    najpierw prawdziwe metadane z przykładowych obrazów twórcy (najdokładniejsze),
+    z fallbackiem do ogólnej reguły dla danego Base Model."""
+    base_model = data.get('baseModel', '')
+    rule = _civitai_settings_for_base_model(base_model) or {}
+
+    samplers, schedulers, steps_list, cfg_list = [], [], [], []
+    KNOWN_SCHEDULERS = ('Karras', 'Exponential', 'Normal', 'Simple', 'SGM Uniform')
+    for img in (data.get('images') or [])[:10]:
+        meta = img.get('meta') or {}
+        if isinstance(meta.get('steps'), (int, float)):
+            steps_list.append(meta['steps'])
+        if isinstance(meta.get('cfgScale'), (int, float)):
+            cfg_list.append(meta['cfgScale'])
+        samp = (meta.get('sampler') or '').strip()
+        if samp:
+            parts = samp.rsplit(' ', 1)
+            if len(parts) == 2 and parts[1] in KNOWN_SCHEDULERS:
+                samplers.append(parts[0]); schedulers.append(parts[1])
+            else:
+                samplers.append(samp)
+
+    def _median(lst):
+        if not lst: return None
+        s = sorted(lst)
+        return s[len(s) // 2]
+
+    def _mode(lst):
+        return max(set(lst), key=lst.count) if lst else None
+
+    if not (steps_list or cfg_list) and not rule:
+        return None
+
+    settings = {
+        'sampler':   _mode(samplers) or rule.get('sampler', 'Euler a'),
+        'scheduler': _mode(schedulers) or rule.get('scheduler', 'Karras'),
+        'steps':     int(_median(steps_list) or rule.get('steps', 20)),
+        'cfg':       float(_median(cfg_list) or rule.get('cfg', 5.5)),
+        'width':     rule.get('width', 1024),
+        'height':    rule.get('height', 1024),
+    }
+    return {'settings': settings, 'base_model': base_model}
+
+def _save_model_settings(model_name, settings, source):
+    """Zapisz ustawienia trwale — nigdy nie nadpisuj ręcznej (manual) poprawki Bartka."""
+    with _db_lock:
+        with db() as con:
+            row = con.execute('SELECT source FROM model_settings WHERE model_name=?', (model_name,)).fetchone()
+            if row and row['source'] == 'manual' and source != 'manual':
+                return
+            con.execute('''INSERT INTO model_settings (model_name, sampler, scheduler, steps, cfg, width, height, source, updated_ts)
+                            VALUES (?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(model_name) DO UPDATE SET
+                                sampler=excluded.sampler, scheduler=excluded.scheduler,
+                                steps=excluded.steps, cfg=excluded.cfg,
+                                width=excluded.width, height=excluded.height,
+                                source=excluded.source, updated_ts=excluded.updated_ts''',
+                        (model_name, settings['sampler'], settings['scheduler'], settings['steps'],
+                         settings['cfg'], settings['width'], settings['height'], source, int(time.time())))
+
+def _get_saved_model_settings(model_name):
+    """Trwałe ustawienia dla modelu (manual/civitai/llm), albo None jeśli brak."""
+    with db() as con:
+        row = con.execute(
+            'SELECT sampler, scheduler, steps, cfg, width, height, source FROM model_settings WHERE model_name=?',
+            (model_name,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        'settings': {k: row[k] for k in ('sampler', 'scheduler', 'steps', 'cfg', 'width', 'height')},
+        'source': row['source'],
+    }
+
+def _fetch_civitai_version_json(url_or_version_id):
+    """Pobierz JSON model-version z Civitai — po pełnym URL pobierania albo po samym ID wersji."""
+    m = re.search(r'/api/download/models/(\d+)', url_or_version_id)
+    version_id = m.group(1) if m else url_or_version_id
+    req = urllib.request.Request(
+        f'https://civitai.com/api/v1/model-versions/{version_id}',
+        headers={'User-Agent': 'Mozilla/5.0'}
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+def _fetch_civitai_settings_by_hash(sha256):
+    """Znajdź model po SHA256 pliku (dokładne trafienie w konkretną wersję) i wyciągnij ustawienia."""
+    req = urllib.request.Request(
+        f'https://civitai.com/api/v1/model-versions/by-hash/{sha256}',
+        headers={'User-Agent': 'Mozilla/5.0'}
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    return _extract_civitai_settings(data)
+
+def _seed_settings_from_civitai_url(url, model_name):
+    """Po pobraniu modelu z civitai(.red) — wyciągnij prawdziwe ustawienia i zapisz je trwale."""
+    try:
+        data = _fetch_civitai_version_json(url)
+        result = _extract_civitai_settings(data)
+        if result:
+            _save_model_settings(model_name, result['settings'], 'civitai')
+    except Exception:
+        pass
+
+def _download_model_thread(job_id, url, dest_dir=None, refresh=True):
     import time as _t
+    dest_dir = dest_dir or MODELS_DIR
     d = _downloads[job_id]
     try:
         req = urllib.request.Request(url, headers={
@@ -199,7 +614,7 @@ def _download_model_thread(job_id, url):
             if not (fname.endswith('.safetensors') or fname.endswith('.ckpt') or fname.endswith('.pt')):
                 fname += '.safetensors'
             fname = fname.replace('/', '_').replace('\\', '_')
-            dest  = MODELS_DIR / fname
+            dest  = dest_dir / fname
             d['filename'] = fname
             d['status']   = 'downloading'
             size = int(resp.headers.get('Content-Length', 0) or 0)
@@ -216,26 +631,27 @@ def _download_model_thread(job_id, url):
                     d['percent'] = int(done * 100 / size) if size else -1
         d['percent'] = 100
         d['status']  = 'done'
-        _refresh_models_once()
+        if refresh:
+            _refresh_models_once(rescan_disk=True)
+            model_name = fname.rsplit('.', 1)[0]
+            _seed_settings_from_civitai_url(url, model_name)
     except Exception as e:
         d['status'] = 'error'
         d['error']  = str(e)
         if d.get('filename'):
-            p = MODELS_DIR / d['filename']
+            p = dest_dir / d['filename']
             if p.exists(): p.unlink()
 
 def _models_cache_worker():
     import time as _time
     while True:
+        _time.sleep(300)  # co 5 min wystarczy — skan dysku robią eventy (upload/download)
         try:
+            if _gpu_lock.locked():
+                continue  # backpressure: nie dokładać I/O na Forge podczas generowania
             _refresh_models_once()
         except Exception:
             pass
-        try:
-            _refresh_ravnet_models_once()
-        except Exception:
-            pass
-        _time.sleep(30)
 
 
 # ── InsightFace auto-crop ──────────────────────────────────────────────────
@@ -318,33 +734,67 @@ def resolve_model(model_name):
             return m['title'], m.get('filename', '')
     return model_name, ''
 
-def resolve_ravnet_model(model_name):
-    with _ravnet_models_lock:
-        models = list(_ravnet_models_cache)
-    for m in models:
-        if m.get('model_name') == model_name:
-            return m['title'], m.get('filename', '')
-    return model_name, ''
-
 FLUX_ADDITIONAL_MODULES = [
     '/home/bartek/forge/models/text_encoder/clip_l.safetensors',
     '/home/bartek/forge/models/text_encoder/t5xxl_fp8_e4m3fn.safetensors',
     '/home/bartek/forge/models/VAE/ae.safetensors',
 ]
 
+# Modele z uszkodzonym/niekompatybilnym wbudowanym VAE (błąd twórcy przy mergu —
+# np. przypadkowo wpięty VAE 16-kanałowy zamiast standardowego 4-kanałowego SDXL).
+# Wymuszamy zewnętrzny, poprawny plik VAE. Klucz: nazwa modelu bez rozszerzenia, lowercase.
+BROKEN_VAE_MODELS = {
+    'gonzalomoxlfluxpony_v30unityxldmd': 'sdxl_vae.safetensors',
+}
+
 def model_override_settings(title, filename=''):
-    s = {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': '', 'forge_additional_modules': []}
-    flux = 'flux' in title.lower() or (filename and is_flux_checkpoint(filename))
+    name = title.split(' [')[0]
+    s = {'sd_model_checkpoint': name, 'sd_vae': '', 'forge_additional_modules': []}
+    # Wykrywanie Flux WYŁĄCZNIE po zawartości pliku (klucze double_blocks) — nazwa modelu
+    # bywa myląca (np. "gonzalomoXLFluxPony" to zwykły SDXL mimo "flux" w nazwie).
+    flux = bool(filename) and is_flux_checkpoint(filename)
     if flux:
         s['forge_additional_modules'] = FLUX_ADDITIONAL_MODULES
+    override_vae = BROKEN_VAE_MODELS.get(name.lower().replace('.safetensors', ''))
+    if override_vae:
+        s['sd_vae'] = override_vae
     return s
+
+def build_adetailer_scripts(params):
+    model = params.get('adetailer_model')
+    if not model:
+        return None
+    return {
+        'ADetailer': {
+            'args': [
+                True, False,
+                {
+                    'ad_model': model,
+                    'ad_prompt': params.get('adetailer_prompt', ''),
+                    'ad_denoising_strength': float(params.get('adetailer_denoise', 0.4)),
+                },
+            ]
+        }
+    }
+
+def _apply_lora_tags(prompt, loras):
+    """Dokleja tagi <lora:name:strength> do prompta Forge (A1111 extra-networks syntax)."""
+    for l in (loras or []):
+        name = (l.get('name') or '').strip()
+        if not name:
+            continue
+        name = name.rsplit('.', 1)[0] if name.lower().endswith(('.safetensors', '.pt', '.ckpt')) else name
+        strength = float(l.get('strength', 1.0))
+        prompt += f' <lora:{name}:{strength}>'
+    return prompt
 
 def forge_generate_thread(params, jid):
     try:
         job_set(jid, status='generating')
         title, fname = resolve_model(params['model'])
-        data = forge_post('/sdapi/v1/txt2img', {
-            'prompt':          params['positive'],
+        prompt = _apply_lora_tags(params['positive'], params.get('loras'))
+        body = {
+            'prompt':          prompt,
             'negative_prompt': params['negative'],
             'sampler_name':    params['sampler'],
             'scheduler':       params.get('scheduler', 'Karras'),
@@ -358,7 +808,11 @@ def forge_generate_thread(params, jid):
             'override_settings': model_override_settings(title, fname),
             'override_settings_restore_afterwards': True,
             'save_images': False,
-        })
+        }
+        adetailer_scripts = build_adetailer_scripts(params)
+        if adetailer_scripts:
+            body['alwayson_scripts'] = adetailer_scripts
+        data = forge_post('/sdapi/v1/txt2img', body)
         imgs_b64 = data.get('images', [])
         info     = json.loads(data.get('info', '{}'))
         seed     = info.get('seed', -1)
@@ -392,77 +846,110 @@ def forge_generate_thread(params, jid):
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
-# Ścieżki wewnątrz kontenera ravnet-forge na DGX (bind mounty /forge/models/...)
-RAVNET_FLUX1_MODULES = [
-    '/forge/models/text_encoder/clip_l.safetensors',
-    '/forge/models/text_encoder/t5xxl_fp8_e4m3fn.safetensors',
-    '/forge/models/VAE/ae.safetensors',
-]
-RAVNET_FLUX2_MODULES = [
-    '/forge/models/text_encoder/mistral_3_small_flux2_bf16.safetensors',
-    '/forge/models/VAE/full_encoder_small_decoder.safetensors',
-]
-
-def ravnet_model_override_settings(title):
-    s = {'sd_model_checkpoint': title.split(' [')[0], 'sd_vae': '', 'forge_additional_modules': []}
-    t = title.lower()
-    if 'flux2' in t or 'klein' in t:
-        s['forge_additional_modules'] = RAVNET_FLUX2_MODULES
-    elif 'flux' in t:
-        s['forge_additional_modules'] = RAVNET_FLUX1_MODULES
-    return s
-
-def ravnet_forge_generate_thread(params, jid):
-    """Generate using remote Forge on Ravnet DGX (forge-ravnet.ebartnet.pl)."""
+def forge_batch_all_models_thread(params, jid):
+    """Generuj ten sam prompt sekwencyjnie na wszystkich modelach Forge —
+    jeden model na raz (załaduj > wygeneruj > zwolnij VRAM > następny), żeby
+    uniknąć OOM na 12 GB VRAM. Ustawienia (sampler/steps/cfg/wymiary) per model
+    biorą się z trwałej bazy model_settings (Etap 1), z fallbackiem do wartości
+    z formularza dla modeli bez zapisanych ustawień.
+    """
     try:
         job_set(jid, status='generating')
-        title, fname = resolve_ravnet_model(params['model'])
-        data = forge_post('/sdapi/v1/txt2img', {
-            'prompt':          params['positive'],
-            'negative_prompt': params['negative'],
-            'sampler_name':    params['sampler'],
-            'scheduler':       params.get('scheduler', 'Karras'),
-            'steps':           int(params['steps']),
-            'cfg_scale':       float(params['cfg']),
-            'width':           int(params['width']),
-            'height':          int(params['height']),
-            'seed':            int(params.get('seed', -1)),
-            'batch_size':      int(params.get('batch', 1)),
-            'n_iter':          1,
-            'override_settings': ravnet_model_override_settings(title),
-            'override_settings_restore_afterwards': True,
-            'save_images': False,
-        }, timeout=600, base_url=RAVNET_FORGE_URL)
-        imgs_b64 = data.get('images', [])
-        info     = json.loads(data.get('info', '{}'))
-        seed     = info.get('seed', -1)
-        seeds    = info.get('all_seeds', [seed] * len(imgs_b64))
+        with _models_lock:
+            # Pomijamy domyślnie modele architektury Flux (np. flux1-dev-fp8) —
+            # znacznie wolniejsze od SDXL (minuty zamiast sekund na obraz),
+            # rozwałałyby czas całego przebiegu "wszystkie modele".
+            all_models = [
+                m for m in _models_cache
+                if m.get('filename') and not is_flux_checkpoint(m['filename'])
+            ]
+        total = len(all_models)
+        if total == 0:
+            raise RuntimeError('Brak modeli Forge do wygenerowania')
 
         today   = datetime.now().strftime('%Y-%m-%d')
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time() * 1000)
-        paths = []
-        for i, b64 in enumerate(imgs_b64):
-            s    = seeds[i] if i < len(seeds) else seed
-            name = f'gp_ravnet_{ts}_{i:02d}_s{s}.png'
-            (out_dir / name).write_bytes(base64.b64decode(b64))
-            paths.append(f'genphoto/{today}/{name}')
-
         gid = params.get('gen_id', uuid.uuid4().hex)
-        with _db_lock:
-            with db() as con:
-                con.execute(
-                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (gid, int(time.time()), params.get('description',''),
-                     params['positive'], params['negative'], params['model'],
-                     params['sampler'], params.get('scheduler','Karras'),
-                     int(params['steps']), float(params['cfg']),
-                     int(params['width']), int(params['height']),
-                     seed, int(params.get('batch',1)),
-                     params.get('preset','ravnet_forge'), json.dumps(paths))
-                )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        all_paths = []
+        errors = []
+
+        for idx, m in enumerate(all_models):
+            model_name = m['model_name']
+            title = m['title']
+            fname = m.get('filename', '')
+
+            job_set(jid, status='generating',
+                    progress={'current': idx + 1, 'total': total, 'model': model_name})
+
+            saved = _get_saved_model_settings(model_name)
+            if saved:
+                s = saved['settings']
+                sampler, scheduler = s['sampler'], s['scheduler']
+                steps, cfg = s['steps'], s['cfg']
+                width, height = s['width'], s['height']
+            else:
+                sampler   = params.get('sampler') or 'DPM++ SDE'
+                scheduler = params.get('scheduler') or 'Karras'
+                steps     = int(params.get('steps', 28))
+                cfg       = float(params.get('cfg', 5.5))
+                width     = int(params.get('width', 1024))
+                height    = int(params.get('height', 1024))
+
+            try:
+                batch_prompt = _apply_lora_tags(params['positive'], params.get('loras'))
+                body = {
+                    'prompt':          batch_prompt,
+                    'negative_prompt': params.get('negative', ''),
+                    'sampler_name':    sampler,
+                    'scheduler':       scheduler,
+                    'steps':           steps,
+                    'cfg_scale':       cfg,
+                    'width':           width,
+                    'height':          height,
+                    'seed':            int(params.get('seed', -1)),
+                    'batch_size':      1,
+                    'n_iter':          1,
+                    'override_settings': model_override_settings(title, fname),
+                    'override_settings_restore_afterwards': False,
+                    'save_images': False,
+                }
+                data = forge_post('/sdapi/v1/txt2img', body, timeout=180)
+                imgs_b64 = data.get('images', [])
+                info = json.loads(data.get('info', '{}'))
+                seed = info.get('seed', -1)
+
+                paths = []
+                for i, b64 in enumerate(imgs_b64):
+                    name = f'gp_batch_{ts}_{idx:02d}_{model_name}_s{seed}.png'
+                    (out_dir / name).write_bytes(base64.b64decode(b64))
+                    p = f'genphoto/{today}/{name}'
+                    paths.append(p)
+                    all_paths.append(p)
+
+                if paths:
+                    with _db_lock:
+                        with db() as con:
+                            con.execute(
+                                'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                (uuid.uuid4().hex, int(time.time()), params.get('description', ''),
+                                 params['positive'], params.get('negative', ''), model_name,
+                                 sampler, scheduler, steps, cfg, width, height,
+                                 seed, 1, 'batch_all_models', json.dumps(paths))
+                            )
+            except Exception as model_err:
+                errors.append(f'{model_name}: {model_err}')
+            finally:
+                # Zwolnij VRAM przed załadowaniem kolejnego modelu.
+                try:
+                    forge_post('/sdapi/v1/unload-checkpoint', {}, timeout=15)
+                except Exception:
+                    pass
+
+        status = 'done' if all_paths else 'error'
+        job_set(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
+                error=('; '.join(errors) if errors else None))
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
@@ -474,38 +961,45 @@ def krea_generate_thread(params, jid):
         # Determine checkpoint
         model = params.get('model', 'oss_turbo')
         
-        # Krea 2 parameters
+        # Krea 2 parameters — num_images always 1: a batched forward pass
+        # doubles VAE-decode activation memory and OOMs on 12 GB VRAM once
+        # the quantized model is loaded, so images are generated one at a time.
         body = {
             'prompt': params['positive'],
             'checkpoint': 'oss_turbo' if 'turbo' in model else 'oss_raw',
             'width': min(int(params['width']), 2048),
             'height': min(int(params['height']), 2048),
-            'num_images': int(params.get('batch', 1)),
+            'num_images': 1,
             'seed': int(params.get('seed', 0)),
         }
-        
+
         # Steps: default 8 for turbo, 52 for raw
         if 'steps' in params and params['steps']:
             body['steps'] = int(params['steps'])
-        
+
         # CFG: default 0.0 for turbo, 3.5 for raw
         if 'cfg' in params and params['cfg']:
             body['cfg'] = float(params['cfg'])
-        
-        # Call Krea 2 API
-        img_data, headers = krea_post('/generate', body)
-        gen_time = headers.get('X-Generation-Time', '?')
-        seed = headers.get('X-Seed', str(body['seed']))
-        
-        # Save image
+
         today = datetime.now().strftime('%Y-%m-%d')
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time() * 1000)
-        name = f'krea_{ts}_00_s{seed}.png'
-        (out_dir / name).write_bytes(img_data)
-        paths = [f'genphoto/{today}/{name}']
-        
+        base_seed = body['seed']
+        batch = int(params.get('batch', 1))
+        paths = []
+        first_seed = None
+
+        for i in range(batch):
+            body['seed'] = base_seed + i
+            img_data, headers = krea_post('/generate', body)
+            seed = headers.get('X-Seed', str(body['seed']))
+            if first_seed is None:
+                first_seed = seed
+            name = f'krea_{ts}_{i:02d}_s{seed}.png'
+            (out_dir / name).write_bytes(img_data)
+            paths.append(f'genphoto/{today}/{name}')
+
         gid = params.get('gen_id', uuid.uuid4().hex)
         with _db_lock:
             with db() as con:
@@ -516,19 +1010,11 @@ def krea_generate_thread(params, jid):
                      params.get('sampler',''), params.get('scheduler',''),
                      int(body.get('steps',8)), float(body.get('cfg',0.0)),
                      int(body['width']), int(body['height']),
-                     int(seed), int(params.get('batch',1)),
+                     int(first_seed), batch,
                      params.get('preset','krea'), json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
-        
-        # Also generate on other batch images if requested
-        for i in range(1, int(params.get('batch', 1))):
-            body['seed'] = int(seed) + i
-            img_data2, _ = krea_post('/generate', body)
-            name2 = f'krea_{ts}_{i:02d}_s{int(seed)+i}.png'
-            (out_dir / name2).write_bytes(img_data2)
-            paths.append(f'genphoto/{today}/{name2}')
-            
+        job_set(jid, status='done', images=paths, seed=first_seed, gen_id=gid)
+
     except Exception as e:
         job_set(jid, status='error', error=str(e))
 
@@ -685,6 +1171,262 @@ def comfy_post(path, data, timeout=30):
 def comfy_get(path, timeout=10):
     with urllib.request.urlopen(f'{COMFY_URL}{path}', timeout=timeout) as r:
         return json.loads(r.read())
+
+ZIMAGE_TEMPLATE = json.loads(r'''
+{
+  "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "z_image_turbo-Q8_0.gguf"}},
+  "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "Qwen3-4B-UD-Q5_K_XL.gguf", "type": "lumina2"}},
+  "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+  "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+  "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+  "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 832, "height": 1216, "batch_size": 1}},
+  "7": {"class_type": "KSamplerAdvanced", "inputs": {"model": ["1", 0], "add_noise": "enable", "noise_seed": 0, "steps": 8, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": 10000, "return_with_leftover_noise": "disable", "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+  "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+  "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "gp_zimage"}}
+}
+''')
+
+COMFY_UNET_DIR = Path(os.environ.get('GP_COMFY_UNET_DIR', '/home/bartek/comfyui/models/unet'))
+
+def _zimage_unet_name(params):
+    """Kwantyzacja GGUF Z-Image: payload 'quant' (np. Q5_K_M — A/B test) >
+    env GP_ZIMAGE_QUANT > domyślne Q8_0. Walidacja: plik musi istnieć na dysku."""
+    quant = (params.get('quant') or os.environ.get('GP_ZIMAGE_QUANT', 'Q8_0')).strip()
+    # tylko bezpieczne znaki — nazwa trafia wprost do ścieżki pliku
+    if not re.fullmatch(r'[A-Za-z0-9_]+', quant):
+        raise RuntimeError(f'Nieprawidłowa nazwa kwantyzacji: {quant!r}')
+    unet = f'z_image_turbo-{quant}.gguf'
+    if not (COMFY_UNET_DIR / unet).exists():
+        raise RuntimeError(f'Brak pliku {unet} w {COMFY_UNET_DIR} '
+                           f'(dostępne: {sorted(p.name for p in COMFY_UNET_DIR.glob("z_image_turbo-*.gguf"))})')
+    return unet
+
+def zimage_generate_thread(params, jid):
+    """Generate using Z-Image Turbo via local ComfyUI (GGUF, port 8189)."""
+    try:
+        job_set(jid, status='generating')
+        import copy as _copy
+
+        unet_name = _zimage_unet_name(params)
+        width  = int(params['width'])
+        height = int(params['height'])
+        steps  = int(params.get('steps', 8)) or 8
+        cfg    = float(params.get('cfg', 1.0)) or 1.0
+        batch  = int(params.get('batch', 1))
+        seed   = int(params.get('seed', -1))
+        if seed < 0:
+            seed = secrets.randbelow(2**32)
+        ts = int(time.time() * 1000)
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+
+        loras = params.get('loras') or []
+
+        # Jeden obraz na raz — batch>1 w jednym forward passie podwaja pamięć
+        # aktywacji przy dekodowaniu VAE i grozi OOM na 12 GB VRAM (patrz Krea 2).
+        for i in range(batch):
+            graph = _copy.deepcopy(ZIMAGE_TEMPLATE)
+            graph['1']['inputs']['unet_name']      = unet_name
+            graph['4']['inputs']['text']            = params['positive']
+            graph['5']['inputs']['text']             = params.get('negative', '')
+            graph['6']['inputs']['width']            = width
+            graph['6']['inputs']['height']           = height
+            graph['7']['inputs']['noise_seed']       = seed + i
+            graph['7']['inputs']['steps']            = steps
+            graph['7']['inputs']['cfg']              = cfg
+            graph['9']['inputs']['filename_prefix']  = f'gp_zimage_{ts}'
+
+            # Wpinamy LoRA łańcuchowo między UnetLoaderGGUF (node "1") a samplerem —
+            # każda kolejna LoRA bierze MODEL z wyjścia poprzedniej.
+            model_ref = ['1', 0]
+            for li, lora in enumerate(loras):
+                node_id = f'lora{li}'
+                graph[node_id] = {
+                    'class_type': 'LoraLoaderModelOnly',
+                    'inputs': {
+                        'model': model_ref,
+                        'lora_name': lora['name'],
+                        'strength_model': float(lora.get('strength', 1.0)),
+                    }
+                }
+                model_ref = [node_id, 0]
+            graph['7']['inputs']['model'] = model_ref
+
+            resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
+            prompt_id = resp['prompt_id']
+
+            deadline = time.time() + 300
+            history = None
+            while time.time() < deadline:
+                h = comfy_get(f'/history/{prompt_id}', timeout=15)
+                if prompt_id in h and h[prompt_id].get('outputs'):
+                    history = h[prompt_id]
+                    break
+                time.sleep(2)
+            if history is None:
+                raise RuntimeError('Timeout oczekiwania na wygenerowanie obrazu (Z-Image)')
+
+            images_meta = history['outputs'].get('9', {}).get('images', [])
+            if not images_meta:
+                raise RuntimeError('ComfyUI nie zwróciło żadnego obrazu (Z-Image)')
+
+            img  = images_meta[0]
+            src  = COMFY_OUTPUTS / img.get('subfolder', '') / img['filename']
+            name = f'zimage_{ts}_{i:02d}_s{seed+i}.png'
+            (out_dir / name).write_bytes(src.read_bytes())
+            paths.append(f'genphoto/{today}/{name}')
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description',''),
+                     params['positive'], params.get('negative',''),
+                     f'z_image_turbo_{unet_name.replace("z_image_turbo-", "").replace(".gguf", "")}',
+                     'euler', 'simple', steps, cfg, width, height,
+                     seed, batch, params.get('preset','zimage'), json.dumps(paths))
+                )
+        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+
+def build_wan_t2v_graph(positive, negative, width, height, length, seed, fps, filename_prefix,
+                         extra_lora_high=None, extra_lora_low=None):
+    """Graf ComfyUI dla WAN 2.2 T2V-A14B (MoE: high+low noise expert) w wariancie
+    lightx2v 4-step (szybki dystylowany sampling — niezbędny na 12GB VRAM / RTX 3060,
+    pelny 20-krokowy wariant trwałby wielokrotnie dłużej). Odtworzone z oficjalnego
+    szablonu ComfyUI (video_wan2_2_14B_t2v.json), z UNETLoader zamienionym na
+    UnetLoaderGGUF (kwantyzacja Q3_K_M zamiast fp8_scaled — mniejszy footprint VRAM).
+    extra_lora_high/extra_lora_low: opcjonalne dodatkowe LoRA (np. efekt ruchu z Civitai),
+    dolaczane w lancuchu ZA lightx2v — kazdy WAN 2.2 LoRA wymaga oddzielnego pliku dla
+    high i low noise expertu."""
+    graph = {
+        'clip_loader': {'class_type': 'CLIPLoader', 'inputs': {
+            'clip_name': WAN_CLIP_NAME, 'type': 'wan', 'device': 'cpu'}},
+        'vae_loader': {'class_type': 'VAELoader', 'inputs': {'vae_name': WAN_VAE_NAME}},
+        'unet_high': {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': WAN_HIGH_NOISE_UNET}},
+        'unet_low':  {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': WAN_LOW_NOISE_UNET}},
+        'lora_high': {'class_type': 'LoraLoaderModelOnly', 'inputs': {
+            'model': ['unet_high', 0], 'lora_name': WAN_HIGH_NOISE_LORA, 'strength_model': 1.0}},
+        'lora_low': {'class_type': 'LoraLoaderModelOnly', 'inputs': {
+            'model': ['unet_low', 0], 'lora_name': WAN_LOW_NOISE_LORA, 'strength_model': 1.0}},
+    }
+
+    model_high_ref = ['lora_high', 0]
+    if extra_lora_high and extra_lora_high.get('name'):
+        graph['lora_high_extra'] = {'class_type': 'LoraLoaderModelOnly', 'inputs': {
+            'model': model_high_ref, 'lora_name': extra_lora_high['name'],
+            'strength_model': float(extra_lora_high.get('strength', 1.0))}}
+        model_high_ref = ['lora_high_extra', 0]
+
+    model_low_ref = ['lora_low', 0]
+    if extra_lora_low and extra_lora_low.get('name'):
+        graph['lora_low_extra'] = {'class_type': 'LoraLoaderModelOnly', 'inputs': {
+            'model': model_low_ref, 'lora_name': extra_lora_low['name'],
+            'strength_model': float(extra_lora_low.get('strength', 1.0))}}
+        model_low_ref = ['lora_low_extra', 0]
+
+    graph.update({
+        'samp_high': {'class_type': 'ModelSamplingSD3', 'inputs': {'model': model_high_ref, 'shift': 5.0}},
+        'samp_low':  {'class_type': 'ModelSamplingSD3', 'inputs': {'model': model_low_ref, 'shift': 5.0}},
+        'latent': {'class_type': 'EmptyHunyuanLatentVideo', 'inputs': {
+            'width': width, 'height': height, 'length': length, 'batch_size': 1}},
+        'pos': {'class_type': 'CLIPTextEncode', 'inputs': {'text': positive, 'clip': ['clip_loader', 0]}},
+        'neg': {'class_type': 'CLIPTextEncode', 'inputs': {'text': negative, 'clip': ['clip_loader', 0]}},
+        'sampler_high': {'class_type': 'KSamplerAdvanced', 'inputs': {
+            'model': ['samp_high', 0], 'add_noise': 'enable', 'noise_seed': seed,
+            'steps': 4, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
+            'positive': ['pos', 0], 'negative': ['neg', 0], 'latent_image': ['latent', 0],
+            'start_at_step': 0, 'end_at_step': 2, 'return_with_leftover_noise': 'enable'}},
+        'sampler_low': {'class_type': 'KSamplerAdvanced', 'inputs': {
+            'model': ['samp_low', 0], 'add_noise': 'disable', 'noise_seed': 0,
+            'steps': 4, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
+            'positive': ['pos', 0], 'negative': ['neg', 0], 'latent_image': ['sampler_high', 0],
+            'start_at_step': 2, 'end_at_step': 4, 'return_with_leftover_noise': 'disable'}},
+        'vae_decode': {'class_type': 'VAEDecode', 'inputs': {
+            'samples': ['sampler_low', 0], 'vae': ['vae_loader', 0]}},
+        'create_video': {'class_type': 'CreateVideo', 'inputs': {
+            'images': ['vae_decode', 0], 'fps': fps}},
+        'save_video': {'class_type': 'SaveVideo', 'inputs': {
+            'video': ['create_video', 0], 'filename_prefix': filename_prefix,
+            'format': 'auto', 'codec': 'auto'}},
+    })
+    return graph
+
+def wan_video_generate_thread(params, jid):
+    """txt2vid przez WAN 2.2 T2V-A14B (ComfyUI, port 8189). Rozdzielczosc/dlugosc
+    klatek ograniczone pod 12GB VRAM — patrz build_wan_t2v_graph."""
+    try:
+        job_set(jid, status='generating')
+        width  = int(params.get('width', 640))
+        height = int(params.get('height', 640))
+        fps    = int(params.get('fps', 16))
+        # length musi byc postaci 4n+1 (kompresja czasowa VAE) — dopasuj do najblizszej
+        raw_length = int(params.get('length', 81))
+        length = max(1, ((raw_length - 1) // 4) * 4 + 1)
+        seed   = int(params.get('seed', -1))
+        if seed < 0:
+            seed = secrets.randbelow(2**32)
+        ts = int(time.time() * 1000)
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        graph = build_wan_t2v_graph(
+            params['positive'], params.get('negative', ''),
+            width, height, length, seed, fps,
+            filename_prefix=f'genphoto/wan_t2v_{ts}',
+            extra_lora_high=params.get('extra_lora_high'),
+            extra_lora_low=params.get('extra_lora_low'),
+        )
+
+        resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
+        prompt_id = resp['prompt_id']
+
+        # Pierwsze uruchomienie laduje ~12GB modeli z dysku — dajemy dlugi timeout.
+        t_start = time.time()
+        deadline = t_start + 900
+        history = None
+        while time.time() < deadline:
+            job_set(jid, status='generating', progress={'elapsed': int(time.time() - t_start)})
+            h = comfy_get(f'/history/{prompt_id}', timeout=15)
+            if prompt_id in h and h[prompt_id].get('outputs'):
+                history = h[prompt_id]
+                break
+            time.sleep(3)
+        if history is None:
+            raise RuntimeError('Timeout oczekiwania na wygenerowanie wideo (WAN 2.2)')
+
+        # UWAGA: SaveVideo mimo nazwy zwraca wynik pod kluczem 'images', nie 'videos'.
+        vids_meta = history['outputs'].get('save_video', {}).get('images', [])
+        if not vids_meta:
+            raise RuntimeError('ComfyUI nie zwrocilo zadnego wideo (WAN 2.2)')
+
+        vid  = vids_meta[0]
+        src  = COMFY_OUTPUTS / vid.get('subfolder', '') / vid['filename']
+        name = f'wan_t2v_{ts}_s{seed}.mp4'
+        (out_dir / name).write_bytes(src.read_bytes())
+        path = f'genphoto/{today}/{name}'
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description', ''),
+                     params['positive'], params.get('negative', ''), 'wan2.2_t2v_a14b',
+                     'euler', 'simple', 4, 1.0, width, height,
+                     seed, 1, 'wanvideo', json.dumps([path]))
+                )
+        job_set(jid, status='done', images=[path], seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
 
 
 # ── Vision Describer ─────────────────────────────────────────────────────────
@@ -913,9 +1655,11 @@ def _parse_vision_text(text):
             neg = l[9:].strip().lstrip(':').strip()
     return pos, neg
 
-def ai_vision_describe(image_b64, style='anime'):
+def ai_vision_describe(image_b64, style='anime', model=None):
     style_prefix = VISION_STYLE_HINTS.get(style, VISION_STYLE_HINTS['anime'])
-    if LOCAL_VISION_URL:
+    # Jeśli użytkownik wybrał konkretny model w UI, pomijamy lokalny fallback
+    # i idziemy prosto na wybrany model przez OpenRouter.
+    if not model and LOCAL_VISION_URL:
         try:
             text = _vision_call(
                 f'{LOCAL_VISION_URL}/v1/chat/completions',
@@ -930,7 +1674,7 @@ def ai_vision_describe(image_b64, style='anime'):
         raise RuntimeError('GP_OR_KEY not set i GP_LOCAL_VISION_URL nie skonfigurowany')
     text = _vision_call(
         'https://openrouter.ai/api/v1/chat/completions',
-        OR_VISION_MODEL, image_b64, style_prefix, style,
+        model or OR_VISION_MODEL, image_b64, style_prefix, style,
         headers_extra={
             'Authorization': f'Bearer {OR_KEY}',
             'HTTP-Referer':  'https://ebartnet.pl',
@@ -1167,12 +1911,6 @@ select{resize:none;cursor:pointer}
 .adv-toggle svg{transition:transform .2s}
 .adv-toggle.open svg{transform:rotate(180deg)}
 #adv-section{display:block;margin-top:14px;padding-top:14px;border-top:1px solid #334155}
-.meta-import-box{background:#0c1e35;border:1.5px dashed #1e3a5f;border-radius:10px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:10px;cursor:pointer;transition:border-color .2s}
-.meta-import-box:hover,.meta-import-box.drag{border-color:#3b82f6;background:#0f2744}
-.meta-import-icon{font-size:1.3rem;flex-shrink:0}
-.meta-import-label{font-size:.78rem;color:#64748b;flex:1}
-.meta-import-label strong{display:block;color:#93c5fd;margin-bottom:2px;font-size:.82rem}
-.meta-import-status{font-size:.75rem;color:#22d3ee;white-space:nowrap}
 #adv-section.open{display:block}
 
 /* Generate button */
@@ -1367,8 +2105,7 @@ select{resize:none;cursor:pointer}
 
 <header>
   <div class="logo">&#127912; GenPhoto</div>
-  <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate');switchBackend('forge');document.getElementById('tab-ravnet').classList.remove('active');this.classList.add('active');">&#127912; Generuj</button>
-  <button class="view-tab-btn hdr-gen-btn" id="tab-ravnet" onclick="switchView('generate');switchBackend('ravnet');document.getElementById('tab-gen').classList.remove('active');this.classList.add('active');">&#128640; RAVNET-FORGE</button>
+  <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate');switchBackend('forge');this.classList.add('active');">&#127912; Generuj</button>
   <div class="hdr-body">
     <div class="preset-tabs" id="preset-tabs">__PRESET_TABS__</div>
     <div class="hdr-spacer"></div>
@@ -1376,6 +2113,7 @@ select{resize:none;cursor:pointer}
       <button class="view-tab-btn" id="tab-edit" onclick="switchView('edit')">&#9999;&#65039; Edytuj</button>
       <button class="view-tab-btn" id="tab-portrait" onclick="switchView('portrait')">&#128100; Portret</button>
       <button class="view-tab-btn" id="tab-pose" onclick="switchView('pose')">&#128694; Poza</button>
+      <button class="view-tab-btn" id="tab-video" onclick="switchView('video')">&#127916; Wideo</button>
     </div>
     <div class="vram-widget" id="vram-widget">
       <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
@@ -1411,6 +2149,16 @@ select{resize:none;cursor:pointer}
         <div class="dl-info" id="dl-info">Przygotowywanie...</div>
         <div class="dl-bar-bg"><div class="dl-bar-fill" id="dl-bar-fill"></div></div>
         <div class="dl-info" id="dl-bytes">0 MB / 0 MB</div>
+      </div>
+      <div style="font-size:.75rem;color:#64748b;margin:14px 0 6px">Wgraj model z dysku (macOS):</div>
+      <div class="mgr-dl-row">
+        <input id="mgr-file-input" type="file" accept=".safetensors,.ckpt,.pt" style="flex:1;font-size:.8rem;color:#94a3b8">
+        <button class="mgr-dl-btn" onclick="startUpload()">&#11014; Wgraj</button>
+      </div>
+      <div class="dl-progress" id="up-progress">
+        <div class="dl-info" id="up-info">Przygotowywanie...</div>
+        <div class="dl-bar-bg"><div class="dl-bar-fill" id="up-bar-fill"></div></div>
+        <div class="dl-info" id="up-bytes">0 MB / 0 MB</div>
       </div>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between">
@@ -1457,21 +2205,6 @@ select{resize:none;cursor:pointer}
     <div class="pb-item"><span>Batch</span><strong id="pb-batch">—</strong></div>
   </div>
 
-  <div class="meta-import-box" id="meta-import-box"
-       onclick="document.getElementById('meta-import-file').click()"
-       ondragover="event.preventDefault();this.classList.add('drag')"
-       ondragleave="this.classList.remove('drag')"
-       ondrop="event.preventDefault();this.classList.remove('drag');metaImportFile(event.dataTransfer.files[0])">
-    <span class="meta-import-icon">&#128228;</span>
-    <div class="meta-import-label">
-      <strong>Wczytaj metadane ze zdjęcia</strong>
-      Przeciągnij PNG lub kliknij — automatycznie wypełni prompt i parametry
-    </div>
-    <span class="meta-import-status" id="meta-import-status"></span>
-    <input type="file" id="meta-import-file" accept="image/png,image/jpeg,image/webp" style="display:none"
-           onchange="metaImportFile(this.files[0])">
-  </div>
-
   <div class="field">
     <label>Opisz co chcesz wygenerować (po polsku)</label>
     <div class="ai-row">
@@ -1514,6 +2247,13 @@ select{resize:none;cursor:pointer}
                  oninput="document.getElementById(\'denoising-val\').textContent=parseFloat(this.value).toFixed(2)">
         </div>
       </div>
+      <div class="field" style="margin-bottom:10px">
+        <label>Model opisujący zdjęcie</label>
+        <select id="ref-vision-model-sel">
+          <option value="qwen/qwen3-vl-235b-a22b-instruct">Qwen3-VL-235B — dokładny opis, mądrzejszy negative prompt</option>
+          <option value="x-ai/grok-4.3">Grok-4.3 — bardziej bezpośredni opis anatomii</option>
+        </select>
+      </div>
       <button onclick="describeRef()" id="ref-desc-btn"
               style="width:100%;background:#0f4c8a;border:none;color:#93c5fd;padding:9px;border-radius:8px;cursor:pointer;font-size:.88rem;font-weight:600">
         &#128269; Opisz zdjęcie i wygeneruj prompt
@@ -1537,8 +2277,47 @@ select{resize:none;cursor:pointer}
       <div style="display:flex;gap:8px">
         <button id="backend-forge" class="backend-btn active" onclick="switchBackend('forge')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9881; Forge</button>
         <button id="backend-krea2" class="backend-btn" onclick="switchBackend('krea2')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9889; Krea 2</button>
-        <button id="backend-ravnet" class="backend-btn" onclick="switchBackend('ravnet')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#128640; Ravnet</button>
+        <button id="backend-zimage" class="backend-btn" onclick="switchBackend('zimage')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#127916; Z-Image</button>
       </div>
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <div style="flex:1;display:flex;gap:4px">
+          <button onclick="serviceControl('forge','start')" title="Uruchom Forge" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
+          <button onclick="serviceControl('forge','stop')" title="Zatrzymaj Forge (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
+        </div>
+        <div style="flex:1;display:flex;gap:4px">
+          <button onclick="serviceControl('krea2','start')" title="Uruchom Krea 2" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
+          <button onclick="serviceControl('krea2','stop')" title="Zatrzymaj Krea 2 (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
+        </div>
+        <div style="flex:1;display:flex;gap:4px">
+          <button onclick="serviceControl('comfyui','start')" title="Uruchom Z-Image / ComfyUI" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
+          <button onclick="serviceControl('comfyui','stop')" title="Zatrzymaj Z-Image / ComfyUI (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
+        </div>
+      </div>
+    </div>
+    <div class="field forge-lora-only" id="forge-lora-section" style="display:none">
+      <label>LoRA (Forge)</label>
+      <div id="forge-lora-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+      <div style="font-size:.72rem;color:var(--muted)">Nowe pliki wgraj przez <code>modelsLora</code> (rsync) do <code>forge/models/Lora</code>, potem odśwież stronę.</div>
+    </div>
+    <div class="field zimage-only" id="quant-section" style="display:none">
+      <label>Kwantyzacja GGUF (A/B test)</label>
+      <select id="quant-sel">
+        <option value="Q8_0" selected>Q8_0 (7.2 GB — dotychczasowa, najlepsza jakość)</option>
+        <option value="Q5_K_M">Q5_K_M (5.3 GB — test: ~2 GB mniej VRAM)</option>
+      </select>
+    </div>
+    <div class="field zimage-only" id="lora-section" style="display:none">
+      <label>LoRA (Z-Image)</label>
+      <div id="lora-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+      <div style="display:flex;gap:6px;margin-bottom:6px">
+        <input type="text" id="lora-url-in" placeholder="Link do LoRA (Civitai/HuggingFace)" style="flex:1">
+        <button onclick="downloadLora()" style="flex:0 0 auto;background:#1e3a5f;border:1px solid #3b82f6;color:#93c5fd;border-radius:8px;padding:0 12px;cursor:pointer;font-size:.78rem">Pobierz</button>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="file" id="lora-file-in" accept=".safetensors,.pt,.ckpt" style="flex:1;font-size:.75rem">
+        <button onclick="uploadLora()" style="flex:0 0 auto;background:#1e3a5f;border:1px solid #3b82f6;color:#93c5fd;border-radius:8px;padding:0 12px;cursor:pointer;font-size:.78rem">Wyślij</button>
+      </div>
+      <div id="lora-status" style="font-size:.72rem;color:var(--muted);margin-top:4px"></div>
     </div>
     <div class="field">
       <label>Model</label>
@@ -1546,8 +2325,20 @@ select{resize:none;cursor:pointer}
         <select id="model-sel" onchange="markCustom();onModelChange(this.value)">__MODEL_OPTIONS__</select>
         <button class="auto-btn" onclick="autoSettings()" title="Dobierz optymalne ustawienia do modelu">&#9881; Auto</button>
         <button class="auto-btn auto-model-btn" onclick="autoModel()" title="AI dobierze najlepszy model do promptu">&#129302; Model</button>
+        <button class="auto-btn" onclick="civitaiSettings()" title="Pobierz ustawienia z Civitai na próbę — NIE zapisuje trwale, kliknij Zapisz osobno">&#127760; Civitai</button>
+        <button class="auto-btn" onclick="saveModelSettings()" title="Zapisz obecne Sampler/Steps/CFG/Wymiary jako domyślne dla tego modelu na stałe">&#128190; Zapisz</button>
       </div>
       <button class="mgr-manage-btn" onclick="openMgrModal()">&#9881; Zarządzaj modelami / pobierz nowy</button>
+      <div id="model-settings-badge" style="font-size:.72rem;color:var(--muted);margin-top:4px"></div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:.82rem;cursor:pointer">
+        <input type="checkbox" id="all-models-check" onchange="toggleAllModels()" style="width:auto;margin:0">
+        generuj z wszystkich modeli (sekwencyjnie, jeden model na raz)
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:.82rem;cursor:pointer"
+             title="Przed generacją zatrzyma pozostałe backendy (Forge/Krea2/ComfyUI) — zwalnia VRAM dla ciężkich jobów, ale ich późniejszy restart potrwa ~30-90s">
+        <input type="checkbox" id="stop-backends-check" style="width:auto;margin:0">
+        zatrzymaj inne backendy przed generacją (ciężki job)
+      </label>
     </div>
     <div class="row2">
       <div class="field krea2-hide">
@@ -1602,6 +2393,24 @@ select{resize:none;cursor:pointer}
       <label>Negative prompt</label>
       <textarea id="negative-ta" onchange="markCustom()"></textarea>
     </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="ad-enable" onchange="markCustom();toggleAdetailerFields()" style="width:auto;margin:0">
+        ADetailer — popraw twarz/dłonie osobnym modelem
+      </label>
+      <div id="ad-fields" style="display:none;margin-top:8px;flex-direction:column;gap:8px">
+        <select id="ad-model-sel" onchange="markCustom()">
+          <option value="face_yolov8n.pt">Twarz (szybki)</option>
+          <option value="face_yolov8s.pt">Twarz (dokładniejszy)</option>
+          <option value="hand_yolov8n.pt">Dłonie</option>
+        </select>
+        <input type="text" id="ad-prompt-in" placeholder="Prompt tylko dla poprawianego regionu (opcjonalnie)" onchange="markCustom()">
+        <div class="field" style="margin:0">
+          <label style="font-size:.75rem">Denoising strength (0–1)</label>
+          <input type="number" id="ad-denoise-in" value="0.4" min="0.1" max="1" step="0.05" onchange="markCustom()">
+        </div>
+      </div>
+    </div>
   </div>
 
   <button class="gen-btn" id="gen-btn" onclick="startGenerate()">&#127912; GENERUJ</button>
@@ -1615,6 +2424,7 @@ select{resize:none;cursor:pointer}
     <span style="color:#334155;font-size:.8rem">Wygenerowane zdjęcia pojawią się tutaj</span>
   </div>
   <div id="progress-wrap">
+    <div id="batch-progress-label" style="display:none;font-size:.8rem;color:#93c5fd;margin-bottom:4px"></div>
     <div class="progress-label"><span id="prog-label">Generowanie...</span><span id="prog-pct"></span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog-fill"></div></div>
   </div>
@@ -2016,6 +2826,80 @@ select{resize:none;cursor:pointer}
 </main>
 </div><!-- /view-pose -->
 
+<div id="view-video" style="display:none">
+<main>
+<div class="left-panel">
+  <div style="font-size:.8rem;color:var(--muted);margin-bottom:12px">
+    Tekst na wideo (txt2vid) — WAN 2.2 T2V-A14B, tryb szybki (4 kroki, LoRA lightx2v). Generowanie trwa kilka minut na 12GB VRAM.
+  </div>
+
+  <div style="margin-bottom:12px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">ComfyUI (WAN 2.2)</label>
+    <div style="display:flex;gap:4px">
+      <button onclick="serviceControl('comfyui','start')" title="Uruchom ComfyUI" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.78rem">&#9654; Start</button>
+      <button onclick="serviceControl('comfyui','stop')" title="Zatrzymaj ComfyUI (zwalnia VRAM)" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.78rem">&#9632; Stop</button>
+    </div>
+  </div>
+
+  <div style="margin-bottom:10px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">Opis sceny (positive prompt)</label>
+    <textarea id="video-prompt" rows="4" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;font-size:.85rem;resize:vertical"
+      placeholder="np. beautiful woman turning her head back over shoulder, gentle smile, soft natural lighting, cinematic slow motion"></textarea>
+  </div>
+
+  <div style="margin-bottom:10px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">Negative prompt</label>
+    <textarea id="video-negative" rows="2" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;font-size:.85rem;resize:vertical">overexposed, subtitles, low quality, worst quality, blurry, deformed, bad anatomy, static, shaky camera, watermark</textarea>
+  </div>
+
+  <div style="margin-bottom:10px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">LoRA (WAN 2.2, opcjonalnie — para High/Low noise)</label>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px">
+      <div>
+        <div style="font-size:.72rem;color:var(--muted);margin-bottom:3px">High noise</div>
+        <select id="video-lora-high" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.8rem"><option value="">&#8212; Brak &#8212;</option></select>
+      </div>
+      <div>
+        <div style="font-size:.72rem;color:var(--muted);margin-bottom:3px">Low noise</div>
+        <select id="video-lora-low" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.8rem"><option value="">&#8212; Brak &#8212;</option></select>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <label style="font-size:.78rem;color:var(--muted)">Waga</label>
+      <input type="number" id="video-lora-strength" value="1.0" min="-2" max="2" step="0.05" style="width:80px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px;font-size:.8rem">
+    </div>
+    <div style="font-size:.72rem;color:var(--muted);margin-top:4px">Pliki WAN LoRA wgraj przez sekcję LoRA (Z-Image) &#8594; Wyślij/Pobierz (ten sam katalog), potem odśwież stronę.</div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin-bottom:10px">
+    <div><label style="font-size:.78rem;color:var(--muted)">Szerokość</label><input type="number" id="video-w" value="640" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    <button onclick="swapVideoWH()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px">&#8644;</button>
+    <div><label style="font-size:.78rem;color:var(--muted)">Wysokość</label><input type="number" id="video-h" value="640" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">
+    <div><label style="font-size:.78rem;color:var(--muted)">Czas trwania (s)</label><input type="number" id="video-duration" value="5" min="1" max="10" step="0.5" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    <div><label style="font-size:.78rem;color:var(--muted)">FPS</label><input type="number" id="video-fps" value="16" min="8" max="30" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    <div><label style="font-size:.78rem;color:var(--muted)">Seed</label><input type="number" id="video-seed" value="-1" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+  </div>
+
+  <button onclick="startVideoGen()" id="video-gen-btn" class="vid-btn">
+    &#127916; GENERUJ WIDEO
+  </button>
+  <div id="video-status" style="margin-top:8px;font-size:.85rem;color:var(--muted);text-align:center"></div>
+  <div id="video-progress-wrap" style="display:none;margin-top:10px">
+    <div class="progress-label"><span>Generowanie wideo (moze potrwac kilka minut)...</span><span id="video-prog-pct"></span></div>
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="vid-prog-fill"></div></div>
+    <div id="video-prog-detail" style="font-size:.75rem;color:var(--muted);margin-top:4px;min-height:1em"></div>
+  </div>
+</div>
+
+<div class="right-panel" id="video-results" style="display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:flex-start;padding:16px">
+  <div style="color:var(--muted);font-size:.9rem;margin-top:40px">Wygenerowane wideo pojawi się tutaj</div>
+</div>
+</main>
+</div><!-- /view-video -->
+
 <!-- ── Video View ── -->
 
 <!-- ── FLUX1 Image ── -->
@@ -2025,6 +2909,7 @@ select{resize:none;cursor:pointer}
   <button id="lb-close" onclick="closeLb()">&#10005;</button>
   <div id="lb-main">
     <img id="lb-img" src="" alt="">
+    <video id="lb-vid" controls autoplay loop style="display:none;max-width:96vw;max-height:80vh"></video>
     <div id="lb-nav">
       <button onclick="navLb(-1)">&#8592; Poprzednie</button>
       <button id="lb-dl" onclick="dlLb()">&#8595; Pobierz</button>
@@ -2051,20 +2936,34 @@ function switchBackend(b) {
   document.querySelectorAll('.backend-btn').forEach(function(el) { el.classList.remove('active'); });
   var btn = document.getElementById('backend-' + b);
   if (btn) btn.classList.add('active');
-  // Sampler + scheduler hidden in Krea 2 mode
+  // Sampler + scheduler hidden in Krea 2 / Z-Image mode (fixed sampler internally)
   document.querySelectorAll('.krea2-hide').forEach(function(el) {
-    el.style.display = (b === 'krea2') ? 'none' : '';
+    el.style.display = (b === 'krea2' || b === 'zimage') ? 'none' : '';
   });
-  if (b === 'ravnet') {
-    fetch('/api/ravnet-models').then(function(r){return r.json();}).then(_applyOrderToSelect);
-  } else if (b === 'forge') {
-    fetch('/api/models').then(function(r){return r.json();}).then(_applyOrderToSelect);
-  }
+  fetch('/api/models').then(function(r){return r.json();}).then(function(models){
+    _applyOrderToSelect(models);
+    var sel = document.getElementById('model-sel');
+    if (!sel) return;
+    if (b === 'zimage') {
+      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'zimage_turbo') { sel.selectedIndex = i; break; } }
+    } else if (b === 'krea2') {
+      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value.indexOf('krea2_') === 0) { sel.selectedIndex = i; break; } }
+    }
+  });
+  document.querySelectorAll('.zimage-only').forEach(function(el) {
+    el.style.display = (b === 'zimage') ? '' : 'none';
+  });
+  document.querySelectorAll('.forge-lora-only').forEach(function(el) {
+    el.style.display = (b === 'forge') ? '' : 'none';
+  });
+  if (b === 'zimage') loadLoraList();
+  if (b === 'forge') loadForgeLoraList();
 }
 
 /* ── Presets ── */
 
-function applyAutoResult(s, fromCache) {
+var SETTINGS_SOURCE_LABELS = {manual: 'zapisane ręcznie', civitai: 'dane z Civitai', llm: 'zgadnięte przez AI', 'civitai-preview': 'z Civitai — NIEZAPISANE, kliknij Zapisz'};
+function applyAutoResult(s, fromCache, source) {
   if (s.steps)    document.getElementById('steps-in').value = s.steps;
   if (s.cfg !== undefined) document.getElementById('cfg-in').value = s.cfg;
   if (s.width)    document.getElementById('w-in').value   = s.width;
@@ -2073,7 +2972,10 @@ function applyAutoResult(s, fromCache) {
   if (s.scheduler) setVal('sched-sel',  s.scheduler);
   markCustom();
   updateParamsBar();
-  var src = fromCache ? ' (cache)' : ' (AI)';
+  var srcLabel = SETTINGS_SOURCE_LABELS[source] || (fromCache ? 'cache' : 'AI');
+  var badge = document.getElementById('model-settings-badge');
+  if (badge) badge.textContent = srcLabel;
+  var src = ' (' + srcLabel + ')';
   var msg = 'Auto' + src + ': ' + (s.sampler||'') + ' · CFG ' + s.cfg + ' · ' + s.steps + ' steps · ' + (s.width||'?') + '\u00d7' + (s.height||'?');
   if (s.notes) msg += ' — ' + s.notes;
   toast(msg, 'ok');
@@ -2103,19 +3005,21 @@ function _sortByOrder(models) {
   var order = _getModelOrder();
   if (!order.length) return models;
   var map = {};
-  models.forEach(function(m){ map[m.model_name || m.title || ''] = m; });
+  models.forEach(function(m){ map[m.name || m.title || ''] = m; });
   var sorted = [];
   order.forEach(function(n){ if (map[n]) { sorted.push(map[n]); delete map[n]; } });
   Object.values(map).forEach(function(m){ sorted.push(m); });
   return sorted;
 }
+var _modelsCache = [];
 function _applyOrderToSelect(models) {
+  _modelsCache = models;
   var sel = document.getElementById('model-sel');
   if (!sel) return;
   var cur = sel.value;
   var sorted = _sortByOrder(models);
   sel.innerHTML = sorted.map(function(m){
-    var v = m.model_name || m.title || '';
+    var v = m.name || m.title || '';
     return '<option value="' + v + '"' + (v===cur?' selected':'') + '>' + v + '</option>';
   }).join('');
 }
@@ -2169,8 +3073,8 @@ function refreshMgrList() {
       list.innerHTML = '';
       var sorted = _sortByOrder(models);
       sorted.forEach(function(m) {
-        var name = (m.model_name || m.title || '').replace(/\.[^.]+$/, '');
-        var fname = (m.filename || m.model_name || '') + '';
+        var name = (m.name || m.title || '').replace(/\.[^.]+$/, '');
+        var fname = (m.name || '') + '';
         if (!fname.match(/\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
         var div = document.createElement('div');
         div.className = 'mgr-item';
@@ -2178,7 +3082,7 @@ function refreshMgrList() {
         div.dataset.fname = fname;
         div.innerHTML = '<span class="mgr-drag-handle" title="Przeciągnij aby zmienić kolejność">&#9776;</span>'
           + '<div class="mgr-item-name" title="' + fname + '">' + name + '</div>'
-          + '<button class="mgr-del-btn" onclick="deleteModel(' + JSON.stringify(fname) + ',this)">&#128465; Usuń</button>';
+          + '<button class="mgr-del-btn" onclick="deleteModel(' + JSON.stringify(fname).replace(/"/g, '&quot;') + ',this)">&#128465; Usuń</button>';
         list.appendChild(div);
       });
       _initDnd(list);
@@ -2193,8 +3097,9 @@ function deleteModel(fname, btn) {
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (d.ok) { toast('Usunięto: ' + fname, 'ok'); refreshMgrList(); }
-      else { toast('Błąd: ' + d.error, 'err'); btn.disabled=false; btn.textContent='🗑 Usu\u0144';; }
-    });
+      else { toast('Błąd: ' + d.error, 'err'); btn.disabled=false; btn.textContent='🗑 Usu\u0144'; }
+    })
+    .catch(function(e){ toast('Błąd połączenia: ' + e, 'err'); btn.disabled=false; btn.textContent='🗑 Usu\u0144'; });
 }
 
 function startDownload() {
@@ -2243,6 +3148,50 @@ function pollDownload() {
         toast('Błąd pobierania: ' + d.error, 'err');
       }
     });
+}
+
+function startUpload() {
+  var inp = document.getElementById('mgr-file-input');
+  var file = inp.files && inp.files[0];
+  if (!file) { toast('Wybierz plik modelu', 'err'); return; }
+  if (!/\.(safetensors|ckpt|pt)$/i.test(file.name)) { toast('Dozwolone rozszerzenia: .safetensors, .ckpt, .pt', 'err'); return; }
+  var prog = document.getElementById('up-progress');
+  prog.classList.add('show');
+  document.getElementById('up-info').textContent = 'Wysyłanie...';
+  document.getElementById('up-bar-fill').style.width = '0%';
+  document.getElementById('up-bytes').textContent = '';
+
+  var fd = new FormData();
+  fd.append('file', file, file.name);
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/model-upload');
+  xhr.upload.onprogress = function(e) {
+    if (!e.lengthComputable) return;
+    var pct = Math.round(e.loaded / e.total * 100);
+    document.getElementById('up-bar-fill').style.width = pct + '%';
+    document.getElementById('up-info').textContent = file.name + '  ' + pct + '%';
+    document.getElementById('up-bytes').textContent = (e.loaded/1048576).toFixed(1) + ' MB / ' + (e.total/1048576).toFixed(1) + ' MB';
+  };
+  xhr.onload = function() {
+    var d;
+    try { d = JSON.parse(xhr.responseText); } catch (e) { d = {ok:false, error:'zla odpowiedz serwera'}; }
+    if (d.ok) {
+      document.getElementById('up-bar-fill').style.width = '100%';
+      document.getElementById('up-info').textContent = '✅ Wgrano: ' + d.filename;
+      toast('Wgrano model: ' + d.filename, 'ok');
+      inp.value = '';
+      refreshMgrList();
+    } else {
+      document.getElementById('up-info').textContent = '❌ Błąd: ' + d.error;
+      toast('Błąd: ' + d.error, 'err');
+    }
+  };
+  xhr.onerror = function() {
+    document.getElementById('up-info').textContent = '❌ Błąd połączenia';
+    toast('Błąd połączenia', 'err');
+  };
+  xhr.send(fd);
 }
 
 function autoModel() {
@@ -2294,28 +3243,57 @@ function autoSettings() {
   var modelName = sel.value;
   if (!modelName) { toast('Wybierz model', 'err'); return; }
 
-  var cacheKey = 'auto_s_' + modelName;
-  try {
-    var cached = localStorage.getItem(cacheKey);
-    if (cached) {
-      var obj = JSON.parse(cached);
-      if (obj && obj.ts && (Date.now() - obj.ts) < 7 * 86400000) {
-        applyAutoResult(obj.s, true);
-        return;
-      }
-    }
-  } catch(e) {}
-
-  toast('\u23f3 Analizuję model przez AI...', 'info');
+  toast('\u23f3 Sprawdzam ustawienia modelu...', 'info');
   fetch('/api/auto-settings?model=' + encodeURIComponent(modelName))
     .then(function(r){ return r.json(); })
     .then(function(d){
-      if (!d.ok) { toast('Błąd AI: ' + (d.error||'?'), 'err'); return; }
-      try { localStorage.setItem(cacheKey, JSON.stringify({s: d.settings, ts: Date.now()})); } catch(e){}
-      applyAutoResult(d.settings, d.cached || false);
+      if (!d.ok) { toast('Błąd: ' + (d.error||'?'), 'err'); return; }
+      applyAutoResult(d.settings, d.cached || false, d.source || 'llm');
     })
     .catch(function(e){ toast('Błąd sieci: ' + e, 'err'); });
 }
+
+function civitaiSettings() {
+  var sel = document.getElementById('model-sel');
+  if (!sel) return;
+  var modelName = sel.value;
+  if (!modelName) { toast('Wybierz model', 'err'); return; }
+
+  toast('\u23f3 Pobieram dane z Civitai...', 'info');
+  fetch('/api/civitai-settings?model=' + encodeURIComponent(modelName))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { toast('Błąd: ' + (d.error||'?'), 'err'); return; }
+      applyAutoResult(d.settings, false, 'civitai-preview');
+    })
+    .catch(function(e){ toast('Błąd sieci: ' + e, 'err'); });
+}
+
+function saveModelSettings() {
+  var sel = document.getElementById('model-sel');
+  if (!sel || !sel.value) { toast('Wybierz model', 'err'); return; }
+  var body = {
+    model:     sel.value,
+    sampler:   document.getElementById('sampler-sel').value,
+    scheduler: document.getElementById('sched-sel').value,
+    steps:     document.getElementById('steps-in').value,
+    cfg:       document.getElementById('cfg-in').value,
+    width:     document.getElementById('w-in').value,
+    height:    document.getElementById('h-in').value,
+  };
+  fetch('/api/auto-settings-save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) {
+        toast('Zapisano ustawienia dla ' + sel.value + ' na stałe', 'ok');
+        document.getElementById('model-settings-badge').textContent = 'Zapisane ręcznie';
+      } else {
+        toast('Błąd zapisu: ' + (d.error||'?'), 'err');
+      }
+    })
+    .catch(function(){ toast('Błąd połączenia', 'err'); });
+}
+
 function applyPreset(id) {
   var p = PRESETS.find(function(x){return x.id===id;});
   if(!p) return;
@@ -2323,6 +3301,9 @@ function applyPreset(id) {
   document.querySelectorAll('.preset-btn').forEach(function(b){
     b.classList.toggle('active', b.dataset.id===id);
   });
+  if(p.model && p.model.startsWith('krea2_')) switchBackend('krea2');
+  else if(p.model && p.model.startsWith('zimage')) switchBackend('zimage');
+  else switchBackend('forge');
   var sel = document.getElementById('model-sel');
   for(var i=0;i<sel.options.length;i++){
     if(sel.options[i].value===p.model) { sel.selectedIndex=i; break; }
@@ -2369,6 +3350,146 @@ function toggleAdv() {
   var tog = document.getElementById('adv-toggle');
   var open = sec.classList.toggle('open');
   tog.classList.toggle('open', open);
+}
+
+function toggleAdetailerFields() {
+  var on = document.getElementById('ad-enable').checked;
+  document.getElementById('ad-fields').style.display = on ? 'flex' : 'none';
+}
+
+/* ── Reset VRAM per backend ── */
+var SERVICE_LABELS = {forge: 'Forge', krea2: 'Krea 2', comfyui: 'Z-Image'};
+function serviceControl(name, action) {
+  var label = SERVICE_LABELS[name];
+  var actionLabel = action === 'start' ? 'Uruchamianie' : 'Zatrzymywanie';
+  toast(actionLabel + ' (' + label + ')...', 'ok');
+  fetch('/api/service/' + name + '/' + action, {method: 'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) toast(label + ': ' + (action === 'start' ? 'uruchomiony' : 'zatrzymany'), 'ok');
+      else toast(label + ': błąd — ' + (d.error || '?'), 'err');
+    })
+    .catch(function(){ toast(label + ': błąd połączenia', 'err'); });
+}
+
+/* ── LoRA (Forge) ── */
+function loadForgeLoraList() {
+  fetch('/api/forge-loras').then(function(r){ return r.json(); }).then(function(names){
+    var wrap = document.getElementById('forge-lora-list');
+    wrap.innerHTML = '';
+    if (!names.length) {
+      wrap.innerHTML = '<div style="font-size:.75rem;color:var(--muted)">Brak LoRA na serwerze — wgraj przez modelsLora.</div>';
+      return;
+    }
+    names.forEach(function(name){
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:.78rem';
+      row.innerHTML =
+        '<input type="checkbox" class="forge-lora-check" data-name="' + name + '" style="width:auto;margin:0">' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + name + '">' + name + '</span>' +
+        '<input type="number" class="forge-lora-strength" value="1.0" min="-2" max="2" step="0.05" style="width:60px;padding:3px 5px;font-size:.75rem">';
+      wrap.appendChild(row);
+    });
+  });
+}
+
+function getSelectedForgeLoras() {
+  var out = [];
+  document.querySelectorAll('#forge-lora-list .forge-lora-check').forEach(function(cb){
+    if (!cb.checked) return;
+    var row = cb.closest('div');
+    var strength = row.querySelector('.forge-lora-strength').value;
+    out.push({name: cb.dataset.name, strength: parseFloat(strength) || 1.0});
+  });
+  return out;
+}
+
+/* ── LoRA (Z-Image) ── */
+function loadLoraList() {
+  fetch('/api/loras').then(function(r){ return r.json(); }).then(function(names){
+    var wrap = document.getElementById('lora-list');
+    wrap.innerHTML = '';
+    if (!names.length) {
+      wrap.innerHTML = '<div style="font-size:.75rem;color:var(--muted)">Brak LoRA na serwerze — pobierz lub wyślij poniżej.</div>';
+      return;
+    }
+    names.forEach(function(name){
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:.78rem';
+      row.innerHTML =
+        '<input type="checkbox" class="lora-check" data-name="' + name + '" style="width:auto;margin:0">' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + name + '">' + name + '</span>' +
+        '<input type="number" class="lora-strength" value="1.0" min="-2" max="2" step="0.05" style="width:60px;padding:3px 5px;font-size:.75rem">';
+      wrap.appendChild(row);
+    });
+  });
+}
+
+function getSelectedLoras() {
+  var out = [];
+  document.querySelectorAll('#lora-list .lora-check').forEach(function(cb){
+    if (!cb.checked) return;
+    var row = cb.closest('div');
+    var strength = row.querySelector('.lora-strength').value;
+    out.push({name: cb.dataset.name, strength: parseFloat(strength) || 1.0});
+  });
+  return out;
+}
+
+function downloadLora() {
+  var url = document.getElementById('lora-url-in').value.trim();
+  if (!url) return toast('Wklej link do LoRA', 'err');
+  var statusEl = document.getElementById('lora-status');
+  statusEl.textContent = 'Pobieranie...';
+  fetch('/api/lora-download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url: url})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { statusEl.textContent = 'Błąd: ' + d.error; return; }
+      _pollLoraDownload(d.job_id, statusEl);
+    })
+    .catch(function(){ statusEl.textContent = 'Błąd połączenia'; });
+}
+
+function _pollLoraDownload(jobId, statusEl) {
+  fetch('/api/download-progress/' + jobId).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.ok) { statusEl.textContent = 'Błąd: ' + (d.error || '?'); return; }
+    if (d.status === 'done') {
+      statusEl.textContent = 'Pobrano: ' + d.filename;
+      document.getElementById('lora-url-in').value = '';
+      loadLoraList();
+    } else if (d.status === 'error') {
+      statusEl.textContent = 'Błąd: ' + d.error;
+    } else {
+      statusEl.textContent = 'Pobieranie... ' + (d.percent >= 0 ? d.percent + '%' : '');
+      setTimeout(function(){ _pollLoraDownload(jobId, statusEl); }, 1500);
+    }
+  });
+}
+
+function uploadLora() {
+  var fileIn = document.getElementById('lora-file-in');
+  var file = fileIn.files[0];
+  if (!file) return toast('Wybierz plik LoRA', 'err');
+  var statusEl = document.getElementById('lora-status');
+  statusEl.textContent = 'Wysyłanie...';
+  var reader = new FileReader();
+  reader.onload = function() {
+    var b64 = reader.result.split(',')[1];
+    fetch('/api/lora-upload', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({filename: file.name, data: b64})})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.ok) {
+          statusEl.textContent = 'Wysłano: ' + file.name;
+          fileIn.value = '';
+          loadLoraList();
+        } else {
+          statusEl.textContent = 'Błąd: ' + d.error;
+        }
+      })
+      .catch(function(){ statusEl.textContent = 'Błąd połączenia'; });
+  };
+  reader.readAsDataURL(file);
 }
 
 /* ── AI Prompt ── */
@@ -2422,12 +3543,13 @@ function describeRef() {
   if (!_refImageB64) return;
   var btn = document.getElementById('ref-desc-btn');
   var style = document.getElementById('ref-style-sel').value;
+  var visionModel = document.getElementById('ref-vision-model-sel').value;
   btn.textContent = '⏳ Analizuję zdjęcie...';
   btn.disabled = true;
   fetch('/api/vision-describe', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({image_b64: _refImageB64, style: style})
+    body: JSON.stringify({image_b64: _refImageB64, style: style, model: visionModel})
   }).then(function(r){return r.json();}).then(function(d){
     if (d.positive) {
       document.getElementById('positive-ta').value = d.positive;
@@ -2475,10 +3597,23 @@ function getModelTriggers(val) {
   return null;
 }
 
+function toggleAllModels() {
+  var on = document.getElementById('all-models-check').checked;
+  var disabled = on;
+  ['model-sel'].forEach(function(id){ document.getElementById(id).disabled = disabled; });
+  document.querySelectorAll('.auto-btn').forEach(function(b){ b.disabled = disabled; b.style.opacity = disabled ? '.5' : ''; });
+}
+
 function onModelChange(val) {
-  var isFlux = val.toLowerCase().indexOf('flux') !== -1 ||
-               val.toLowerCase().indexOf('unstableevolution') !== -1 ||
-               val.toLowerCase().indexOf('krea') !== -1;
+  var vl = val.toLowerCase();
+  if (vl.startsWith('krea2_')) switchBackend('krea2');
+  else if (vl.startsWith('zimage')) switchBackend('zimage');
+  else if (_backend === 'krea2' || _backend === 'zimage') switchBackend('forge');
+
+  // Flux wykrywany po prawdziwej zawartości pliku (backend, is_flux), nie po nazwie —
+  // nazwy modeli bywają mylące (np. "gonzalomoXLFluxPony" to zwykły SDXL).
+  var modelInfo = _modelsCache.find(function(m){ return (m.name || m.title) === val; });
+  var isFlux = (modelInfo && modelInfo.is_flux) || val.toLowerCase().indexOf('krea') !== -1;
   var fluxBanner = document.getElementById('flux-banner');
   if (isFlux) {
     if (!fluxBanner) {
@@ -2547,6 +3682,26 @@ function startGenerate() {
     preset:      _curPreset || 'custom',
     backend:     _backend,
   };
+  if (document.getElementById('ad-enable').checked) {
+    params.adetailer_model   = document.getElementById('ad-model-sel').value;
+    params.adetailer_prompt  = document.getElementById('ad-prompt-in').value.trim();
+    params.adetailer_denoise = parseFloat(document.getElementById('ad-denoise-in').value);
+  }
+  if (document.getElementById('all-models-check').checked) {
+    params.all_models = true;
+  }
+  var _stopBk = document.getElementById('stop-backends-check');
+  if (_stopBk && _stopBk.checked) {
+    params.stop_other_backends = true;
+  }
+  if (_backend === 'zimage') {
+    params.loras = getSelectedLoras();
+    var _qsel = document.getElementById('quant-sel');
+    if (_qsel && _qsel.value) params.quant = _qsel.value;
+  }
+  if (_backend === 'forge') {
+    params.loras = getSelectedForgeLoras();
+  }
   if (_refImageB64) {
     params.init_image = _refImageB64;
     params.denoising  = parseFloat(document.getElementById('denoising-range').value);
@@ -2567,13 +3722,22 @@ function startGenerate() {
 
 function pollJob(jid, tick) {
   fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
+    if (d.progress) {
+      var bl = document.getElementById('batch-progress-label');
+      bl.style.display = 'block';
+      bl.textContent = 'Model ' + d.progress.current + '/' + d.progress.total + ': ' + d.progress.model +
+        (d.progress.error ? ' (błąd, pomijam)' : '');
+    }
     if(d.status === 'done') {
       stopForgeProgress();
       document.getElementById('prog-fill').style.width='100%';
       document.getElementById('prog-pct').textContent='';
+      document.getElementById('batch-progress-label').style.display = 'none';
+      if (d.error) toast('Część modeli zwróciła błąd: ' + d.error, 'err');
       setTimeout(function(){showProgress(false); showImages(d.images, d.seed); resetBtn(); loadHistory();}, 400);
     } else if(d.status === 'error') {
       stopForgeProgress();
+      document.getElementById('batch-progress-label').style.display = 'none';
       showProgress(false); resetBtn(); toast('Błąd: '+d.error, 'err');
     } else {
       _pollTimer = setTimeout(function(){pollJob(jid, tick+1);}, 2000);
@@ -2623,8 +3787,18 @@ function navLb(d)    { _lbIdx=(_lbIdx+d+_lbImgs.length)%_lbImgs.length; updLb();
 function dlLb()      { var a=document.createElement('a'); a.href='/img/'+_lbImgs[_lbIdx]; a.download=_lbImgs[_lbIdx].split('/').pop(); a.click(); }
 function updLb() {
   var path = _lbImgs[_lbIdx];
-  document.getElementById('lb-img').src = '/img/' + path;
+  var isVideo = /\.mp4$/i.test(path);
+  var imgEl = document.getElementById('lb-img');
+  var vidEl = document.getElementById('lb-vid');
+  if (isVideo) {
+    imgEl.style.display = 'none'; imgEl.src = '';
+    vidEl.style.display = ''; vidEl.src = '/img/' + path;
+  } else {
+    vidEl.style.display = 'none'; vidEl.pause(); vidEl.src = '';
+    imgEl.style.display = ''; imgEl.src = '/img/' + path;
+  }
   var meta = document.getElementById('lb-meta');
+  if (isVideo) { meta.innerHTML = '<span id="lb-meta-empty">Wideo — brak metadanych EXIF</span>'; return; }
   meta.innerHTML = '<span id="lb-meta-empty">Ładowanie…</span>';
   fetch('/api/image-meta?path=' + encodeURIComponent(path))
     .then(function(r){ return r.json(); })
@@ -2685,11 +3859,12 @@ function loadHistory() {
       /* thumbnails */
       var thumbsDiv = document.createElement('div'); thumbsDiv.className='hist-thumbs';
       paths.slice(0,4).forEach(function(p, i){
-        var img = document.createElement('img');
-        img.className='hist-thumb'; img.loading='lazy';
-        img.src='/img/'+encodeURI(p);
-        img.onclick=(function(ps,idx){return function(){openHistLb(ps,idx);};})(paths,i);
-        thumbsDiv.appendChild(img);
+        var el = /\.mp4$/i.test(p) ? document.createElement('video') : document.createElement('img');
+        el.className='hist-thumb';
+        if (el.tagName === 'VIDEO') { el.muted = true; el.src = '/img/'+encodeURI(p); }
+        else { el.loading='lazy'; el.src='/img/'+encodeURI(p); }
+        el.onclick=(function(ps,idx){return function(){openHistLb(ps,idx);};})(paths,i);
+        thumbsDiv.appendChild(el);
       });
 
       /* meta */
@@ -2792,31 +3967,6 @@ function openMetaModal(g) {
   document.getElementById('meta-modal').classList.add('open');
   document.body.style.overflow='hidden';
 }
-function metaImportFile(file) {
-  if (!file) return;
-  var status = document.getElementById('meta-import-status');
-  if (status) status.textContent = 'Wczytuję...';
-  var reader = new FileReader();
-  reader.onload = function(e) {
-    var b64 = e.target.result.split(',')[1];
-    fetch('/api/image-meta-upload', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({data: b64})
-    })
-    .then(function(r){ return r.json(); })
-    .then(function(d) {
-      if (!d.ok) { if(status) status.textContent = 'Brak metadanych SD'; return; }
-      _fillFormFromMeta(d);
-      if(status) status.textContent = '✓ Wczytano';
-      setTimeout(function(){ if(status) status.textContent=''; }, 3000);
-      toast('Metadane wczytane z ' + file.name, 'ok');
-    })
-    .catch(function(){ if(status) status.textContent = 'Błąd'; });
-  };
-  reader.readAsDataURL(file);
-}
-
 function _fillFormFromMeta(d) {
   if (d.positive) document.getElementById('positive-ta').value = d.positive;
   if (d.negative) document.getElementById('negative-ta').value = d.negative;
@@ -3000,7 +4150,7 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
   }
 
   window.vramFree = function() {
-    if (!confirm('Spowoduje to restart Forge (~30s przerwy). Kontynuować?')) return;
+    if (!confirm('Restart WSZYSTKICH backendów GPU (Forge, Krea2, ComfyUI) — przerwa ~60-90s. Kontynuować?')) return;
     var btn = document.getElementById('vram-free-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Restart...'; }
     var nums = document.getElementById('vram-nums');
@@ -3010,8 +4160,8 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
         toast('Błąd: ' + (d.error || '?'), 'error');
         return;
       }
-      toast('Forge restartuje — ~30s przerwy', 'info');
-      // polling aż Forge wróci
+      toast('Backendy restartują — pełna gotowość za ~60-90s', 'info');
+      // polling aż VRAM się zwolni
       var tries = 0;
       (function waitForge(){
         setTimeout(function(){
@@ -3019,12 +4169,12 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
           fetch('/api/vram').then(function(r){ return r.json(); }).then(function(v){
             if (v.ok) {
               if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
-              toast('Forge gotowy · VRAM wolny: ' + v.free_gb + ' GB', 'success');
-            } else if (tries < 20) { waitForge(); }
+              toast('VRAM zwolniony: ' + v.free_gb + ' GB wolne · backendy wstają', 'success');
+            } else if (tries < 30) { waitForge(); }
             else {
               if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
             }
-          }).catch(function(){ if (tries < 20) waitForge(); else { if(btn){btn.disabled=false;btn.textContent='ZWOLNIJ';} } });
+          }).catch(function(){ if (tries < 30) waitForge(); else { if(btn){btn.disabled=false;btn.textContent='ZWOLNIJ';} } });
         }, 3000);
       })();
     }).catch(function() {
@@ -3062,14 +4212,16 @@ var _editDrawing = false;
 var _editHistOpen = false;
 
 function switchView(v) {
-  ['generate','edit','portrait','pose'].forEach(function(n){
+  ['generate','edit','portrait','pose','video'].forEach(function(n){
     document.getElementById('view-'+n).style.display = v===n ? '' : 'none';
   });
   document.getElementById('tab-gen').classList.toggle('active',       v==='generate');
   document.getElementById('tab-edit').classList.toggle('active',      v==='edit');
   document.getElementById('tab-portrait').classList.toggle('active',  v==='portrait');
   document.getElementById('tab-pose').classList.toggle('active',      v==='pose');
+  document.getElementById('tab-video').classList.toggle('active',     v==='video');
   if(v==='edit') loadEditHistory();
+  if(v==='video') loadWanVideoLoraOptions();
 }
 
 /* ── Portrait / InstantID ── */
@@ -3624,7 +4776,107 @@ function pollPose(jid, btn, status) {
     }
   });
 }
+function loadWanVideoLoraOptions() {
+  fetch('/api/loras').then(function(r){ return r.json(); }).then(function(names){
+    ['video-lora-high', 'video-lora-low'].forEach(function(selId){
+      var sel = document.getElementById(selId);
+      var cur = sel.value;
+      sel.innerHTML = '<option value="">— Brak —</option>';
+      names.forEach(function(name){
+        var opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      sel.value = cur;
+    });
+  });
+}
+
+function swapVideoWH() {
+  var w = document.getElementById('video-w'), h = document.getElementById('video-h');
+  var tmp = w.value; w.value = h.value; h.value = tmp;
+}
+
+function startVideoGen() {
+  var prompt = document.getElementById('video-prompt').value.trim();
+  if (!prompt) return toast('Wpisz opis sceny', 'err');
+  var btn = document.getElementById('video-gen-btn');
+  var status = document.getElementById('video-status');
+  btn.disabled = true; btn.textContent = '⏳ Generowanie...';
+  status.textContent = 'Ladowanie modeli WAN 2.2 i generowanie...';
+  var fps = parseInt(document.getElementById('video-fps').value) || 16;
+  var duration = parseFloat(document.getElementById('video-duration').value) || 5;
+  var loraHigh = document.getElementById('video-lora-high').value;
+  var loraLow  = document.getElementById('video-lora-low').value;
+  var loraStrength = parseFloat(document.getElementById('video-lora-strength').value) || 1.0;
+  var params = {
+    positive: prompt,
+    negative: document.getElementById('video-negative').value.trim(),
+    width:    parseInt(document.getElementById('video-w').value),
+    height:   parseInt(document.getElementById('video-h').value),
+    length:   Math.round(duration * fps),
+    fps:      fps,
+    seed:     parseInt(document.getElementById('video-seed').value),
+    backend:  'wanvideo',
+    extra_lora_high: loraHigh ? {name: loraHigh, strength: loraStrength} : null,
+    extra_lora_low:  loraLow  ? {name: loraLow,  strength: loraStrength} : null,
+  };
+  fetch('/api/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params)})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if (!d.ok) { toast(d.error||'Blad', 'err'); btn.disabled=false; btn.textContent='🎬 GENERUJ WIDEO'; status.textContent=''; return; }
+    document.getElementById('video-progress-wrap').style.display = 'block';
+    pollVideoGen(d.job_id, btn, status);
+  })
+  .catch(function(){ toast('Blad polaczenia', 'err'); btn.disabled=false; btn.textContent='🎬 GENERUJ WIDEO'; status.textContent=''; });
+}
+
+var WAN_VIDEO_EST_SECONDS = 380; // szacunek na podstawie zmierzonych testow (~6-6.5 min)
+function pollVideoGen(jid, btn, status) {
+  fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
+    if (d.status === 'generating' && d.progress && typeof d.progress.elapsed === 'number') {
+      var el = d.progress.elapsed;
+      var pct = Math.min(95, Math.round(el / WAN_VIDEO_EST_SECONDS * 100));
+      var mm = Math.floor(el / 60), ss = el % 60;
+      var phase = el < 60 ? 'Ladowanie modeli WAN 2.2...'
+                : el < 300 ? 'Generowanie klatek (sampling)...'
+                : 'Finalizacja / zapis wideo...';
+      document.getElementById('vid-prog-fill').style.width = pct + '%';
+      document.getElementById('video-prog-pct').textContent = pct + '%';
+      document.getElementById('video-prog-detail').textContent =
+        phase + '  (' + mm + ':' + (ss<10?'0':'') + ss + ')';
+    }
+    if (d.status === 'done') {
+      document.getElementById('vid-prog-fill').style.width = '100%';
+      document.getElementById('video-prog-pct').textContent = '100%';
+      document.getElementById('video-progress-wrap').style.display = 'none';
+      btn.disabled = false; btn.textContent = '🎬 GENERUJ WIDEO'; status.textContent = '';
+      var results = document.getElementById('video-results');
+      while (results.firstChild) results.removeChild(results.firstChild);
+      (d.images||[]).forEach(function(path){
+        var wrap = document.createElement('div'); wrap.style.cssText = 'position:relative;width:100%';
+        var vid = document.createElement('video');
+        vid.src = '/img/'+path; vid.controls = true; vid.autoplay = true; vid.loop = true;
+        vid.style.cssText = 'width:100%;border-radius:10px;border:1px solid var(--border)';
+        var dl = document.createElement('a');
+        dl.href = '/img/'+path; dl.download = path.split('/').pop();
+        dl.style.cssText = 'display:block;margin-top:6px;text-align:center;background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:5px 10px;border-radius:6px;font-size:.8rem;text-decoration:none';
+        dl.textContent = '⬇ Pobierz';
+        wrap.appendChild(vid); wrap.appendChild(dl); results.appendChild(wrap);
+      });
+    } else if (d.status === 'error') {
+      document.getElementById('video-progress-wrap').style.display = 'none';
+      toast('Blad: '+(d.error||'nieznany'), 'err');
+      btn.disabled = false; btn.textContent = '🎬 GENERUJ WIDEO'; status.textContent = '';
+    } else {
+      status.textContent = 'Generowanie wideo...';
+      setTimeout(function(){ pollVideoGen(jid, btn, status); }, 3000);
+    }
+  });
+}
+
 /* ── Init ── */
+switchBackend(_backend);
 applyPreset('portrait');
 loadHistory();
 
@@ -3680,11 +4932,7 @@ class Handler(BaseHTTPRequestHandler):
         # Fetch models from Forge
         with _models_lock:
             raw_models = [m for m in _models_cache if not m.get('model_name','').lower().startswith('flux')]
-        model_opts = ''
-        for m in raw_models:
-            n = html.escape(m.get('model_name',''))
-            t = html.escape(m.get('model_name',''))
-            model_opts += f'<option value="{t}">{n}</option>'
+        model_opts = build_model_optgroups(raw_models)
         if not model_opts:
             model_opts = '<option value="RealVisXL_V5_fp16">RealVisXL_V5_fp16</option>'
 
@@ -3755,8 +5003,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
             return
         if path == '/api/models/refresh':
-            _refresh_models_once()
+            _refresh_models_once(rescan_disk=True)
             self._json({'ok': True})
+            return
+
+        if path == '/api/loras':
+            try:
+                names = sorted(
+                    p.name for p in LORAS_DIR.glob('*')
+                    if p.is_file() and p.suffix in ('.safetensors', '.pt', '.ckpt')
+                    and not p.name.startswith('put_')
+                )
+            except Exception:
+                names = []
+            self._json(names)
+            return
+
+        if path == '/api/forge-loras':
+            try:
+                names = sorted(
+                    p.stem for p in FORGE_LORAS_DIR.glob('*')
+                    if p.is_file() and p.suffix in ('.safetensors', '.pt', '.ckpt')
+                )
+            except Exception:
+                names = []
+            self._json(names)
             return
 
         if path.startswith('/api/download-progress/'):
@@ -3833,6 +5104,26 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
+        if path.startswith('/api/civitai-settings'):
+            from urllib.parse import urlparse, parse_qs as pqs
+            qs    = pqs(urlparse(self.path).query)
+            mname = qs.get('model', [''])[0].strip()
+            if not mname:
+                self._json({'ok': False, 'error': 'brak model'}); return
+            with _models_lock:
+                m = next((x for x in _models_cache if x.get('model_name') == mname), None)
+            sha256 = (m or {}).get('sha256', '')
+            if not sha256:
+                self._json({'ok': False, 'error': 'Brak hash pliku (Forge jeszcze go nie policzył — wygeneruj raz tym modelem, potem spróbuj ponownie)'}); return
+            try:
+                result = _fetch_civitai_settings_by_hash(sha256)
+                if not result:
+                    self._json({'ok': False, 'error': 'Civitai nie zwróciło danych dla tego pliku'}); return
+                self._json({'ok': True, 'settings': result['settings'], 'base_model': result['base_model']})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
+            return
+
         if path.startswith('/api/auto-settings'):
             from urllib.parse import urlparse, parse_qs as pqs
             qs    = pqs(urlparse(self.path).query)
@@ -3840,6 +5131,11 @@ class Handler(BaseHTTPRequestHandler):
             if not mname:
                 self._json({'ok': False, 'error': 'brak model'}); return
             import time as _t
+            # Trwałe ustawienia (ręczne, civitai lub wcześniej zgadnięte przez LLM)
+            # mają pierwszeństwo — przeżywają restart, w przeciwieństwie do _auto_cache.
+            saved = _get_saved_model_settings(mname)
+            if saved:
+                self._json({'ok': True, 'settings': saved['settings'], 'cached': True, 'source': saved['source']}); return
             cached = _auto_cache.get(mname)
             if cached and (_t.time() - cached['ts']) < 86400 * 7:
                 self._json({'ok': True, 'settings': cached['settings'], 'cached': True}); return
@@ -3879,6 +5175,10 @@ class Handler(BaseHTTPRequestHandler):
                 if raw.startswith('json'): raw = raw[4:].strip()
                 settings = json.loads(raw)
                 _auto_cache[mname] = {'settings': settings, 'ts': _t.time()}
+                try:
+                    _save_model_settings(mname, settings, 'llm')
+                except Exception:
+                    pass
                 self._json({'ok': True, 'settings': settings, 'cached': False})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
@@ -3916,7 +5216,7 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 with db() as con:
                     rows = con.execute(
-                        'SELECT * FROM generations ORDER BY ts DESC LIMIT 50'
+                        'SELECT * FROM generations ORDER BY ts DESC LIMIT 100'
                     ).fetchall()
             self._json([dict(r) for r in rows])
             return
@@ -3924,13 +5224,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/models':
             with _models_lock:
                 raw = list(_models_cache)
-            self._json([{'name': m.get('model_name',''), 'title': m.get('title','')} for m in raw])
-            return
-
-        if path == '/api/ravnet-models':
-            with _ravnet_models_lock:
-                raw = list(_ravnet_models_cache)
-            self._json([{'name': m.get('model_name',''), 'title': m.get('title','')} for m in raw])
+            self._json([{
+                'name': m.get('model_name',''),
+                'title': m.get('title',''),
+                'is_flux': bool(m.get('filename')) and is_flux_checkpoint(m['filename']),
+            } for m in raw])
             return
 
         if path == '/api/edit-history':
@@ -3992,16 +5290,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok': False, 'error': str(e)})
             return
 
-        if path == '/api/vram-free':
-            try:
-                import subprocess as _sp
-                _sp.Popen(
-                    ['systemctl', '--user', 'restart', 'forge'],
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-                )
-                self._json({'ok': True, 'msg': 'Forge restartuje — ~30s przerwy'})
-            except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+        if path == '/api/metrics':
+            with _mlock:
+                events = list(_metrics)
+            self._json({'ok': True, 'count': len(events), 'events': events[-100:]})
             return
 
         if path == '/api/forge-progress':
@@ -4044,7 +5336,88 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _handle_model_upload(self):
+        if not self._authed():
+            self._json({'ok': False, 'error': 'unauthorized'}, 401); return
+        ctype = self.headers.get('Content-Type', '')
+        m = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', ctype)
+        if not ctype.startswith('multipart/form-data') or not m:
+            self._json({'ok': False, 'error': 'oczekiwano multipart/form-data'}); return
+        boundary = (m.group(1) or m.group(2)).encode()
+        total = int(self.headers.get('Content-Length', 0))
+        rfile = self.rfile
+        remaining = [total]
+
+        def read_bytes(n):
+            n = min(n, remaining[0])
+            if n <= 0: return b''
+            chunk = rfile.read(n)
+            remaining[0] -= len(chunk)
+            return chunk
+
+        def read_line():
+            line = b''
+            while remaining[0] > 0:
+                b = read_bytes(1)
+                if not b: break
+                line += b
+                if line.endswith(b'\r\n'): break
+            return line
+
+        delim = b'--' + boundary
+        line = read_line()
+        if not line.startswith(delim):
+            self._json({'ok': False, 'error': 'zly format multipart'}); return
+        filename = None
+        while True:
+            line = read_line()
+            if line in (b'\r\n', b''):
+                break
+            decoded = line.decode('utf-8', errors='replace')
+            mm = re.search(r'filename="([^"]*)"', decoded)
+            if mm:
+                filename = mm.group(1)
+        if not filename:
+            self._json({'ok': False, 'error': 'brak nazwy pliku'}); return
+        filename = os.path.basename(filename)
+        if not filename or not filename.lower().endswith(('.safetensors', '.ckpt', '.pt')):
+            self._json({'ok': False, 'error': 'nieobslugiwane rozszerzenie (dozwolone: .safetensors, .ckpt, .pt)'}); return
+        if (MODELS_DIR / filename).exists():
+            self._json({'ok': False, 'error': 'plik ' + filename + ' juz istnieje'}); return
+
+        tmp_path = MODELS_DIR / (filename + '.part')
+        closing = b'\r\n' + delim
+        tail_len = len(closing) + 4
+        buf = b''
+        try:
+            with open(tmp_path, 'wb') as f:
+                while True:
+                    chunk = read_bytes(65536)
+                    if not chunk and not buf:
+                        break
+                    buf += chunk
+                    idx2 = buf.find(closing)
+                    if idx2 != -1:
+                        f.write(buf[:idx2])
+                        buf = b''
+                        break
+                    if len(buf) > tail_len:
+                        f.write(buf[:-tail_len])
+                        buf = buf[-tail_len:]
+                    if not chunk:
+                        break
+            tmp_path.rename(MODELS_DIR / filename)
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            self._json({'ok': False, 'error': str(e)}); return
+
+        _refresh_models_once(rescan_disk=True)
+        self._json({'ok': True, 'filename': filename})
+
     def do_POST(self):
+        if self.path == '/api/model-upload':
+            self._handle_model_upload()
+            return
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length).decode('utf-8', errors='replace')
 
@@ -4084,46 +5457,125 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': False, 'error': 'unauthorized'}, 401)
             return
 
-        if self.path == '/api/image-meta-upload':
+        if self.path == '/api/lora-download':
             try:
-                import base64 as _b64, io as _io
-                payload = json.loads(body)
-                data = _b64.b64decode(payload['data'])
-                from PIL import Image as _Img
-                with _Img.open(_io.BytesIO(data)) as im:
-                    params_str = im.info.get('parameters','')
-                result = {'ok': bool(params_str), 'raw': params_str}
-                if params_str:
-                    lines = params_str.split('\n')
-                    result['positive'] = lines[0].strip() if lines else ''
-                    neg = next((l.replace('Negative prompt:','').strip() for l in lines if l.startswith('Negative prompt:')), '')
-                    result['negative'] = neg
-                    meta_line = next((l for l in lines if 'Steps:' in l), '')
-                    for kv in meta_line.split(','):
-                        kv = kv.strip()
-                        if ': ' in kv:
-                            k, v = kv.split(': ', 1)
-                            result[k.strip().lower().replace(' ','_')] = v.strip()
-                self._json(result)
+                data = json.loads(body)
+                url = data.get('url', '').strip()
+            except:
+                self._json({'ok': False, 'error': 'bad JSON'}); return
+            if not url or not (url.startswith('http://') or url.startswith('https://')):
+                self._json({'ok': False, 'error': 'nieprawidłowy URL'}); return
+            job_id = uuid.uuid4().hex[:12]
+            _downloads[job_id] = {'url': url, 'filename': '', 'percent': 0,
+                                   'status': 'starting', 'error': '', 'bytes_done': 0, 'size': 0}
+            threading.Thread(target=_download_model_thread,
+                              args=(job_id, url), kwargs={'dest_dir': LORAS_DIR, 'refresh': False},
+                              daemon=True).start()
+            self._json({'ok': True, 'job_id': job_id})
+            return
+
+        if self.path == '/api/lora-upload':
+            try:
+                data = json.loads(body)
+                fname = data.get('filename', '').strip()
+                b64   = data.get('data', '')
+            except:
+                self._json({'ok': False, 'error': 'bad JSON'}); return
+            if not fname or '/' in fname or '\\' in fname:
+                self._json({'ok': False, 'error': 'nieprawidłowa nazwa pliku'}); return
+            if not fname.endswith(('.safetensors', '.pt', '.ckpt')):
+                self._json({'ok': False, 'error': 'obsługiwane tylko .safetensors/.pt/.ckpt'}); return
+            try:
+                raw = base64.b64decode(b64)
+                (LORAS_DIR / fname).write_bytes(raw)
+                self._json({'ok': True})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
+            return
+
+        if self.path == '/api/auto-settings-save':
+            try:
+                data = json.loads(body)
+                mname = data.get('model', '').strip()
+                settings = {
+                    'sampler':   data.get('sampler', ''),
+                    'scheduler': data.get('scheduler', ''),
+                    'steps':     int(data.get('steps', 20)),
+                    'cfg':       float(data.get('cfg', 5.0)),
+                    'width':     int(data.get('width', 1024)),
+                    'height':    int(data.get('height', 1024)),
+                }
+            except Exception:
+                self._json({'ok': False, 'error': 'bad JSON'}); return
+            if not mname:
+                self._json({'ok': False, 'error': 'brak model'}); return
+            _save_model_settings(mname, settings, 'manual')
+            self._json({'ok': True})
+            return
+
+        if self.path == '/api/vram-free':
+            # Restart WSZYSTKICH backendów GPU — poprzednio tylko Forge, a VRAM
+            # potrafił trzymać ComfyUI (Z-Image/WAN ~7-9 GB idle).
+            try:
+                import subprocess as _sp
+                for svc in ('forge', 'krea2', 'comfyui'):
+                    _sp.Popen(['systemctl', '--user', 'restart', svc],
+                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                metric('vram_free_restart', services='forge,krea2,comfyui')
+                def _health_watch():
+                    time.sleep(2)
+                    for b in ('forge', 'krea2', 'zimage'):
+                        _wait_backend_health(b, timeout_s=150)
+                    metric('vram_free_healthy')
+                threading.Thread(target=_health_watch, daemon=True).start()
+                self._json({'ok': True, 'msg': 'Restart Forge + Krea2 + ComfyUI — pełna gotowość za ~60-90s'})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)})
+            return
+
+        if self.path.startswith('/api/service/'):
+            parts = self.path.split('/')
+            valid_services = ('forge', 'krea2', 'comfyui')
+            if len(parts) == 5 and parts[3] in valid_services and parts[4] in ('start', 'stop'):
+                name, action = parts[3], parts[4]
+                try:
+                    import subprocess as _sp
+                    _sp.run(['systemctl', '--user', action, name], timeout=20, check=True)
+                    self._json({'ok': True})
+                except Exception as e:
+                    self._json({'ok': False, 'error': str(e)})
+            else:
+                self._json({'ok': False, 'error': 'nieprawidłowy serwis/akcja'})
             return
 
         if self.path == '/api/generate':
             try:
                 params = json.loads(body)
                 params['gen_id'] = uuid.uuid4().hex
-                jid = job_create()
                 backend = params.get('backend', 'forge')
                 if backend == 'krea2':
-                    target = krea_generate_thread
-                elif backend == 'ravnet':
-                    target = ravnet_forge_generate_thread
+                    target, kind = krea_generate_thread, 'krea2'
+                elif backend == 'zimage':
+                    target, kind = zimage_generate_thread, 'zimage'
+                elif backend == 'wanvideo':
+                    target, kind = wan_video_generate_thread, 'wanvideo'
+                elif backend == 'forge' and params.get('all_models'):
+                    target, kind, backend = forge_batch_all_models_thread, 'batch_all', 'forge'
                 elif params.get('init_image'):
-                    target = forge_img2img_ref_thread
+                    target, kind, backend = forge_img2img_ref_thread, 'forge', 'forge'
                 else:
-                    target = forge_generate_thread
-                t = threading.Thread(target=target, args=(params, jid), daemon=True)
+                    target, kind, backend = forge_generate_thread, 'forge', 'forge'
+                if gpu_queue_full():
+                    metric('queue_reject', backend=backend)
+                    self._json({'ok': False,
+                                'error': 'GPU zajęte — 1 generacja w toku i 1 w kolejce. '
+                                         'Poczekaj na zakończenie.',
+                                'retry_after_s': 30}, 503)
+                    return
+                jid = job_create()
+                t = threading.Thread(target=gpu_run,
+                                     args=(kind, backend, target, params, jid),
+                                     daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
@@ -4151,7 +5603,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({'ok': False, 'error': 'Brak promptu'}); return
                 params['gen_id'] = uuid.uuid4().hex
                 jid = job_create()
-                t = threading.Thread(target=forge_instantid_thread, args=(params, jid), daemon=True)
+                t = threading.Thread(target=gpu_run,
+                                     args=('forge', 'forge', forge_instantid_thread, params, jid),
+                                     daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
@@ -4164,7 +5618,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not params.get('body_image'):
                     self._json({'ok': False, 'error': 'Brak zdjęcia ciała'}); return
                 jid = job_create()
-                t = threading.Thread(target=forge_pose_thread, args=(params, jid), daemon=True)
+                t = threading.Thread(target=gpu_run,
+                                     args=('forge', 'forge', forge_pose_thread, params, jid),
+                                     daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
@@ -4176,9 +5632,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 image_b64 = data.get('image_b64', '')
                 style     = data.get('style', 'anime')
+                vmodel    = data.get('model', '').strip() or None
                 if not image_b64:
                     self._json({'ok': False, 'error': 'Brak image_b64'}); return
-                pos, neg = ai_vision_describe(image_b64, style)
+                pos, neg = ai_vision_describe(image_b64, style, model=vmodel)
                 self._json({'ok': True, 'positive': pos, 'negative': neg})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
@@ -4206,7 +5663,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({'ok': False, 'error': 'Brak positive prompt'}); return
                 params['gen_id'] = uuid.uuid4().hex
                 jid = job_create()
-                t = threading.Thread(target=forge_edit_thread, args=(params, jid), daemon=True)
+                t = threading.Thread(target=gpu_run,
+                                     args=('forge', 'forge', forge_edit_thread, params, jid),
+                                     daemon=True)
                 t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
@@ -4293,5 +5752,5 @@ if __name__ == '__main__':
             super().server_bind()
     server = _DualStack(('::', PORT), Handler)
     threading.Thread(target=_models_cache_worker, daemon=True).start()
-    _refresh_models_once()  # zaladuj cache przed pierwszym requestem
+    _refresh_models_once(rescan_disk=True)  # zaladuj cache przed pierwszym requestem
     server.serve_forever()
