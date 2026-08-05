@@ -337,12 +337,22 @@ NEG = ('(worst quality:2), (low quality:2), (blurry:1.3), deformed, ugly, extra 
 PRESETS = [
     {'id':'krea_turbo','name':'Krea 2 Turbo','icon':'&#9889;',
      'model':'krea2_oss_turbo','sampler':'','scheduler':'',
-     'steps':8, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
+     'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
      'prefix':'',
      'negative': ''},
     {'id':'krea_raw',  'name':'Krea 2 Raw',  'icon':'&#127922;',
      'model':'krea2_oss_raw','sampler':'','scheduler':'',
      'steps':28, 'cfg':3.5,'width':1024, 'height':1024, 'batch':1,
+     'prefix':'',
+     'negative': ''},
+    {'id':'krea_moody', 'name':'Krea 2 Moody', 'icon':'&#127917;',
+     'model':'krea2_oss_moody','sampler':'','scheduler':'',
+     'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
+     'prefix':'',
+     'negative': ''},
+    {'id':'krea_krea2gpt', 'name':'Krea 2 GPT', 'icon':'&#129504;',
+     'model':'krea2_oss_krea2gpt','sampler':'','scheduler':'',
+     'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
      'prefix':'',
      'negative': ''},
     {'id':'zimage_turbo', 'name':'Z-Image Turbo', 'icon':'&#127916;',
@@ -965,19 +975,18 @@ def krea_generate_thread(params, jid):
     try:
         job_set(jid, status='generating')
         
-        # Determine checkpoint — jawne mapowanie. Poprzednio: cokolwiek bez
-        # 'turbo' w nazwie lądowało w oss_raw (pusty model z presetu przy
-        # nieodświeżonej liście modeli ładował 26 GB RAW zamiast Turbo).
+        # Determine checkpoint — model_name z listy zawsze ma postac 'krea2_<checkpoint>'
+        # (patrz _refresh_models_once, ktore buduje ta liste wprost z /health Krea2 API,
+        # wiec kazdy checkpoint zgloszony przez API automatycznie tu dziala, bez
+        # koniecznosci recznego dopisywania kolejnych 'elif' przy nowych modelach).
         model = (params.get('model') or '').strip()
-        if 'turbo' in model:
-            checkpoint = 'oss_turbo'
-        elif 'raw' in model:
-            checkpoint = 'oss_raw'
+        if model.startswith('krea2_'):
+            checkpoint = model[len('krea2_'):]
         else:
             raise RuntimeError(
                 f'Nieznany model Krea 2: {model!r}. '
                 f'Odśwież stronę (lista modeli mogła być nieaktualna) i wybierz '
-                f'krea2_oss_turbo albo krea2_oss_raw z listy modeli.'
+                f'jeden z modeli Krea 2 z listy.'
             )
 
         # Krea 2 parameters — num_images always 1: a batched forward pass
@@ -985,6 +994,7 @@ def krea_generate_thread(params, jid):
         # the quantized model is loaded, so images are generated one at a time.
         body = {
             'prompt': params['positive'],
+            'negative_prompt': params.get('negative', '') or '',
             'checkpoint': checkpoint,
             'width': min(int(params['width']), 2048),
             'height': min(int(params['height']), 2048),
@@ -2088,6 +2098,14 @@ select{resize:none;cursor:pointer}
 #vid-prog-fill{background:linear-gradient(90deg,#7c3aed,#db2777)}
 .vid-hist-thumb{width:80px;height:56px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid #334155}
 
+/* ── Tablet/mid-desktop responsive (bez zmniejszania fontów, tylko łamanie na 2 linie) ── */
+@media(max-width:1024px) and (min-width:641px){
+  header{flex-wrap:wrap;height:auto;padding:8px 12px;row-gap:6px}
+  .hdr-body{order:2;flex:0 0 100%;border-top:1px solid #1e3a5f;padding-top:6px;margin-top:2px;overflow-x:auto}
+  .hdr-spacer{display:none}
+  .vram-widget{order:1;margin-left:auto}
+}
+
 /* ── Mobile responsive ── */
 @media(max-width:640px){
   /* Linia 1: logo | Generuj | Galeria | logout */
@@ -2953,7 +2971,7 @@ var _lbImgs = [], _lbIdx = 0;
 var _pollTimer = null;
 var _histOpen = false;
 var _backend = 'forge';
-function switchBackend(b) {
+function switchBackend(b, desiredModel) {
   _backend = b;
   document.querySelectorAll('.backend-btn').forEach(function(el) { el.classList.remove('active'); });
   var btn = document.getElementById('backend-' + b);
@@ -2966,6 +2984,12 @@ function switchBackend(b) {
     _applyOrderToSelect(models);
     var sel = document.getElementById('model-sel');
     if (!sel) return;
+    // Jesli wywolujacy zna konkretny docelowy model (preset albo reczny wybor
+    // w dropdownie) — uzyj go. W przeciwnym razie dopiero zgadnij pierwszy
+    // pasujacy (np. przy pierwszym wejsciu na dana zakladke backendu).
+    if (desiredModel) {
+      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === desiredModel) { sel.selectedIndex = i; return; } }
+    }
     if (b === 'zimage') {
       for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'zimage_turbo') { sel.selectedIndex = i; break; } }
     } else if (b === 'krea2') {
@@ -3323,8 +3347,8 @@ function applyPreset(id) {
   document.querySelectorAll('.preset-btn').forEach(function(b){
     b.classList.toggle('active', b.dataset.id===id);
   });
-  if(p.model && p.model.startsWith('krea2_')) switchBackend('krea2');
-  else if(p.model && p.model.startsWith('zimage')) switchBackend('zimage');
+  if(p.model && p.model.startsWith('krea2_')) switchBackend('krea2', p.model);
+  else if(p.model && p.model.startsWith('zimage')) switchBackend('zimage', p.model);
   else switchBackend('forge');
   var sel = document.getElementById('model-sel');
   for(var i=0;i<sel.options.length;i++){
@@ -3628,8 +3652,15 @@ function toggleAllModels() {
 
 function onModelChange(val) {
   var vl = val.toLowerCase();
-  if (vl.startsWith('krea2_')) switchBackend('krea2');
-  else if (vl.startsWith('zimage')) switchBackend('zimage');
+  // Przelaczaj backend TYLKO gdy faktycznie sie zmienia — w przeciwnym razie
+  // switchBackend() odpala async refetch listy modeli, ktorego callback
+  // nadpisuje reczny/presetowy wybor (wybiera 'pierwszy z brzegu' krea2_*).
+  if (vl.startsWith('krea2_')) {
+    if (_backend !== 'krea2') switchBackend('krea2', val);
+  }
+  else if (vl.startsWith('zimage')) {
+    if (_backend !== 'zimage') switchBackend('zimage', val);
+  }
   else if (_backend === 'krea2' || _backend === 'zimage') switchBackend('forge');
 
   // Flux wykrywany po prawdziwej zawartości pliku (backend, is_flux), nie po nazwie —
@@ -4152,8 +4183,24 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
   }
 
   function _tick() {
-    fetch('/api/vram').then(function(r){ return r.json(); }).then(function(d) {
-      if (!d.ok) return;
+    fetch('/api/vram').then(function(r){
+      // Sesja wygasla -> serwer daje 302 na /login (fetch podaza za redirectem)
+      // albo nie-JSON. Zamiast polykac blad i zostawiac "-- / --", przekieruj
+      // przegladarke do logowania.
+      var ct = (r.headers.get('content-type') || '');
+      if (r.redirected || ct.indexOf('application/json') === -1) {
+        window.location.href = '/login';
+        return null;
+      }
+      return r.json();
+    }).then(function(d) {
+      if (!d) return;
+      var nums = document.getElementById('vram-nums');
+      if (!d.ok) {
+        // Endpoint zwrocil blad — pokaz go zamiast zostawiac mylce "-- / --".
+        if (nums) { nums.textContent = 'blad VRAM'; nums.style.color = '#ef4444'; }
+        return;
+      }
       var used  = d.used_gb,  free = d.free_gb, total = d.total_gb;
       var pct   = total > 0 ? used / total : 0;
 
@@ -4162,12 +4209,14 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
 
       _drawChart(pct);
 
-      var nums = document.getElementById('vram-nums');
       if (nums) {
         nums.textContent = used.toFixed(1) + ' / ' + free.toFixed(1);
         nums.style.color = pct >= 0.95 ? '#ef4444' : pct >= 0.80 ? '#f59e0b' : '#93c5fd';
       }
-    }).catch(function(){});
+    }).catch(function(){
+      var nums = document.getElementById('vram-nums');
+      if (nums) { nums.textContent = 'brak laczn.'; nums.style.color = '#ef4444'; }
+    });
     _timer = setTimeout(_tick, 4000);
   }
 
@@ -5309,6 +5358,9 @@ class Handler(BaseHTTPRequestHandler):
                     'total_gb': round(total_mb / 1024, 2),
                 })
             except Exception as e:
+                # Log do journalu — wczesniej wyjatek byl zwracany tylko jako
+                # ok:false i znikal bez sladu, co uniemozliwialo diagnoze.
+                print(f'[genphoto] /api/vram ERROR: {e!r}', flush=True)
                 self._json({'ok': False, 'error': str(e)})
             return
 
