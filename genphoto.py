@@ -355,6 +355,16 @@ PRESETS = [
      'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
      'prefix':'',
      'negative': ''},
+    {'id':'krea_krealism', 'name':'Krealism', 'icon':'&#128247;',
+     'model':'krea2_oss_krealism','sampler':'','scheduler':'',
+     'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
+     'prefix':'',
+     'negative': ''},
+    {'id':'krea_redcraft', 'name':'RedCraft 3.0', 'icon':'&#128293;',
+     'model':'krea2_oss_redcraft','sampler':'','scheduler':'',
+     'steps':6, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':2,
+     'prefix':'',
+     'negative': ''},
     {'id':'zimage_turbo', 'name':'Z-Image Turbo', 'icon':'&#127916;',
      'model':'zimage_turbo','sampler':'','scheduler':'',
      'steps':8, 'cfg':1.0, 'width':832, 'height':1216, 'batch':1,
@@ -1875,9 +1885,9 @@ body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;min-heigh
 a{color:inherit;text-decoration:none}
 
 /* Header */
-header{background:#1e293b;border-bottom:1px solid #334155;padding:0 16px;min-height:52px;display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:100}
+header{background:#1e293b;border-bottom:1px solid #334155;padding:8px 16px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;z-index:100}
+.hdr-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 .logo{font-size:1.05rem;font-weight:700;color:#93c5fd;white-space:nowrap;flex-shrink:0}
-.hdr-body{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
 .preset-tabs{display:flex;gap:5px;overflow-x:auto;scrollbar-width:none;flex-shrink:0}
 .preset-tabs::-webkit-scrollbar{display:none}
 .preset-btn{background:#0f172a;border:1px solid #334155;color:#94a3b8;padding:5px 12px;border-radius:20px;font-size:.78rem;cursor:pointer;white-space:nowrap;transition:all .2s;display:flex;align-items:center;gap:4px}
@@ -1956,7 +1966,7 @@ select{resize:none;cursor:pointer}
 #results-placeholder .big{font-size:2.5rem}
 
 /* Progress */
-#progress-wrap{display:none;margin-bottom:16px}
+#progress-wrap{display:none;margin-bottom:16px;order:-1;flex-shrink:0}
 .progress-label{font-size:.78rem;color:#64748b;margin-bottom:6px;display:flex;justify-content:space-between}
 .progress-bar-bg{background:#0f172a;border-radius:4px;height:6px;overflow:hidden}
 .progress-bar-fill{background:linear-gradient(90deg,#3b82f6,#8b5cf6);height:100%;border-radius:4px;transition:width .5s;width:0%}
@@ -2098,24 +2108,21 @@ select{resize:none;cursor:pointer}
 #vid-prog-fill{background:linear-gradient(90deg,#7c3aed,#db2777)}
 .vid-hist-thumb{width:80px;height:56px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid #334155}
 
-/* ── Tablet/mid-desktop responsive (bez zmniejszania fontów, tylko łamanie na 2 linie) ── */
+/* ── Tablet/mid-desktop responsive (header ma juz 3 stale rzedy, tu tylko dopasowanie odstepow) ── */
 @media(max-width:1024px) and (min-width:641px){
-  header{flex-wrap:wrap;height:auto;padding:8px 12px;row-gap:6px}
-  .hdr-body{order:2;flex:0 0 100%;border-top:1px solid #1e3a5f;padding-top:6px;margin-top:2px;overflow-x:auto}
+  header{padding:8px 12px;row-gap:6px}
   .hdr-spacer{display:none}
-  .vram-widget{order:1;margin-left:auto}
+  .hdr-row-3{margin-left:0}
 }
 
 /* ── Mobile responsive ── */
 @media(max-width:640px){
-  /* Linia 1: logo | Generuj | Galeria | logout */
-  header{flex-wrap:wrap;height:auto;padding:5px 8px;gap:4px;row-gap:4px;align-items:center}
-  .logo{flex-shrink:0;font-size:.88rem;order:1}
-  .hdr-gen-btn{order:1;font-size:.75rem;padding:4px 10px}
-  .hdr-links{order:1;margin-left:auto;gap:4px}
+  header{padding:5px 8px;gap:4px;row-gap:4px}
+  .logo{font-size:.88rem}
+  .hdr-gen-btn{font-size:.75rem;padding:4px 10px}
+  .hdr-links{gap:4px}
   .hdr-portal-link{display:none}
-  /* Linia 2: presety | auto | edytuj | portret | poza — scroll poziomy */
-  .hdr-body{order:2;flex:0 0 100%;border-top:1px solid #1e3a5f;padding-top:5px;margin-top:2px;overflow-x:auto;flex-wrap:nowrap;gap:4px}
+  .hdr-row-2,.hdr-row-3{border-top:1px solid #1e3a5f;padding-top:5px;flex-wrap:nowrap;overflow-x:auto}
   .hdr-spacer{display:none}
   .vram-widget{display:none}
   .view-tab-btn{padding:4px 9px;font-size:.73rem;white-space:nowrap}
@@ -2144,17 +2151,21 @@ select{resize:none;cursor:pointer}
 <body>
 
 <header>
-  <div class="logo">&#127912; GenPhoto</div>
-  <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate');switchBackend('forge');this.classList.add('active');">&#127912; Generuj</button>
-  <div class="hdr-body">
+  <div class="hdr-row hdr-row-1">
+    <div class="logo">&#127912; GenPhoto</div>
+  </div>
+  <div class="hdr-row hdr-row-2">
+    <button class="view-tab-btn hdr-gen-btn active" id="tab-gen" onclick="switchView('generate');switchBackend('forge');this.classList.add('active');">&#127912; Generuj</button>
     <div class="preset-tabs" id="preset-tabs">__PRESET_TABS__</div>
-    <div class="hdr-spacer"></div>
+  </div>
+  <div class="hdr-row hdr-row-3">
     <div class="view-tabs">
       <button class="view-tab-btn" id="tab-edit" onclick="switchView('edit')">&#9999;&#65039; Edytuj</button>
       <button class="view-tab-btn" id="tab-portrait" onclick="switchView('portrait')">&#128100; Portret</button>
       <button class="view-tab-btn" id="tab-pose" onclick="switchView('pose')">&#128694; Poza</button>
       <button class="view-tab-btn" id="tab-video" onclick="switchView('video')">&#127916; Wideo</button>
     </div>
+    <div class="hdr-spacer"></div>
     <div class="vram-widget" id="vram-widget">
       <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
       <div class="vram-info">
@@ -2163,11 +2174,11 @@ select{resize:none;cursor:pointer}
       </div>
       <button class="vram-free-btn" id="vram-free-btn" onclick="vramFree()">ZWOLNIJ</button>
     </div>
-  </div>
-  <div class="hdr-links">
-    <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
-    <a href="__PORTAL_URL__" target="_blank" class="hdr-btn hdr-portal-link">&#9889; Portal</a>
-    <a href="/logout" class="hdr-btn">&#10155;</a>
+    <div class="hdr-links">
+      <a href="__GALLERY_URL__" target="_blank" class="hdr-btn">&#128193; Galeria</a>
+      <a href="__PORTAL_URL__" target="_blank" class="hdr-btn hdr-portal-link">&#9889; Portal</a>
+      <a href="/logout" class="hdr-btn">&#10155;</a>
+    </div>
   </div>
 </header>
 
