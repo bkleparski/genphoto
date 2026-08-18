@@ -136,6 +136,7 @@ GPU_WATCHDOG_S = {
     'zimage':    600,    # 8 kroków turbo + ewentualny reload GGUF
     'wanvideo':  1500,   # wewnętrzny deadline wątku WAN to 900s + ładowanie ~12GB GGUF
     'batch_all': 3600,   # ~20 modeli × (load + generowanie + unload)
+    'krea2_batch': 1200, # 4 warianty Krea 2 × (load + 2 zdjęcia)
 }
 
 # Minimalny wolny VRAM (MB) przed startem joba.
@@ -973,6 +974,80 @@ def forge_batch_all_models_thread(params, jid):
                     forge_post('/sdapi/v1/unload-checkpoint', {}, timeout=15)
                 except Exception:
                     pass
+
+        status = 'done' if all_paths else 'error'
+        job_set(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
+                error=('; '.join(errors) if errors else None))
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+KREA2_BATCH_VARIANTS = ['oss_moody', 'oss_krea2gpt', 'oss_krealism', 'oss_redcraft']
+
+def krea_batch_variants_thread(params, jid):
+    """Generuj ten sam prompt sekwencyjnie na wszystkich wariantach Krea 2
+    (Moody -> GPT -> Krealism -> RedCraft), po 2 zdjecia na wariant. Krea2 API
+    samo zwalnia VRAM poprzedniego checkpointu przy zmianie (patrz get_pipeline
+    w krea-2/api.py) — w przeciwienstwie do Forge nie trzeba tu wolac osobnego
+    unload miedzy modelami."""
+    try:
+        job_set(jid, status='generating')
+        total = len(KREA2_BATCH_VARIANTS)
+        images_per_variant = 2
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        base_seed = int(params.get('seed', 0)) or secrets.randbelow(2**31)
+        steps = int(params.get('steps') or 6)
+        cfg   = float(params.get('cfg') or 0.0)
+        width  = min(int(params.get('width', 1024)), 2048)
+        height = min(int(params.get('height', 1024)), 2048)
+
+        all_paths = []
+        errors = []
+
+        for idx, checkpoint in enumerate(KREA2_BATCH_VARIANTS):
+            model_name = f'krea2_{checkpoint}'
+            job_set(jid, status='generating',
+                    progress={'current': idx + 1, 'total': total, 'model': model_name})
+            try:
+                paths = []
+                first_seed = None
+                for i in range(images_per_variant):
+                    body = {
+                        'prompt': params['positive'],
+                        'negative_prompt': params.get('negative', '') or '',
+                        'checkpoint': checkpoint,
+                        'width': width, 'height': height,
+                        'num_images': 1,
+                        'seed': base_seed + idx * 100 + i,
+                        'steps': steps, 'cfg': cfg,
+                    }
+                    img_data, headers = krea_post('/generate', body, timeout=600)
+                    seed = headers.get('X-Seed', str(body['seed']))
+                    if first_seed is None:
+                        first_seed = seed
+                    name = f'krea_batch_{ts}_{idx:02d}_{checkpoint}_{i:02d}_s{seed}.png'
+                    (out_dir / name).write_bytes(img_data)
+                    p = f'genphoto/{today}/{name}'
+                    paths.append(p)
+                    all_paths.append(p)
+
+                if paths:
+                    with _db_lock:
+                        with db() as con:
+                            con.execute(
+                                'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                (uuid.uuid4().hex, int(time.time()), params.get('description', ''),
+                                 params['positive'], params.get('negative', ''), model_name,
+                                 '', '', steps, cfg, width, height,
+                                 int(first_seed), images_per_variant,
+                                 'krea2_batch_variants', json.dumps(paths))
+                            )
+            except Exception as variant_err:
+                errors.append(f'{model_name}: {variant_err}')
 
         status = 'done' if all_paths else 'error'
         job_set(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
@@ -2386,6 +2461,11 @@ select{resize:none;cursor:pointer}
         generuj z wszystkich modeli (sekwencyjnie, jeden model na raz)
       </label>
       <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:.82rem;cursor:pointer"
+             title="Tylko backend Krea 2 — generuje po 2 zdjęcia na każdym z 4 wariantów (Moody, GPT, Krealism, RedCraft 3.0), sekwencyjnie">
+        <input type="checkbox" id="krea-variants-check" style="width:auto;margin:0">
+        Krea 2: generuj ze wszystkich wariantów (Moody → GPT → Krealism → RedCraft, po 2 zdjęcia)
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:.82rem;cursor:pointer"
              title="Przed generacją zatrzyma pozostałe backendy (Forge/Krea2/ComfyUI) — zwalnia VRAM dla ciężkich jobów, ale ich późniejszy restart potrwa ~30-90s">
         <input type="checkbox" id="stop-backends-check" style="width:auto;margin:0">
         zatrzymaj inne backendy przed generacją (ciężki job)
@@ -3753,6 +3833,10 @@ function startGenerate() {
   }
   if (document.getElementById('all-models-check').checked) {
     params.all_models = true;
+  }
+  var _kreaVar = document.getElementById('krea-variants-check');
+  if (_kreaVar && _kreaVar.checked) {
+    params.krea_all_variants = true;
   }
   var _stopBk = document.getElementById('stop-backends-check');
   if (_stopBk && _stopBk.checked) {
@@ -5638,7 +5722,9 @@ class Handler(BaseHTTPRequestHandler):
                 params = json.loads(body)
                 params['gen_id'] = uuid.uuid4().hex
                 backend = params.get('backend', 'forge')
-                if backend == 'krea2':
+                if backend == 'krea2' and params.get('krea_all_variants'):
+                    target, kind = krea_batch_variants_thread, 'krea2_batch'
+                elif backend == 'krea2':
                     target, kind = krea_generate_thread, 'krea2'
                 elif backend == 'zimage':
                     target, kind = zimage_generate_thread, 'zimage'
