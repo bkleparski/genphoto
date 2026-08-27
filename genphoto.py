@@ -92,8 +92,74 @@ with db() as _c:
     )''')
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
-SESSIONS = set()
+# token -> timestamp wygasniecia. Wczesniej byl to set() bez TTL i bez limitu:
+# kazde zalogowanie dokladalo token, ktory zyl az do restartu procesu.
+SESSIONS = {}
+SESSION_TTL_S = 24 * 3600
+_sess_lock = threading.Lock()
+
+def session_new():
+    tok = secrets.token_hex(32)
+    now = time.time()
+    with _sess_lock:
+        for t in [t for t, exp in SESSIONS.items() if exp <= now]:
+            SESSIONS.pop(t, None)
+        SESSIONS[tok] = now + SESSION_TTL_S
+    return tok
+
+def session_valid(tok):
+    if not tok:
+        return False
+    with _sess_lock:
+        exp = SESSIONS.get(tok)
+        if exp is None:
+            return False
+        if exp <= time.time():
+            SESSIONS.pop(tok, None)
+            return False
+        return True
+
+def session_drop(tok):
+    with _sess_lock:
+        SESSIONS.pop(tok, None)
+
+# Rate-limit logowania: max LOGIN_MAX_TRIES nieudanych prob z jednego IP
+# w oknie LOGIN_WINDOW_S. Bez tego haslo (gole sha256) jest do rozbicia brute-force.
+LOGIN_MAX_TRIES = 5
+LOGIN_WINDOW_S  = 300
+_login_fails = {}            # ip -> [timestamp, ...]
+_login_lock  = threading.Lock()
+
+def login_blocked(ip):
+    now = time.time()
+    with _login_lock:
+        hits = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW_S]
+        _login_fails[ip] = hits
+        return len(hits) >= LOGIN_MAX_TRIES
+
+def login_note_fail(ip):
+    now = time.time()
+    with _login_lock:
+        hits = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW_S]
+        hits.append(now)
+        _login_fails[ip] = hits
+        # eviction: nie trzymaj wpisow dla IP ktore dawno nie probowaly
+        if len(_login_fails) > 500:
+            for k in [k for k, v in _login_fails.items() if not v or now - v[-1] > LOGIN_WINDOW_S]:
+                _login_fails.pop(k, None)
+
+def login_note_ok(ip):
+    with _login_lock:
+        _login_fails.pop(ip, None)
 _auto_cache = {}  # model_name -> {settings, ts}
+AUTO_CACHE_MAX = 300
+
+def auto_cache_put(key, value):
+    """Zapis z gornym limitem — bez tego cache rosl z kazdym nowym promptem."""
+    if len(_auto_cache) >= AUTO_CACHE_MAX:
+        for k in sorted(_auto_cache, key=lambda x: _auto_cache[x].get('ts', 0))[:AUTO_CACHE_MAX // 4]:
+            _auto_cache.pop(k, None)
+    _auto_cache[key] = value
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 JOBS = {}
@@ -127,6 +193,8 @@ _gpu_lock  = threading.Lock()
 _gpu_wlock = threading.Lock()
 _gpu_waiters = 0             # liczba jobów oczekujących na mutex
 GPU_QUEUE_MAX_WAIT_S = 120   # timeout oczekiwania w kolejce
+GPU_DRAIN_MAX_S      = 300   # ile czekac, az zawieszony job odda VRAM
+GPU_DRAIN_POLL_S     = 5     # co ile sprawdzac VRAM w trakcie drenazu
 GPU_QUEUE_MAX_DEPTH  = 1     # 1 job w toku + 1 w kolejce = "max 2"
 
 # Watchdog per typ joba (s) — powyżej najdłuższego legalnego czasu danego typu.
@@ -287,17 +355,44 @@ def gpu_run(kind, backend, target, params, jid):
     # Od tego miejsca trzymamy mutex — pre-flight i job atomowo.
     done_evt  = threading.Event()
     fired_evt = threading.Event()
+    # Mutex GPU wolno zwolnic dokladnie raz. Bez tego strazy: watchdog zwalnial
+    # mutex, nowy job go przejmowal, a finally starego watku robilo release()
+    # na CUDZYM juz mutexie (threading.Lock zwalnia dowolny watek) — i trzeci
+    # job wchodzil na zajete GPU.
+    released_evt = threading.Event()
+    def _release_gpu_once():
+        if released_evt.is_set():
+            return False
+        released_evt.set()
+        try:
+            _gpu_lock.release()
+            return True
+        except RuntimeError:
+            return False
+
     watchdog_s = GPU_WATCHDOG_S.get(kind, 900)
     def _watch():
-        if not done_evt.wait(watchdog_s):
-            fired_evt.set()
-            job_set(jid, status='error',
-                    error=f'Watchdog: job przekroczył {watchdog_s}s — mutex GPU zwolniony awaryjnie.')
-            metric('watchdog_fire', backend=backend, kind=kind)
-            try:
-                _gpu_lock.release()
-            except RuntimeError:
-                pass
+        if done_evt.wait(watchdog_s):
+            return
+        fired_evt.set()
+        job_set(jid, status='error',
+                error=f'Watchdog: job przekroczył {watchdog_s}s — zgłoszony jako nieudany.')
+        metric('watchdog_fire', backend=backend, kind=kind)
+        # Zawieszony watek dalej zyje i trzyma VRAM. Zwolnienie mutexu od razu
+        # wpuscilo by drugi job na to samo GPU — czyli OOM. Czekamy, az watek
+        # sam skonczy albo VRAM faktycznie wroci.
+        need_mb  = VRAM_NEED_COLD_MB.get(backend, 6000)
+        deadline = time.time() + GPU_DRAIN_MAX_S
+        while time.time() < deadline:
+            if done_evt.wait(GPU_DRAIN_POLL_S):
+                return          # watek skonczyl — mutex zwolni jego finally
+            if _free_vram_mb() >= need_mb:
+                metric('watchdog_drain_ok', backend=backend, kind=kind)
+                break
+        else:
+            metric('watchdog_drain_timeout', backend=backend, kind=kind)
+        if _release_gpu_once():
+            metric('watchdog_release', backend=backend, kind=kind)
     threading.Thread(target=_watch, daemon=True).start()
     try:
         if params.get('stop_other_backends'):
@@ -320,10 +415,7 @@ def gpu_run(kind, backend, target, params, jid):
                final_status=job_get(jid).get('status'))
     finally:
         done_evt.set()
-        try:
-            _gpu_lock.release()
-        except RuntimeError:
-            pass
+        _release_gpu_once()
 
 def gpu_queue_full():
     with _gpu_wlock:
@@ -450,6 +542,35 @@ def forge_post(path, data, timeout=600, base_url=None):
 
 _flux_cache = {}
 
+# Cache list LoRA. Wczesniej kazde zadanie /api/loras robilo pelny glob() po
+# katalogu — przy kazdym otwarciu strony i kazdym odswiezeniu listy.
+# Kluczem waznosci jest mtime katalogu: dorzucenie/usuniecie pliku je uniewaznia.
+_lora_cache = {}          # str(dir) -> (mtime, [nazwy])
+_lora_cache_lock = threading.Lock()
+
+def list_lora_names(directory, stem=False):
+    key = str(directory)
+    try:
+        mtime = directory.stat().st_mtime
+    except OSError:
+        return []
+    with _lora_cache_lock:
+        hit = _lora_cache.get(key)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    try:
+        names = sorted(
+            (p.stem if stem else p.name)
+            for p in directory.glob('*')
+            if p.is_file() and p.suffix in ('.safetensors', '.pt', '.ckpt')
+            and not p.name.startswith('put_')
+        )
+    except Exception:
+        names = []
+    with _lora_cache_lock:
+        _lora_cache[key] = (mtime, names)
+    return names
+
 
 def krea_post(path, data, timeout=120):
     """POST to Krea 2 API and return (binary_image_data, headers_dict)"""
@@ -464,7 +585,21 @@ def krea_post(path, data, timeout=120):
 # Cache modeli Forge — odnawiany w tle co 30s
 _models_cache = []
 _models_lock  = threading.Lock()
-_downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size}
+_downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size,ts}
+DOWNLOADS_KEEP    = 40      # ile wpisow trzymac
+DOWNLOADS_KEEP_S  = 3600    # jak dlugo trzymac zakonczony wpis (front odpytuje progress)
+
+def downloads_gc():
+    """Usun stare zakonczone pobrania. Bez tego _downloads rosl bez konca."""
+    now = time.time()
+    for k in [k for k, v in list(_downloads.items())
+              if v.get('status') in ('done', 'error')
+              and now - v.get('ts', now) > DOWNLOADS_KEEP_S]:
+        _downloads.pop(k, None)
+    if len(_downloads) > DOWNLOADS_KEEP:
+        for k in sorted(_downloads, key=lambda j: _downloads[j].get('ts', 0))[:-DOWNLOADS_KEEP]:
+            if _downloads[k].get('status') in ('done', 'error'):
+                _downloads.pop(k, None)
 MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
 LORAS_DIR     = Path(os.environ.get('GP_LORAS_DIR', '/home/bartek/comfyui/models/loras'))
 FORGE_LORAS_DIR = Path('/home/bartek/forge/models/Lora')
@@ -620,6 +755,29 @@ def _seed_settings_from_civitai_url(url, model_name):
     except Exception:
         pass
 
+# Allowlist zrodel pobierania. Bez niej /api/download-model przyjmowal dowolny
+# URL (takze http://127.0.0.1:7860/... — SSRF do uslug na loopbacku).
+DOWNLOAD_ALLOWED_HOSTS = (
+    'civitai.com', 'civitai.red',
+    'huggingface.co', 'cdn-lfs.huggingface.co', 'cdn-lfs-us-1.huggingface.co',
+)
+DOWNLOAD_MAX_BYTES = 30 * 1024 ** 3   # 30 GB — powyzej najwiekszych sensownych checkpointow
+DOWNLOAD_MIN_FREE  = 5 * 1024 ** 3    # zostaw 5 GB zapasu na dysku
+
+def download_url_rejected(url):
+    """Zwraca komunikat bledu, jesli URL nie nadaje sie do pobrania. None = OK."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+    except Exception:
+        return 'nieprawidłowy URL'
+    if u.scheme not in ('http', 'https'):
+        return 'dozwolone tylko http/https'
+    host = (u.hostname or '').lower()
+    if not any(host == h or host.endswith('.' + h) for h in DOWNLOAD_ALLOWED_HOSTS):
+        return f'niedozwolony host: {host or "?"} (dozwolone: civitai, huggingface)'
+    return None
+
 def _download_model_thread(job_id, url, dest_dir=None, refresh=True):
     import time as _t
     dest_dir = dest_dir or MODELS_DIR
@@ -646,6 +804,13 @@ def _download_model_thread(job_id, url, dest_dir=None, refresh=True):
             d['filename'] = fname
             d['status']   = 'downloading'
             size = int(resp.headers.get('Content-Length', 0) or 0)
+            if size and size > DOWNLOAD_MAX_BYTES:
+                raise RuntimeError(f'plik za duzy: {size / 1024**3:.1f} GB '
+                                   f'(limit {DOWNLOAD_MAX_BYTES / 1024**3:.0f} GB)')
+            free = shutil.disk_usage(dest_dir).free
+            if size and free - size < DOWNLOAD_MIN_FREE:
+                raise RuntimeError(f'za malo miejsca: wolne {free / 1024**3:.1f} GB, '
+                                   f'plik {size / 1024**3:.1f} GB')
             d['size'] = size
             done = 0
             chunk = 1024 * 256
@@ -655,6 +820,9 @@ def _download_model_thread(job_id, url, dest_dir=None, refresh=True):
                     if not buf: break
                     f.write(buf)
                     done += len(buf)
+                    # serwer moze klamac w Content-Length albo go nie podac
+                    if done > DOWNLOAD_MAX_BYTES:
+                        raise RuntimeError('przekroczono limit rozmiaru pobierania')
                     d['bytes_done'] = done
                     d['percent'] = int(done * 100 / size) if size else -1
         d['percent'] = 100
@@ -751,6 +919,8 @@ def is_flux_checkpoint(filename):
         result = any('double_blocks' in k for k in header.keys())
     except Exception:
         result = False
+    if len(_flux_cache) > 500:
+        _flux_cache.clear()
     _flux_cache[filename] = result
     return result
 
@@ -3210,9 +3380,9 @@ function refreshMgrList() {
       list.innerHTML = '';
       var sorted = _sortByOrder(models);
       sorted.forEach(function(m) {
-        var name = (m.name || m.title || '').replace(/\.[^.]+$/, '');
+        var name = (m.name || m.title || '').replace(/\\.[^.]+$/, '');
         var fname = (m.name || '') + '';
-        if (!fname.match(/\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
+        if (!fname.match(/\\.(safetensors|ckpt|pt)$/i)) fname += '.safetensors';
         var div = document.createElement('div');
         div.className = 'mgr-item';
         div.draggable = true;
@@ -3291,7 +3461,7 @@ function startUpload() {
   var inp = document.getElementById('mgr-file-input');
   var file = inp.files && inp.files[0];
   if (!file) { toast('Wybierz plik modelu', 'err'); return; }
-  if (!/\.(safetensors|ckpt|pt)$/i.test(file.name)) { toast('Dozwolone rozszerzenia: .safetensors, .ckpt, .pt', 'err'); return; }
+  if (!/\\.(safetensors|ckpt|pt)$/i.test(file.name)) { toast('Dozwolone rozszerzenia: .safetensors, .ckpt, .pt', 'err'); return; }
   var prog = document.getElementById('up-progress');
   prog.classList.add('show');
   document.getElementById('up-info').textContent = 'Wysyłanie...';
@@ -3935,7 +4105,7 @@ function navLb(d)    { _lbIdx=(_lbIdx+d+_lbImgs.length)%_lbImgs.length; updLb();
 function dlLb()      { var a=document.createElement('a'); a.href='/img/'+_lbImgs[_lbIdx]; a.download=_lbImgs[_lbIdx].split('/').pop(); a.click(); }
 function updLb() {
   var path = _lbImgs[_lbIdx];
-  var isVideo = /\.mp4$/i.test(path);
+  var isVideo = /\\.mp4$/i.test(path);
   var imgEl = document.getElementById('lb-img');
   var vidEl = document.getElementById('lb-vid');
   if (isVideo) {
@@ -4007,7 +4177,7 @@ function loadHistory() {
       /* thumbnails */
       var thumbsDiv = document.createElement('div'); thumbsDiv.className='hist-thumbs';
       paths.slice(0,4).forEach(function(p, i){
-        var el = /\.mp4$/i.test(p) ? document.createElement('video') : document.createElement('img');
+        var el = /\\.mp4$/i.test(p) ? document.createElement('video') : document.createElement('img');
         el.className='hist-thumb';
         if (el.tagName === 'VIDEO') { el.muted = true; el.src = '/img/'+encodeURI(p); }
         else { el.loading='lazy'; el.src='/img/'+encodeURI(p); }
@@ -5069,8 +5239,17 @@ class Handler(BaseHTTPRequestHandler):
                 return c[len(COOKIE_NAME)+1:]
         return None
 
+    def _client_ip(self):
+        peer = self.client_address[0]
+        if peer in ('127.0.0.1', '::1'):
+            fwd = (self.headers.get('CF-Connecting-IP')
+                   or self.headers.get('X-Forwarded-For', '').split(',')[0].strip())
+            if fwd:
+                return fwd
+        return peer
+
     def _authed(self):
-        return self._cookie() in SESSIONS
+        return session_valid(self._cookie())
 
     def _json(self, d, code=200):
         body = json.dumps(d).encode()
@@ -5152,19 +5331,34 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
 
+        # Bariera auth na szczycie routingu. Wszystko powyzej niej bylo dostepne
+        # publicznie (m.in. /api/model-delete kasujacy pliki i /api/download-model
+        # sciagajacy dowolny URL). Jedyny wyjatek to sama strona logowania.
+        if path != '/login' and not self._authed():
+            self._redirect('/login')
+            return
+
         # Static image serving
         if path.startswith('/img/'):
             rel = unquote(path[5:])
             fpath = (OUTPUTS_DIR / rel).resolve()
-            if str(fpath).startswith(str(OUTPUTS_DIR.resolve())) and fpath.is_file():
+            # is_relative_to zamiast startswith na stringu: prefix-match przepuszczal
+            # katalogi-siostry o wspolnym poczatku nazwy (np. .../outputs-backup/).
+            if fpath.is_relative_to(OUTPUTS_DIR.resolve()) and fpath.is_file():
                 mime, _ = mimetypes.guess_type(str(fpath))
-                data = fpath.read_bytes()
+                size = fpath.stat().st_size
                 self.send_response(200)
                 self.send_header('Content-Type', mime or 'image/png')
-                self.send_header('Content-Length', len(data))
-                self.send_header('Cache-Control', 'public, max-age=3600')
+                self.send_header('Content-Length', size)
+                self.send_header('Cache-Control', 'private, max-age=3600')
                 self.end_headers()
-                self.wfile.write(data)
+                # Strumieniowo: read_bytes() ladowal caly plik do RAM, co przy
+                # kilkusetmegabajtowym wideo z WAN dawalo skok zuzycia pamieci.
+                try:
+                    with open(fpath, 'rb') as fh:
+                        shutil.copyfileobj(fh, self.wfile, 256 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             else:
                 self.send_error(404)
             return
@@ -5174,26 +5368,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/api/loras':
-            try:
-                names = sorted(
-                    p.name for p in LORAS_DIR.glob('*')
-                    if p.is_file() and p.suffix in ('.safetensors', '.pt', '.ckpt')
-                    and not p.name.startswith('put_')
-                )
-            except Exception:
-                names = []
-            self._json(names)
+            self._json(list_lora_names(LORAS_DIR))
             return
 
         if path == '/api/forge-loras':
-            try:
-                names = sorted(
-                    p.stem for p in FORGE_LORAS_DIR.glob('*')
-                    if p.is_file() and p.suffix in ('.safetensors', '.pt', '.ckpt')
-                )
-            except Exception:
-                names = []
-            self._json(names)
+            self._json(list_lora_names(FORGE_LORAS_DIR, stem=True))
             return
 
         if path.startswith('/api/download-progress/'):
@@ -5265,7 +5444,7 @@ class Handler(BaseHTTPRequestHandler):
                     for m in model_list:
                         if chosen.lower() in m.lower() or m.lower() in chosen.lower():
                             chosen = m; break
-                _auto_cache[cache_key] = {'model': chosen, 'reason': reason, 'ts': _t.time()}
+                auto_cache_put(cache_key, {'model': chosen, 'reason': reason, 'ts': _t.time()})
                 self._json({'ok': True, 'model': chosen, 'reason': reason, 'cached': False})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
@@ -5340,7 +5519,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw = data['choices'][0]['message']['content'].strip().strip('`').strip()
                 if raw.startswith('json'): raw = raw[4:].strip()
                 settings = json.loads(raw)
-                _auto_cache[mname] = {'settings': settings, 'ts': _t.time()}
+                auto_cache_put(mname, {'settings': settings, 'ts': _t.time()})
                 try:
                     _save_model_settings(mname, settings, 'llm')
                 except Exception:
@@ -5352,20 +5531,16 @@ class Handler(BaseHTTPRequestHandler):
         # Logout
         if path == '/logout':
             tok = self._cookie()
-            if tok: SESSIONS.discard(tok)
+            if tok: session_drop(tok)
             self.send_response(302)
             self.send_header('Location', '/login')
-            self.send_header('Set-Cookie', f'{COOKIE_NAME}=; Max-Age=0; Path=/')
+            self.send_header('Set-Cookie', f'{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure')
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
 
         if path == '/login':
             self._html(LOGIN_PAGE.replace('__ERR__', ''))
-            return
-
-        if not self._authed():
-            self._redirect('/login')
             return
 
         if path == '/':
@@ -5590,40 +5765,55 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length).decode('utf-8', errors='replace')
 
+        # Bariera auth przed calym routingiem POST (poza logowaniem).
+        # /api/model-upload jest obslugiwany wyzej i ma wlasny check w metodzie.
+        if self.path != '/login' and not self._authed():
+            self._json({'ok': False, 'error': 'unauthorized'}, 401)
+            return
+
         if self.path == '/api/download-model':
             try:
                 data = json.loads(body)
                 url = data.get('url', '').strip()
             except:
                 self._json({'ok': False, 'error': 'bad JSON'}); return
-            if not url or not (url.startswith('http://') or url.startswith('https://')):
-                self._json({'ok': False, 'error': 'nieprawidłowy URL'}); return
+            bad = download_url_rejected(url) if url else 'nieprawidłowy URL'
+            if bad:
+                self._json({'ok': False, 'error': bad}); return
             job_id = uuid.uuid4().hex[:12]
+            downloads_gc()
             _downloads[job_id] = {'url': url, 'filename': '', 'percent': 0,
-                                   'status': 'starting', 'error': '', 'bytes_done': 0, 'size': 0}
+                                   'status': 'starting', 'error': '', 'bytes_done': 0,
+                                   'size': 0, 'ts': time.time()}
             threading.Thread(target=_download_model_thread, args=(job_id, url), daemon=True).start()
             self._json({'ok': True, 'job_id': job_id})
             return
         if self.path == '/login':
+            ip = self._client_ip()
+            if login_blocked(ip):
+                err = '<div class="err">Za dużo nieudanych prób. Spróbuj za 5 minut.</div>'
+                self._html(LOGIN_PAGE.replace('__ERR__', err), 429)
+                return
             params   = parse_qs(body)
             username = params.get('username', [''])[0].strip()
             password = params.get('password', [''])[0]
             pw_hash  = hashlib.sha256(password.encode()).hexdigest()
-            if username == GP_USERNAME and pw_hash == GP_PW_HASH:
-                tok = secrets.token_hex(32)
-                SESSIONS.add(tok)
+            # compare_digest zamiast == : porownanie w stalym czasie
+            ok = (secrets.compare_digest(username, GP_USERNAME)
+                  and secrets.compare_digest(pw_hash, GP_PW_HASH))
+            if ok:
+                login_note_ok(ip)
+                tok = session_new()
                 self.send_response(302)
                 self.send_header('Location', '/')
-                self.send_header('Set-Cookie', f'{COOKIE_NAME}={tok}; Path=/; HttpOnly; SameSite=Lax')
+                self.send_header('Set-Cookie',
+                                 f'{COOKIE_NAME}={tok}; Path=/; HttpOnly; SameSite=Lax; Secure')
                 self.send_header('Content-Length', '0')
                 self.end_headers()
             else:
+                login_note_fail(ip)
                 err = '<div class="err">Błędny login lub hasło</div>'
                 self._html(LOGIN_PAGE.replace('__ERR__', err))
-            return
-
-        if not self._authed():
-            self._json({'ok': False, 'error': 'unauthorized'}, 401)
             return
 
         if self.path == '/api/lora-download':
@@ -5632,11 +5822,14 @@ class Handler(BaseHTTPRequestHandler):
                 url = data.get('url', '').strip()
             except:
                 self._json({'ok': False, 'error': 'bad JSON'}); return
-            if not url or not (url.startswith('http://') or url.startswith('https://')):
-                self._json({'ok': False, 'error': 'nieprawidłowy URL'}); return
+            bad = download_url_rejected(url) if url else 'nieprawidłowy URL'
+            if bad:
+                self._json({'ok': False, 'error': bad}); return
             job_id = uuid.uuid4().hex[:12]
+            downloads_gc()
             _downloads[job_id] = {'url': url, 'filename': '', 'percent': 0,
-                                   'status': 'starting', 'error': '', 'bytes_done': 0, 'size': 0}
+                                   'status': 'starting', 'error': '', 'bytes_done': 0,
+                                   'size': 0, 'ts': time.time()}
             threading.Thread(target=_download_model_thread,
                               args=(job_id, url), kwargs={'dest_dir': LORAS_DIR, 'refresh': False},
                               daemon=True).start()
