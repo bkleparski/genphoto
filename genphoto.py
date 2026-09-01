@@ -17,13 +17,49 @@ FORGE_URL    = os.environ.get('GP_FORGE_URL',  'http://localhost:7860').rstrip('
 COMFY_URL    = os.environ.get('GP_COMFY_URL', 'http://localhost:8189').rstrip('/')
 COMFY_OUTPUTS = Path(os.environ.get('GP_COMFY_OUTPUTS', '/home/bartek/comfyui/output'))
 
-# WAN 2.2 T2V-A14B (MoE, GGUF Q3_K_M) — txt2vid
-WAN_HIGH_NOISE_UNET = 'Wan2.2-T2V-A14B-HighNoise-Q3_K_M.gguf'
-WAN_LOW_NOISE_UNET  = 'Wan2.2-T2V-A14B-LowNoise-Q3_K_M.gguf'
-WAN_HIGH_NOISE_LORA = 'wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors'
-WAN_LOW_NOISE_LORA  = 'wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors'
+# WAN 2.2 A14B (MoE: high+low noise expert) — wideo
 WAN_CLIP_NAME       = 'umt5_xxl_fp8_e4m3fn_scaled.safetensors'
 WAN_VAE_NAME        = 'Wan2.1_VAE.safetensors'
+
+# Wagi per rodzina modelu. Q4_K_S, nie Q3_K_M — poniżej Q4 model 14B traci przewagę
+# nad trzykrotnie mniejszym 5B w pełnej precyzji. Q4_K_S, nie Q4_K_M — ~1 GB mniej
+# na eksperta, co na 12 GB zostawia zapas dla umt5 i aktywacji. Eksperci high/low
+# ładują się sekwencyjnie, więc w VRAM jest jeden naraz — to ta rezerwa czyni Q4 wykonalnym.
+WAN_WEIGHTS = {
+    't2v': {
+        'unet_high': 'Wan2.2-T2V-A14B-HighNoise-Q4_K_S.gguf',
+        'unet_low':  'Wan2.2-T2V-A14B-LowNoise-Q4_K_S.gguf',
+        'lora_high': 'wan2.2_t2v_lightning_4steps_seko_v2_high_noise.safetensors',
+        'lora_low':  'wan2.2_t2v_lightning_4steps_seko_v2_low_noise.safetensors',
+    },
+    'i2v': {
+        'unet_high': 'Wan2.2-I2V-A14B-HighNoise-Q4_K_S.gguf',
+        'unet_low':  'Wan2.2-I2V-A14B-LowNoise-Q4_K_S.gguf',
+        'lora_high': 'wan2.2_i2v_lightning_4steps_seko_v1_high_noise.safetensors',
+        'lora_low':  'wan2.2_i2v_lightning_4steps_seko_v1_low_noise.safetensors',
+    },
+}
+
+# Awaryjny powrót do sprawdzonej konfiguracji, gdyby Q4_K_S okazał się za ciasny:
+# ustawić GP_WAN_FALLBACK_Q3=1 w .env.genphoto i zrestartować usługę.
+WAN_WEIGHTS_Q3_FALLBACK = {
+    't2v': {
+        'unet_high': 'Wan2.2-T2V-A14B-HighNoise-Q3_K_M.gguf',
+        'unet_low':  'Wan2.2-T2V-A14B-LowNoise-Q3_K_M.gguf',
+        'lora_high': 'wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors',
+        'lora_low':  'wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors',
+    },
+    'i2v': {
+        'unet_high': 'Wan2.2-I2V-A14B-HighNoise-Q3_K_M.gguf',
+        'unet_low':  'Wan2.2-I2V-A14B-LowNoise-Q3_K_M.gguf',
+        # Lightning I2V nie ma odpowiednika Q3-era — bez niej I2V trwa 20+ min,
+        # więc fallback zostawia LoRA z zestawu podstawowego.
+        'lora_high': 'wan2.2_i2v_lightning_4steps_seko_v1_high_noise.safetensors',
+        'lora_low':  'wan2.2_i2v_lightning_4steps_seko_v1_low_noise.safetensors',
+    },
+}
+if os.environ.get('GP_WAN_FALLBACK_Q3') == '1':
+    WAN_WEIGHTS = WAN_WEIGHTS_Q3_FALLBACK
 
 KREA2_URL    = os.environ.get('GP_KREA2_URL', 'http://localhost:7870').rstrip('/')
 DEEPSEEK_KEY   = os.environ.get('GP_DEEPSEEK_KEY', '')
@@ -202,7 +238,7 @@ GPU_WATCHDOG_S = {
     'forge':     900,    # txt2img/img2img/edit/instantid/pose (forge_post timeout 600s + zapas)
     'krea2':     900,    # pętla batch po 1 obrazie
     'zimage':    600,    # 8 kroków turbo + ewentualny reload GGUF
-    'wanvideo':  1500,   # wewnętrzny deadline wątku WAN to 900s + ładowanie ~12GB GGUF
+    'wanvideo':  2100,   # wewnętrzny deadline wątku WAN to 1800s + ładowanie ~17GB GGUF
     'batch_all': 3600,   # ~20 modeli × (load + generowanie + unload)
     'krea2_batch': 1200, # 4 warianty Krea 2 × (load + 2 zdjęcia)
 }
@@ -210,7 +246,7 @@ GPU_WATCHDOG_S = {
 # Minimalny wolny VRAM (MB) przed startem joba.
 # "cold" = backend nie działa/nie trzyma modelu; "hot" = backend już jest w VRAM
 # (załadowany model nie musi alokować ponownie — wymóg dodatkowej pamięci niższy).
-VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 4500, 'zimage': 6500, 'wanvideo': 8000}
+VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 4500, 'zimage': 6500, 'wanvideo': 9500}
 VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000}
 
 # ── Metryki (ring buffer, endpoint /api/metrics) ─────────────────────────────
@@ -313,15 +349,49 @@ def _stop_other_backends(backend):
         except Exception:
             pass
 
+def _free_vram_for_video(need_mb, timeout_s=90):
+    """Zwolnij kartę pod job wideo: zatrzymaj konkurencyjne backendy i poczekaj na drenaż.
+
+    Wideo zajmuje niemal całą kartę na kilkanaście minut, więc nie ma sensu, żeby
+    konkurowało z Forge czy Krea 2 — a bez tego kroku job leciał w błąd "za mało VRAM"
+    i kazał użytkownikowi ręcznie klikać ZWOLNIJ (w spoczynku samo krea-2 trzyma ~7 GB
+    z 12, więc trafiało to praktycznie w każdą próbę). Zatrzymanie idzie przez systemd,
+    nie kill — usługi mają Restart i wróciłyby po 10 s.
+
+    Zwraca (ok, wolne_mb)."""
+    _stop_other_backends('wanvideo')
+    deadline = time.time() + timeout_s
+    free = None
+    while time.time() < deadline:
+        try:
+            free = _free_vram_mb()
+        except Exception:
+            return True, None      # bez odczytu VRAM nie blokujemy startu
+        if free >= need_mb:
+            metric('video_vram_freed', free_mb=free, need_mb=need_mb)
+            return True, free
+        time.sleep(3)
+    metric('video_vram_drain_timeout', free_mb=free, need_mb=need_mb)
+    return False, free
+
+
 def gpu_preflight(backend):
     """Warunki startu joba. Wywoływane W TRAKCIE trzymania _gpu_lock (atomowo
     ze startem). Zwraca None gdy OK, albo string z komunikatem błędu."""
     hot  = _backend_alive(backend)
+    # Dla wideo "backend odpowiada" nie znaczy "model jest w VRAM": ComfyUI z --lowvram
+    # zwalnia wagi między jobami, więc każdy job wideo ładuje ~8 GB od zera. Bez tego
+    # preflight brał próg HOT (3 GB), przepuszczał job przy 3,9 GB wolnego i kazał
+    # 8-gigabajtowemu modelowi przeciskać się warstwami obok krea-2 trzymającego 7 GB.
+    if backend == 'wanvideo':
+        hot = False
     need = (VRAM_NEED_HOT_MB if hot else VRAM_NEED_COLD_MB).get(backend, 4000)
     try:
         free = _free_vram_mb()
     except Exception:
         free = None
+    if backend == 'wanvideo' and free is not None and free < need:
+        _, free = _free_vram_for_video(need)
     if free is not None and free < need:
         return (f'Za mało wolnego VRAM: {free/1024:.1f} GB wolne, '
                 f'wymagane ~{need/1024:.1f} GB. '
@@ -1459,6 +1529,29 @@ def comfy_get(path, timeout=10):
     with urllib.request.urlopen(f'{COMFY_URL}{path}', timeout=timeout) as r:
         return json.loads(r.read())
 
+def comfy_upload_image(data, filename, timeout=60):
+    """Wgraj obraz do katalogu input ComfyUI (multipart/form-data) i zwróć nazwę,
+    pod którą widzi go węzeł LoadImage. Używane przez tryby I2V i FLF."""
+    name = f'gp_{int(time.time()*1000)}_{Path(filename).name}'
+    boundary = f'----genphoto{uuid.uuid4().hex}'
+    ctype = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+        f'filename="{name}"\r\nContent-Type: {ctype}\r\n\r\n'.encode(),
+        data,
+        f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="overwrite"\r\n\r\n'
+        f'true\r\n--{boundary}--\r\n'.encode(),
+    ]
+    req = urllib.request.Request(
+        f'{COMFY_URL}/upload/image', data=b''.join(parts),
+        headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}, method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        resp = json.loads(r.read())
+    # ComfyUI zwraca {'name': ..., 'subfolder': ..., 'type': 'input'}; LoadImage oczekuje
+    # "podkatalog/nazwa" gdy subfolder niepusty.
+    sub = resp.get('subfolder') or ''
+    return f'{sub}/{resp["name"]}' if sub else resp['name']
+
 ZIMAGE_TEMPLATE = json.loads(r'''
 {
   "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "z_image_turbo-Q8_0.gguf"}},
@@ -1582,26 +1675,28 @@ def zimage_generate_thread(params, jid):
         job_set(jid, status='error', error=str(e))
 
 
-def build_wan_t2v_graph(positive, negative, width, height, length, seed, fps, filename_prefix,
-                         extra_lora_high=None, extra_lora_low=None):
-    """Graf ComfyUI dla WAN 2.2 T2V-A14B (MoE: high+low noise expert) w wariancie
-    lightx2v 4-step (szybki dystylowany sampling — niezbędny na 12GB VRAM / RTX 3060,
-    pelny 20-krokowy wariant trwałby wielokrotnie dłużej). Odtworzone z oficjalnego
-    szablonu ComfyUI (video_wan2_2_14B_t2v.json), z UNETLoader zamienionym na
-    UnetLoaderGGUF (kwantyzacja Q3_K_M zamiast fp8_scaled — mniejszy footprint VRAM).
-    extra_lora_high/extra_lora_low: opcjonalne dodatkowe LoRA (np. efekt ruchu z Civitai),
-    dolaczane w lancuchu ZA lightx2v — kazdy WAN 2.2 LoRA wymaga oddzielnego pliku dla
-    high i low noise expertu."""
+def _wan_common_loaders(family, positive, negative, extra_lora_high=None, extra_lora_low=None):
+    """Loadery, łańcuch LoRA i enkoder tekstu — wspólne dla wszystkich trybów WAN 2.2.
+
+    UNETLoader zamieniony na UnetLoaderGGUF (kwantyzacja zamiast fp8_scaled — mniejszy
+    footprint VRAM). extra_lora_high/extra_lora_low: opcjonalne dodatkowe LoRA (np. efekt
+    ruchu z Civitai), dołączane w łańcuchu ZA akceleracyjną — każdy WAN 2.2 LoRA wymaga
+    osobnego pliku dla eksperta high i low noise.
+
+    Zwraca (graph, model_high_ref, model_low_ref)."""
+    w = WAN_WEIGHTS[family]
     graph = {
         'clip_loader': {'class_type': 'CLIPLoader', 'inputs': {
             'clip_name': WAN_CLIP_NAME, 'type': 'wan', 'device': 'cpu'}},
         'vae_loader': {'class_type': 'VAELoader', 'inputs': {'vae_name': WAN_VAE_NAME}},
-        'unet_high': {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': WAN_HIGH_NOISE_UNET}},
-        'unet_low':  {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': WAN_LOW_NOISE_UNET}},
+        'unet_high': {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': w['unet_high']}},
+        'unet_low':  {'class_type': 'UnetLoaderGGUF', 'inputs': {'unet_name': w['unet_low']}},
         'lora_high': {'class_type': 'LoraLoaderModelOnly', 'inputs': {
-            'model': ['unet_high', 0], 'lora_name': WAN_HIGH_NOISE_LORA, 'strength_model': 1.0}},
+            'model': ['unet_high', 0], 'lora_name': w['lora_high'], 'strength_model': 1.0}},
         'lora_low': {'class_type': 'LoraLoaderModelOnly', 'inputs': {
-            'model': ['unet_low', 0], 'lora_name': WAN_LOW_NOISE_LORA, 'strength_model': 1.0}},
+            'model': ['unet_low', 0], 'lora_name': w['lora_low'], 'strength_model': 1.0}},
+        'pos': {'class_type': 'CLIPTextEncode', 'inputs': {'text': positive, 'clip': ['clip_loader', 0]}},
+        'neg': {'class_type': 'CLIPTextEncode', 'inputs': {'text': negative, 'clip': ['clip_loader', 0]}},
     }
 
     model_high_ref = ['lora_high', 0]
@@ -1618,41 +1713,200 @@ def build_wan_t2v_graph(positive, negative, width, height, length, seed, fps, fi
             'strength_model': float(extra_lora_low.get('strength', 1.0))}}
         model_low_ref = ['lora_low_extra', 0]
 
+    return graph, model_high_ref, model_low_ref
+
+
+def _wan_moe_samplers(graph, model_high_ref, model_low_ref, pos_ref, neg_ref, latent_ref,
+                      steps, seed, shift=5.0):
+    """Para KSamplerAdvanced dzieląca kroki między eksperta high i low noise (MoE).
+
+    Granica na steps//2: przy 4 krokach daje 2+2 (tak było przed rozbudową), przy 8 — 4+4.
+    cfg=1, bo modele dystylowane (Lightning/lightx2v) nie korzystają z guidance.
+    Dopisuje węzły do grafu, zwraca referencję do wyjścia latentów."""
+    boundary = max(1, steps // 2)
     graph.update({
-        'samp_high': {'class_type': 'ModelSamplingSD3', 'inputs': {'model': model_high_ref, 'shift': 5.0}},
-        'samp_low':  {'class_type': 'ModelSamplingSD3', 'inputs': {'model': model_low_ref, 'shift': 5.0}},
-        'latent': {'class_type': 'EmptyHunyuanLatentVideo', 'inputs': {
-            'width': width, 'height': height, 'length': length, 'batch_size': 1}},
-        'pos': {'class_type': 'CLIPTextEncode', 'inputs': {'text': positive, 'clip': ['clip_loader', 0]}},
-        'neg': {'class_type': 'CLIPTextEncode', 'inputs': {'text': negative, 'clip': ['clip_loader', 0]}},
+        'samp_high': {'class_type': 'ModelSamplingSD3', 'inputs': {
+            'model': model_high_ref, 'shift': shift}},
+        'samp_low':  {'class_type': 'ModelSamplingSD3', 'inputs': {
+            'model': model_low_ref, 'shift': shift}},
         'sampler_high': {'class_type': 'KSamplerAdvanced', 'inputs': {
             'model': ['samp_high', 0], 'add_noise': 'enable', 'noise_seed': seed,
-            'steps': 4, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
-            'positive': ['pos', 0], 'negative': ['neg', 0], 'latent_image': ['latent', 0],
-            'start_at_step': 0, 'end_at_step': 2, 'return_with_leftover_noise': 'enable'}},
+            'steps': steps, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
+            'positive': pos_ref, 'negative': neg_ref, 'latent_image': latent_ref,
+            'start_at_step': 0, 'end_at_step': boundary, 'return_with_leftover_noise': 'enable'}},
         'sampler_low': {'class_type': 'KSamplerAdvanced', 'inputs': {
             'model': ['samp_low', 0], 'add_noise': 'disable', 'noise_seed': 0,
-            'steps': 4, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
-            'positive': ['pos', 0], 'negative': ['neg', 0], 'latent_image': ['sampler_high', 0],
-            'start_at_step': 2, 'end_at_step': 4, 'return_with_leftover_noise': 'disable'}},
-        'vae_decode': {'class_type': 'VAEDecode', 'inputs': {
-            'samples': ['sampler_low', 0], 'vae': ['vae_loader', 0]}},
+            'steps': steps, 'cfg': 1, 'sampler_name': 'euler', 'scheduler': 'simple',
+            'positive': pos_ref, 'negative': neg_ref, 'latent_image': ['sampler_high', 0],
+            'start_at_step': boundary, 'end_at_step': steps,
+            'return_with_leftover_noise': 'disable'}},
+    })
+    return ['sampler_low', 0]
+
+
+# Dekodowanie wideo kafelkami. ComfyUI startuje bez --cpu-vae (VAE na GPU jest
+# kilkanaście razy szybsze), a kafelkowanie przestrzenne i czasowe trzyma szczyt pamięci
+# w ryzach — ten sam wzorzec, który rozwiązał OOM w krea-2 podczas audytu.
+# temporal_size = ile klatek dekodowanych naraz; niżej = mniej VRAM, minimalnie wolniej.
+VAE_TILE_SIZE     = int(os.environ.get('GP_VAE_TILE_SIZE', '512'))
+VAE_TILE_OVERLAP  = int(os.environ.get('GP_VAE_TILE_OVERLAP', '64'))
+VAE_TEMPORAL_SIZE = int(os.environ.get('GP_VAE_TEMPORAL_SIZE', '16'))
+VAE_TEMPORAL_OVER = int(os.environ.get('GP_VAE_TEMPORAL_OVERLAP', '8'))
+
+
+RIFE_CKPT = os.environ.get('GP_RIFE_CKPT', 'rife49.pth')
+
+
+def _wan_video_output(graph, latent_ref, fps, filename_prefix, interpolate=False):
+    """VAE decode (kafelkowany) → opcjonalna interpolacja → kontener wideo → zapis.
+    Wspólny ogon każdego grafu WAN.
+
+    interpolate: RIFE dokłada klatkę między każdą parę, więc materiał 16 fps staje się
+    płynnym 32 fps. Sam model wideo tego nie zrobi — bez tego kroku klip wygląda jak
+    poklatkowy niezależnie od jakości pojedynczych klatek."""
+    graph['vae_decode'] = {'class_type': 'VAEDecodeTiled', 'inputs': {
+        'samples': latent_ref, 'vae': ['vae_loader', 0],
+        'tile_size': VAE_TILE_SIZE, 'overlap': VAE_TILE_OVERLAP,
+        'temporal_size': VAE_TEMPORAL_SIZE, 'temporal_overlap': VAE_TEMPORAL_OVER}}
+
+    frames_ref, out_fps = ['vae_decode', 0], fps
+    if interpolate:
+        graph['rife'] = {'class_type': 'RIFE VFI', 'inputs': {
+            'ckpt_name': RIFE_CKPT, 'frames': ['vae_decode', 0],
+            'clear_cache_after_n_frames': 8,   # niżej niż domyślne 10 — karta ma 12 GB
+            'multiplier': 2, 'fast_mode': True, 'ensemble': True,
+            'scale_factor': 1.0, 'dtype': 'float16', 'batch_size': 1,
+            # torch_compile jest w required mimo wartości domyślnej — API odrzuca graf
+            # bez niego (prompt_outputs_failed_validation). Zostawiamy False: kompilacja
+            # zwraca się dopiero przy serii klipów, a pierwszy przebieg mocno spowalnia.
+            'torch_compile': False}}
+        frames_ref, out_fps = ['rife', 0], fps * 2
+
+    graph.update({
         'create_video': {'class_type': 'CreateVideo', 'inputs': {
-            'images': ['vae_decode', 0], 'fps': fps}},
+            'images': frames_ref, 'fps': out_fps}},
         'save_video': {'class_type': 'SaveVideo', 'inputs': {
             'video': ['create_video', 0], 'filename_prefix': filename_prefix,
             'format': 'auto', 'codec': 'auto'}},
     })
     return graph
 
+
+def build_wan_t2v_graph(positive, negative, width, height, length, seed, fps, filename_prefix,
+                        steps=4, extra_lora_high=None, extra_lora_low=None,
+                        interpolate=False, **_):
+    """Tekst na wideo. Odtworzone z oficjalnego szablonu ComfyUI (video_wan2_2_14B_t2v.json)."""
+    graph, mh, ml = _wan_common_loaders('t2v', positive, negative,
+                                        extra_lora_high, extra_lora_low)
+    graph['latent'] = {'class_type': 'EmptyHunyuanLatentVideo', 'inputs': {
+        'width': width, 'height': height, 'length': length, 'batch_size': 1}}
+    out = _wan_moe_samplers(graph, mh, ml, ['pos', 0], ['neg', 0], ['latent', 0], steps, seed)
+    return _wan_video_output(graph, out, fps, filename_prefix, interpolate)
+
+
+def build_wan_i2v_graph(positive, negative, width, height, length, seed, fps, filename_prefix,
+                        steps=4, extra_lora_high=None, extra_lora_low=None,
+                        start_image=None, interpolate=False, **_):
+    """Obraz na wideo — klatka startowa niesie kompozycję, światło i styl, model dokłada ruch.
+    To jest droga do jakości Krea 2 w ruchu: zdjęcie z Krea 2 jako pierwsza klatka.
+
+    WanImageToVideo przyjmuje conditioning i zwraca (positive, negative, latent) — dlatego
+    samplery dostają jego wyjścia, nie surowe 'pos'/'neg'. clip_vision_output jest opcjonalny
+    i Wan 2.2 I2V-A14B go nie wymaga (w odróżnieniu od Wan 2.1 I2V)."""
+    if not start_image:
+        raise RuntimeError('Tryb "obraz na wideo" wymaga klatki startowej')
+    graph, mh, ml = _wan_common_loaders('i2v', positive, negative,
+                                        extra_lora_high, extra_lora_low)
+    graph['start_img'] = {'class_type': 'LoadImage', 'inputs': {'image': start_image}}
+    graph['i2v'] = {'class_type': 'WanImageToVideo', 'inputs': {
+        'positive': ['pos', 0], 'negative': ['neg', 0], 'vae': ['vae_loader', 0],
+        'width': width, 'height': height, 'length': length, 'batch_size': 1,
+        'start_image': ['start_img', 0]}}
+    out = _wan_moe_samplers(graph, mh, ml, ['i2v', 0], ['i2v', 1], ['i2v', 2], steps, seed)
+    return _wan_video_output(graph, out, fps, filename_prefix, interpolate)
+
+
+def build_wan_flf_graph(positive, negative, width, height, length, seed, fps, filename_prefix,
+                        steps=4, extra_lora_high=None, extra_lora_low=None,
+                        start_image=None, end_image=None, interpolate=False, **_):
+    """Pierwsza i ostatnia klatka — model dogenerowuje przejście między dwoma zdjęciami."""
+    if not start_image or not end_image:
+        raise RuntimeError('Tryb "pierwsza i ostatnia klatka" wymaga dwóch obrazów')
+    graph, mh, ml = _wan_common_loaders('i2v', positive, negative,
+                                        extra_lora_high, extra_lora_low)
+    graph['start_img'] = {'class_type': 'LoadImage', 'inputs': {'image': start_image}}
+    graph['end_img']   = {'class_type': 'LoadImage', 'inputs': {'image': end_image}}
+    graph['flf'] = {'class_type': 'WanFirstLastFrameToVideo', 'inputs': {
+        'positive': ['pos', 0], 'negative': ['neg', 0], 'vae': ['vae_loader', 0],
+        'width': width, 'height': height, 'length': length, 'batch_size': 1,
+        'start_image': ['start_img', 0], 'end_image': ['end_img', 0]}}
+    out = _wan_moe_samplers(graph, mh, ml, ['flf', 0], ['flf', 1], ['flf', 2], steps, seed)
+    return _wan_video_output(graph, out, fps, filename_prefix, interpolate)
+
+
+# Rejestr trybów wideo. Dodanie kolejnego modelu (np. HunyuanVideo 1.5) to jeden wpis
+# tutaj plus jedna funkcja budująca graf — bez dokładania gałęzi w routingu /api/generate.
+VIDEO_MODES = {
+    'wan_t2v': {'graph': build_wan_t2v_graph, 'family': 't2v',
+                'label': 'Tekst na wideo (Wan 2.2)',    'images': 0,
+                'db_model': 'wan2.2_t2v_a14b'},
+    'wan_i2v': {'graph': build_wan_i2v_graph, 'family': 'i2v',
+                'label': 'Obraz na wideo (Wan 2.2)',    'images': 1,
+                'db_model': 'wan2.2_i2v_a14b'},
+    'wan_flf': {'graph': build_wan_flf_graph, 'family': 'i2v',
+                'label': 'Pierwsza i ostatnia klatka',  'images': 2,
+                'db_model': 'wan2.2_flf2v_a14b'},
+}
+# Domyślnie tekst na wideo — żądanie bez 'video_mode' (stary frontend, curl) nie może
+# wpaść w tryb wymagający klatki startowej i wywalić się na jej braku.
+DEFAULT_VIDEO_MODE = 'wan_t2v'
+
+MAX_FRAME_BYTES = 30 * 1024 * 1024   # klatka startowa z uploadu — zdjęcie, nie film
+
+def _video_frame_to_comfy(ref=None, b64=None):
+    """Klatka z UI → katalog input ComfyUI. Zwraca nazwę dla węzła LoadImage.
+
+    Dwie drogi, obie z widoku Wideo: 'ref' to ścieżka z galerii (tak jak trzyma ją baza
+    w kolumnie 'paths', np. 'genphoto/2026-09-01/krea_....png'), 'b64' to data URL
+    z uploadu. Przy ścieżce nie wychodzimy poza OUTPUTS_DIR — ta sama bariera
+    (is_relative_to) co w /img/."""
+    if b64:
+        raw = b64.split(',', 1)[1] if b64.startswith('data:') else b64
+        try:
+            data = base64.b64decode(raw, validate=True)
+        except Exception:
+            raise RuntimeError('Nieprawidłowy obraz (base64)')
+        if len(data) > MAX_FRAME_BYTES:
+            raise RuntimeError('Obraz za duży (limit 30 MB)')
+        return comfy_upload_image(data, 'upload.png')
+    if not ref:
+        return None
+    p = Path(ref)
+    cand = (p if p.is_absolute() else (OUTPUTS_DIR / ref)).resolve()
+    if not cand.is_relative_to(OUTPUTS_DIR.resolve()):
+        raise RuntimeError('Obraz spoza katalogu wyników')
+    if not cand.is_file():
+        raise RuntimeError(f'Nie znaleziono obrazu: {ref}')
+    return comfy_upload_image(cand.read_bytes(), cand.name)
+
+
 def wan_video_generate_thread(params, jid):
-    """txt2vid przez WAN 2.2 T2V-A14B (ComfyUI, port 8189). Rozdzielczosc/dlugosc
-    klatek ograniczone pod 12GB VRAM — patrz build_wan_t2v_graph."""
+    """Generowanie wideo przez WAN 2.2 A14B (ComfyUI, port 8189).
+
+    Tryb wybiera params['video_mode'] z rejestru VIDEO_MODES: tekst na wideo, obraz
+    na wideo albo pierwsza i ostatnia klatka. Rozdzielczość i długość ograniczone
+    pod 12 GB VRAM."""
     try:
         job_set(jid, status='generating')
-        width  = int(params.get('width', 640))
-        height = int(params.get('height', 640))
+        mode_key = params.get('video_mode') or DEFAULT_VIDEO_MODE
+        mode = VIDEO_MODES.get(mode_key)
+        if not mode:
+            raise RuntimeError(f'Nieznany tryb wideo: {mode_key}')
+
+        width  = int(params.get('width', 832))
+        height = int(params.get('height', 480))
         fps    = int(params.get('fps', 16))
+        steps  = max(2, min(12, int(params.get('steps', 4))))
         # length musi byc postaci 4n+1 (kompresja czasowa VAE) — dopasuj do najblizszej
         raw_length = int(params.get('length', 81))
         length = max(1, ((raw_length - 1) // 4) * 4 + 1)
@@ -1665,20 +1919,33 @@ def wan_video_generate_thread(params, jid):
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        graph = build_wan_t2v_graph(
+        # Klatki startowa/końcowa: z dysku do katalogu input ComfyUI, żeby LoadImage je widział.
+        start_image = end_image = None
+        if mode['images'] >= 1:
+            start_image = _video_frame_to_comfy(params.get('start_image'),
+                                                params.get('start_image_b64'))
+        if mode['images'] >= 2:
+            end_image = _video_frame_to_comfy(params.get('end_image'),
+                                              params.get('end_image_b64'))
+
+        graph = mode['graph'](
             params['positive'], params.get('negative', ''),
             width, height, length, seed, fps,
-            filename_prefix=f'genphoto/wan_t2v_{ts}',
+            filename_prefix=f'genphoto/{mode_key}_{ts}',
+            steps=steps,
             extra_lora_high=params.get('extra_lora_high'),
             extra_lora_low=params.get('extra_lora_low'),
+            start_image=start_image, end_image=end_image,
+            interpolate=bool(params.get('interpolate')),
         )
 
         resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
         prompt_id = resp['prompt_id']
 
-        # Pierwsze uruchomienie laduje ~12GB modeli z dysku — dajemy dlugi timeout.
+        # Pierwsze uruchomienie laduje ~17GB modeli z dysku (Q4_K_S), a tryb Finał
+        # (8 kroków, 720p) trwa dłużej niż dawne 4-krokowe 640x640 — stąd 30 min.
         t_start = time.time()
-        deadline = t_start + 900
+        deadline = t_start + 1800
         history = None
         while time.time() < deadline:
             job_set(jid, status='generating', progress={'elapsed': int(time.time() - t_start)})
@@ -1697,7 +1964,7 @@ def wan_video_generate_thread(params, jid):
 
         vid  = vids_meta[0]
         src  = COMFY_OUTPUTS / vid.get('subfolder', '') / vid['filename']
-        name = f'wan_t2v_{ts}_s{seed}.mp4'
+        name = f'{mode_key}_{ts}_s{seed}.mp4'
         (out_dir / name).write_bytes(src.read_bytes())
         path = f'genphoto/{today}/{name}'
 
@@ -1707,8 +1974,8 @@ def wan_video_generate_thread(params, jid):
                 con.execute(
                     'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (gid, int(time.time()), params.get('description', ''),
-                     params['positive'], params.get('negative', ''), 'wan2.2_t2v_a14b',
-                     'euler', 'simple', 4, 1.0, width, height,
+                     params['positive'], params.get('negative', ''), mode['db_model'],
+                     'euler', 'simple', steps, 1.0, width, height,
                      seed, 1, 'wanvideo', json.dumps([path]))
                 )
         job_set(jid, status='done', images=[path], seed=seed, gen_id=gid)

@@ -232,6 +232,7 @@ select{resize:none;cursor:pointer}
 .vid-btn:hover{opacity:.9}
 .vid-btn:disabled{opacity:.5;cursor:not-allowed}
 #vid-prog-fill{background:linear-gradient(90deg,#7c3aed,#db2777)}
+.vid-frame-preview{background:var(--panel);border:1px dashed #334155;border-radius:8px;padding:10px;min-height:52px;display:flex;flex-direction:column;justify-content:center;color:var(--muted);font-size:.75rem;text-align:center}
 .vid-hist-thumb{width:80px;height:56px;object-fit:cover;border-radius:5px;cursor:pointer;border:1px solid #334155}
 
 /* ── Tablet/mid-desktop responsive (header ma juz 3 stale rzedy, tu tylko dopasowanie odstepow) ── */
@@ -1011,68 +1012,134 @@ select{resize:none;cursor:pointer}
 <div id="view-video" style="display:none">
 <main>
 <div class="left-panel">
-  <div style="font-size:.8rem;color:var(--muted);margin-bottom:12px">
-    Tekst na wideo (txt2vid) — WAN 2.2 T2V-A14B, tryb szybki (4 kroki, LoRA lightx2v). Generowanie trwa kilka minut na 12GB VRAM.
+
+  <!-- Tryb -->
+  <div style="margin-bottom:12px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:5px">Tryb</label>
+    <div id="vid-mode-tabs" style="display:flex;gap:4px">
+      <button class="vid-preset-btn active" data-mode="wan_i2v" onclick="setVideoMode('wan_i2v')">&#128444; Obraz &#8594; wideo</button>
+      <button class="vid-preset-btn" data-mode="wan_t2v" onclick="setVideoMode('wan_t2v')">&#128172; Tekst &#8594; wideo</button>
+      <button class="vid-preset-btn" data-mode="wan_flf" onclick="setVideoMode('wan_flf')">&#8646; Pierwsza+ostatnia</button>
+    </div>
+    <div id="vid-mode-hint" style="font-size:.72rem;color:var(--muted);margin-top:5px;line-height:1.4"></div>
   </div>
 
-  <div style="margin-bottom:12px">
-    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">ComfyUI (WAN 2.2)</label>
-    <div style="display:flex;gap:4px">
-      <button onclick="serviceControl('comfyui','start')" title="Uruchom ComfyUI" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.78rem">&#9654; Start</button>
-      <button onclick="serviceControl('comfyui','stop')" title="Zatrzymaj ComfyUI (zwalnia VRAM)" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.78rem">&#9632; Stop</button>
+  <!-- Klatki -->
+  <div id="vid-frames-box" style="margin-bottom:12px">
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:5px">
+      Klatka startowa <span style="opacity:.7">&#8212; ona niesie styl i kompozycję</span>
+    </label>
+    <div style="display:flex;gap:4px;margin-bottom:6px">
+      <button onclick="pickLatestFrame('start')" class="vid-preset-btn">&#9889; Ostatnie zdjęcie</button>
+      <button onclick="openFramePicker('start')" class="vid-preset-btn">&#128193; Z galerii</button>
+      <button onclick="document.getElementById('vid-start-file').click()" class="vid-preset-btn">&#11014; Wgraj</button>
+    </div>
+    <input type="file" id="vid-start-file" accept="image/*" style="display:none" onchange="uploadFrameFile('start', this)">
+    <div id="vid-start-preview" class="vid-frame-preview">Nie wybrano</div>
+
+    <div id="vid-end-box" style="display:none;margin-top:10px">
+      <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:5px">Klatka końcowa</label>
+      <div style="display:flex;gap:4px;margin-bottom:6px">
+        <button onclick="openFramePicker('end')" class="vid-preset-btn">&#128193; Z galerii</button>
+        <button onclick="document.getElementById('vid-end-file').click()" class="vid-preset-btn">&#11014; Wgraj</button>
+      </div>
+      <input type="file" id="vid-end-file" accept="image/*" style="display:none" onchange="uploadFrameFile('end', this)">
+      <div id="vid-end-preview" class="vid-frame-preview">Nie wybrano</div>
     </div>
   </div>
 
+  <!-- Prompt -->
   <div style="margin-bottom:10px">
-    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">Opis sceny (positive prompt)</label>
-    <textarea id="video-prompt" rows="4" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;font-size:.85rem;resize:vertical"
-      placeholder="np. beautiful woman turning her head back over shoulder, gentle smile, soft natural lighting, cinematic slow motion"></textarea>
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">
+      <span id="vid-prompt-label">Opis ruchu</span>
+    </label>
+    <textarea id="video-prompt" rows="3" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;font-size:.85rem;resize:vertical"
+      placeholder="np. she slowly turns her head toward the camera, hair moving in the wind, soft light shifting, cinematic"></textarea>
   </div>
 
   <div style="margin-bottom:10px">
-    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">Negative prompt</label>
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">Czego unikać (negative)</label>
     <textarea id="video-negative" rows="2" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;font-size:.85rem;resize:vertical">overexposed, subtitles, low quality, worst quality, blurry, deformed, bad anatomy, static, shaky camera, watermark</textarea>
   </div>
 
+  <!-- Format -->
   <div style="margin-bottom:10px">
-    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:4px">LoRA (WAN 2.2, opcjonalnie — para High/Low noise)</label>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px">
-      <div>
-        <div style="font-size:.72rem;color:var(--muted);margin-bottom:3px">High noise</div>
+    <label style="font-size:.82rem;color:var(--muted);display:block;margin-bottom:5px">Format</label>
+    <div id="vid-ratio-tabs" style="display:flex;gap:4px">
+      <button class="vid-preset-btn active" data-w="832" data-h="480" onclick="setVideoRatio(this)">16:9</button>
+      <button class="vid-preset-btn" data-w="480" data-h="832" onclick="setVideoRatio(this)">9:16</button>
+      <button class="vid-preset-btn" data-w="640" data-h="640" onclick="setVideoRatio(this)">1:1</button>
+      <button class="vid-preset-btn" data-w="1280" data-h="720" onclick="setVideoRatio(this)">HD 16:9</button>
+    </div>
+    <div style="font-size:.7rem;color:var(--muted);margin-top:4px">
+      Wan 2.2 trenowany na 832&times;480 i 1280&times;720 &#8212; te formaty dają najlepszą kompozycję. HD kosztuje ok. 2,5&times; więcej czasu.
+    </div>
+  </div>
+
+  <details style="margin-bottom:10px">
+    <summary style="font-size:.78rem;color:var(--muted);cursor:pointer">Wymiary ręcznie</summary>
+    <div style="display:flex;gap:6px;align-items:end;margin-top:6px">
+      <div style="flex:1"><label style="font-size:.72rem;color:var(--muted)">Szerokość</label><input type="number" id="video-w" value="832" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+      <button onclick="swapVideoWH()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px">&#8644;</button>
+      <div style="flex:1"><label style="font-size:.72rem;color:var(--muted)">Wysokość</label><input type="number" id="video-h" value="480" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    </div>
+  </details>
+
+  <!-- Czas / fps / seed -->
+  <div style="display:flex;gap:6px;margin-bottom:10px">
+    <div style="flex:1"><label style="font-size:.72rem;color:var(--muted)">Czas (s)</label><input type="number" id="video-duration" value="5" min="1" max="10" step="0.5" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    <div style="flex:1"><label style="font-size:.72rem;color:var(--muted)">FPS</label><input type="number" id="video-fps" value="16" min="8" max="30" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+    <div style="flex:1.4"><label style="font-size:.72rem;color:var(--muted)">Seed (-1 = losowy)</label><input type="number" id="video-seed" value="-1" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
+  </div>
+
+  <!-- LoRA -->
+  <details style="margin-bottom:12px">
+    <summary style="font-size:.78rem;color:var(--muted);cursor:pointer">LoRA stylu (para High/Low noise)</summary>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <div style="flex:1">
+        <label style="font-size:.7rem;color:var(--muted)">High noise</label>
         <select id="video-lora-high" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.8rem"><option value="">&#8212; Brak &#8212;</option></select>
       </div>
-      <div>
-        <div style="font-size:.72rem;color:var(--muted);margin-bottom:3px">Low noise</div>
+      <div style="flex:1">
+        <label style="font-size:.7rem;color:var(--muted)">Low noise</label>
         <select id="video-lora-low" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.8rem"><option value="">&#8212; Brak &#8212;</option></select>
       </div>
+      <div style="width:80px">
+        <label style="font-size:.7rem;color:var(--muted)">Siła</label>
+        <input type="number" id="video-lora-strength" value="1.0" min="-2" max="2" step="0.05" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.8rem">
+      </div>
     </div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <label style="font-size:.78rem;color:var(--muted)">Waga</label>
-      <input type="number" id="video-lora-strength" value="1.0" min="-2" max="2" step="0.05" style="width:80px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px;font-size:.8rem">
-    </div>
-    <div style="font-size:.72rem;color:var(--muted);margin-top:4px">Pliki WAN LoRA wgraj przez sekcję LoRA (Z-Image) &#8594; Wyślij/Pobierz (ten sam katalog), potem odśwież stronę.</div>
+    <div style="font-size:.7rem;color:var(--muted);margin-top:4px">Każdy WAN 2.2 LoRA wymaga osobnego pliku dla eksperta high i low noise. Akceleracyjna (Lightning) jest podpięta automatycznie.</div>
+  </details>
+
+  <!-- Szkic / Finał -->
+  <div style="display:flex;gap:6px">
+    <button onclick="startVideoGen('draft')" id="video-draft-btn" class="vid-btn" style="flex:1;background:#334155">
+      &#9998; SZKIC
+    </button>
+    <button onclick="startVideoGen('final')" id="video-gen-btn" class="vid-btn" style="flex:1.3">
+      &#127916; FINAŁ
+    </button>
+  </div>
+  <div style="font-size:.7rem;color:var(--muted);margin-top:5px;line-height:1.45">
+    Szkic i Finał mają ten sam format, długość i seed &#8212; różni je liczba kroków (4 kontra 8).
+    Dlatego szkic pokazuje realnie ten sam ruch, tylko mniej ostry. Finał dokłada też interpolację RIFE (16 &#8594; 32 fps). Szkic ok. 4 min, Finał ok. 8-10 min.
   </div>
 
-  <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin-bottom:10px">
-    <div><label style="font-size:.78rem;color:var(--muted)">Szerokość</label><input type="number" id="video-w" value="640" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
-    <button onclick="swapVideoWH()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px">&#8644;</button>
-    <div><label style="font-size:.78rem;color:var(--muted)">Wysokość</label><input type="number" id="video-h" value="640" step="16" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">
-    <div><label style="font-size:.78rem;color:var(--muted)">Czas trwania (s)</label><input type="number" id="video-duration" value="5" min="1" max="10" step="0.5" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
-    <div><label style="font-size:.78rem;color:var(--muted)">FPS</label><input type="number" id="video-fps" value="16" min="8" max="30" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
-    <div><label style="font-size:.78rem;color:var(--muted)">Seed</label><input type="number" id="video-seed" value="-1" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:6px;border-radius:6px;font-size:.85rem"></div>
-  </div>
-
-  <button onclick="startVideoGen()" id="video-gen-btn" class="vid-btn">
-    &#127916; GENERUJ WIDEO
-  </button>
   <div id="video-status" style="margin-top:8px;font-size:.85rem;color:var(--muted);text-align:center"></div>
   <div id="video-progress-wrap" style="display:none;margin-top:10px">
-    <div class="progress-label"><span>Generowanie wideo (moze potrwac kilka minut)...</span><span id="video-prog-pct"></span></div>
+    <div class="progress-label"><span>Generowanie wideo...</span><span id="video-prog-pct"></span></div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="vid-prog-fill"></div></div>
     <div id="video-prog-detail" style="font-size:.75rem;color:var(--muted);margin-top:4px;min-height:1em"></div>
+  </div>
+
+  <div style="margin-top:14px">
+    <label style="font-size:.78rem;color:var(--muted);display:block;margin-bottom:4px">ComfyUI (silnik wideo)</label>
+    <div style="display:flex;gap:4px">
+      <button onclick="serviceControl('comfyui','start')" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.78rem">&#9654; Start</button>
+      <button onclick="serviceControl('comfyui','stop')" style="flex:1;padding:6px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.78rem">&#9632; Stop</button>
+    </div>
+    <div style="font-size:.68rem;color:var(--muted);margin-top:4px">Forge i Krea 2 są zatrzymywane automatycznie przed generowaniem wideo &#8212; karta ma 12 GB i model potrzebuje jej prawie całej.</div>
   </div>
 </div>
 
@@ -1080,6 +1147,17 @@ select{resize:none;cursor:pointer}
   <div style="color:var(--muted);font-size:.9rem;margin-top:40px">Wygenerowane wideo pojawi się tutaj</div>
 </div>
 </main>
+
+<!-- Wybór klatki z galerii -->
+<div id="frame-picker" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,.88);z-index:60;padding:24px;overflow:auto">
+  <div style="max-width:1000px;margin:0 auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="color:var(--text);font-size:1rem">Wybierz klatkę z historii generowań</div>
+      <button onclick="closeFramePicker()" style="background:none;border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:8px;cursor:pointer">Zamknij</button>
+    </div>
+    <div id="frame-picker-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px"></div>
+  </div>
+</div>
 </div><!-- /view-video -->
 
 <!-- ── Video View ── -->
@@ -2993,13 +3071,148 @@ function pollPose(jid, btn, status) {
     }
   });
 }
+/* ── Wideo: stan ── */
+var _vidMode   = 'wan_i2v';
+var _vidFrames = {start: null, end: null};   // {ref} z galerii albo {b64} z uploadu
+var _vidPickTarget = 'start';
+var _vidLast   = null;                        // ostatni job: {seed, quality, params}
+
+var VIDEO_MODE_HINTS = {
+  wan_i2v: 'Zdjęcie niesie kompozycję, światło i styl — model dokłada sam ruch. ' +
+           'To najkrótsza droga do jakości Krea 2 w wideo.',
+  wan_t2v: 'Scena powstaje wyłącznie z opisu. Wygodne, ale estetyka zależy od modelu wideo, ' +
+           'który jest słabszy niż Krea 2.',
+  wan_flf: 'Podajesz dwa zdjęcia, model dogenerowuje przejście między nimi.'
+};
+
+function setVideoMode(mode) {
+  _vidMode = mode;
+  var tabs = document.querySelectorAll('#vid-mode-tabs .vid-preset-btn');
+  for (var i = 0; i < tabs.length; i++)
+    tabs[i].classList.toggle('active', tabs[i].getAttribute('data-mode') === mode);
+  document.getElementById('vid-mode-hint').textContent = VIDEO_MODE_HINTS[mode] || '';
+  document.getElementById('vid-frames-box').style.display = (mode === 'wan_t2v') ? 'none' : '';
+  document.getElementById('vid-end-box').style.display    = (mode === 'wan_flf') ? '' : 'none';
+  document.getElementById('vid-prompt-label').textContent =
+    (mode === 'wan_t2v') ? 'Opis sceny' : 'Opis ruchu';
+}
+
+function setVideoRatio(btn) {
+  var tabs = document.querySelectorAll('#vid-ratio-tabs .vid-preset-btn');
+  for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+  btn.classList.add('active');
+  document.getElementById('video-w').value = btn.getAttribute('data-w');
+  document.getElementById('video-h').value = btn.getAttribute('data-h');
+}
+
+function swapVideoWH() {
+  var w = document.getElementById('video-w'), h = document.getElementById('video-h');
+  var tmp = w.value; w.value = h.value; h.value = tmp;
+}
+
+/* ── Wideo: wybór klatki ── */
+function _renderFramePreview(which) {
+  var box = document.getElementById('vid-' + which + '-preview');
+  var f = _vidFrames[which];
+  while (box.firstChild) box.removeChild(box.firstChild);
+  if (!f) { box.textContent = 'Nie wybrano'; return; }
+  var img = document.createElement('img');
+  img.src = f.b64 ? f.b64 : ('/img/' + encodeURI(f.ref));
+  img.style.cssText = 'max-width:100%;max-height:150px;border-radius:8px;display:block;margin:0 auto';
+  var cap = document.createElement('div');
+  cap.style.cssText = 'font-size:.68rem;color:var(--muted);margin-top:4px;text-align:center;word-break:break-all';
+  cap.textContent = f.b64 ? 'wgrany plik' : f.ref.split('/').pop();
+  box.appendChild(img); box.appendChild(cap);
+}
+
+function _imagesFromHistory(rows) {
+  var out = [];
+  (rows || []).forEach(function (g) {
+    var paths = [];
+    try { paths = JSON.parse(g.paths || '[]'); } catch (e) { paths = []; }
+    paths.forEach(function (p) { if (!/\.mp4$/i.test(p)) out.push({path: p, model: g.model}); });
+  });
+  return out;
+}
+
+function pickLatestFrame(which) {
+  fetch('/api/history').then(function (r) { return r.json(); }).then(function (d) {
+    var imgs = _imagesFromHistory(d);
+    if (!imgs.length) return toast('Brak zdjęć w historii', 'err');
+    _vidFrames[which] = {ref: imgs[0].path};
+    _renderFramePreview(which);
+    toast('Wzięto ostatnie zdjęcie', 'ok');
+  }).catch(function () { toast('Nie udało się pobrać historii', 'err'); });
+}
+
+function openFramePicker(which) {
+  _vidPickTarget = which;
+  var grid = document.getElementById('frame-picker-grid');
+  while (grid.firstChild) grid.removeChild(grid.firstChild);
+  document.getElementById('frame-picker').style.display = 'block';
+  fetch('/api/history').then(function (r) { return r.json(); }).then(function (d) {
+    var imgs = _imagesFromHistory(d);
+    if (!imgs.length) {
+      var em = document.createElement('div');
+      em.style.cssText = 'color:var(--muted);grid-column:1/-1;text-align:center;padding:30px';
+      em.textContent = 'Brak zdjęć w historii generowań';
+      grid.appendChild(em); return;
+    }
+    imgs.slice(0, 60).forEach(function (it) {
+      var wrap = document.createElement('div');
+      wrap.style.cssText = 'cursor:pointer;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--panel)';
+      var img = document.createElement('img');
+      img.src = '/img/' + encodeURI(it.path);
+      img.loading = 'lazy';
+      img.style.cssText = 'width:100%;height:110px;object-fit:cover;display:block';
+      var cap = document.createElement('div');
+      cap.style.cssText = 'font-size:.62rem;color:var(--muted);padding:3px 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      cap.textContent = it.model || '';
+      wrap.appendChild(img); wrap.appendChild(cap);
+      wrap.onclick = function () {
+        _vidFrames[_vidPickTarget] = {ref: it.path};
+        _renderFramePreview(_vidPickTarget);
+        closeFramePicker();
+      };
+      grid.appendChild(wrap);
+    });
+  });
+}
+
+function closeFramePicker() {
+  document.getElementById('frame-picker').style.display = 'none';
+}
+
+function uploadFrameFile(which, input) {
+  var file = input.files && input.files[0];
+  if (!file) return;
+  if (file.size > 30 * 1024 * 1024) return toast('Obraz za duży (limit 30 MB)', 'err');
+  var reader = new FileReader();
+  reader.onload = function (e) {
+    _vidFrames[which] = {b64: e.target.result};
+    _renderFramePreview(which);
+  };
+  reader.readAsDataURL(file);
+  input.value = '';
+}
+
+/* ── Wideo: LoRA ── */
 function loadWanVideoLoraOptions() {
-  fetch('/api/loras').then(function(r){ return r.json(); }).then(function(names){
-    ['video-lora-high', 'video-lora-low'].forEach(function(selId){
+  fetch('/api/loras').then(function (r) { return r.json(); }).then(function (names) {
+    ['video-lora-high', 'video-lora-low'].forEach(function (selId) {
       var sel = document.getElementById(selId);
       var cur = sel.value;
+      var wantHigh = selId.indexOf('high') !== -1;
       sel.innerHTML = '<option value="">— Brak —</option>';
-      names.forEach(function(name){
+      names.filter(function (n) {
+        /* Akceleracyjne (Lightning/lightx2v) są podpięte automatycznie — nie zaśmiecaj listy.
+           Poza tym pokaż tylko plik pasujący do eksperta, którego dotyczy ten select. */
+        if (/lightning|lightx2v/i.test(n)) return false;
+        var lo = n.toLowerCase();
+        var isHigh = lo.indexOf('high') !== -1, isLow = lo.indexOf('low') !== -1;
+        if (!isHigh && !isLow) return true;          // nazwa nic nie mówi — pokaż w obu
+        return wantHigh ? isHigh : isLow;
+      }).forEach(function (name) {
         var opt = document.createElement('option');
         opt.value = name; opt.textContent = name;
         sel.appendChild(opt);
@@ -3009,91 +3222,175 @@ function loadWanVideoLoraOptions() {
   });
 }
 
-function swapVideoWH() {
-  var w = document.getElementById('video-w'), h = document.getElementById('video-h');
-  var tmp = w.value; w.value = h.value; h.value = tmp;
-}
+/* ── Wideo: generowanie ── */
+var VIDEO_STEPS = {draft: 4, final: 8};
 
-function startVideoGen() {
+function startVideoGen(quality, seedOverride) {
+  quality = quality || 'final';
   var prompt = document.getElementById('video-prompt').value.trim();
-  if (!prompt) return toast('Wpisz opis sceny', 'err');
-  var btn = document.getElementById('video-gen-btn');
+  if (!prompt) return toast('Opisz, co ma się dziać w kadrze', 'err');
+  if (_vidMode !== 'wan_t2v' && !_vidFrames.start)
+    return toast('Wybierz klatkę startową', 'err');
+  if (_vidMode === 'wan_flf' && !_vidFrames.end)
+    return toast('Ten tryb wymaga też klatki końcowej', 'err');
+
+  var btn    = document.getElementById(quality === 'draft' ? 'video-draft-btn' : 'video-gen-btn');
+  var other  = document.getElementById(quality === 'draft' ? 'video-gen-btn' : 'video-draft-btn');
   var status = document.getElementById('video-status');
-  btn.disabled = true; btn.textContent = '⏳ Generowanie...';
-  status.textContent = 'Ladowanie modeli WAN 2.2 i generowanie...';
-  var fps = parseInt(document.getElementById('video-fps').value) || 16;
+  var label  = btn.textContent;
+  btn.disabled = other.disabled = true;
+  btn.textContent = '⏳ Generowanie...';
+
+  var fps      = parseInt(document.getElementById('video-fps').value) || 16;
   var duration = parseFloat(document.getElementById('video-duration').value) || 5;
   var loraHigh = document.getElementById('video-lora-high').value;
   var loraLow  = document.getElementById('video-lora-low').value;
-  var loraStrength = parseFloat(document.getElementById('video-lora-strength').value) || 1.0;
+  var loraStr  = parseFloat(document.getElementById('video-lora-strength').value) || 1.0;
+  var seed     = (typeof seedOverride === 'number')
+               ? seedOverride
+               : (parseInt(document.getElementById('video-seed').value));
+
   var params = {
-    positive: prompt,
-    negative: document.getElementById('video-negative').value.trim(),
-    width:    parseInt(document.getElementById('video-w').value),
-    height:   parseInt(document.getElementById('video-h').value),
-    length:   Math.round(duration * fps),
-    fps:      fps,
-    seed:     parseInt(document.getElementById('video-seed').value),
-    backend:  'wanvideo',
-    extra_lora_high: loraHigh ? {name: loraHigh, strength: loraStrength} : null,
-    extra_lora_low:  loraLow  ? {name: loraLow,  strength: loraStrength} : null,
+    backend:    'wanvideo',
+    video_mode: _vidMode,
+    positive:   prompt,
+    negative:   document.getElementById('video-negative').value.trim(),
+    width:      parseInt(document.getElementById('video-w').value),
+    height:     parseInt(document.getElementById('video-h').value),
+    length:     Math.round(duration * fps),
+    fps:        fps,
+    steps:      VIDEO_STEPS[quality],
+    /* Interpolacja RIFE tylko w Finale: podwaja liczbę klatek, więc 16 fps staje się
+       płynnym 32 fps. W szkicu zbędna — szkic ocenia ruch i kompozycję, nie płynność. */
+    interpolate: (quality === 'final'),
+    seed:       isNaN(seed) ? -1 : seed,
+    extra_lora_high: loraHigh ? {name: loraHigh, strength: loraStr} : null,
+    extra_lora_low:  loraLow  ? {name: loraLow,  strength: loraStr} : null
   };
-  fetch('/api/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params)})
-  .then(function(r){return r.json();})
-  .then(function(d){
-    if (!d.ok) { toast(d.error||'Blad', 'err'); btn.disabled=false; btn.textContent='🎬 GENERUJ WIDEO'; status.textContent=''; return; }
+  if (_vidMode !== 'wan_t2v' && _vidFrames.start) {
+    if (_vidFrames.start.b64) params.start_image_b64 = _vidFrames.start.b64;
+    else                      params.start_image     = _vidFrames.start.ref;
+  }
+  if (_vidMode === 'wan_flf' && _vidFrames.end) {
+    if (_vidFrames.end.b64) params.end_image_b64 = _vidFrames.end.b64;
+    else                    params.end_image     = _vidFrames.end.ref;
+  }
+
+  status.textContent = 'Zwalnianie karty i ładowanie modelu Wan 2.2...';
+  fetch('/api/generate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify(params)})
+  .then(function (r) { return r.json(); })
+  .then(function (d) {
+    if (!d.ok) {
+      toast(d.error || 'Blad', 'err');
+      btn.disabled = other.disabled = false; btn.textContent = label; status.textContent = '';
+      return;
+    }
     document.getElementById('video-progress-wrap').style.display = 'block';
-    pollVideoGen(d.job_id, btn, status);
+    pollVideoGen(d.job_id, btn, other, status, label, quality, params);
   })
-  .catch(function(){ toast('Blad polaczenia', 'err'); btn.disabled=false; btn.textContent='🎬 GENERUJ WIDEO'; status.textContent=''; });
+  .catch(function () {
+    toast('Blad polaczenia', 'err');
+    btn.disabled = other.disabled = false; btn.textContent = label; status.textContent = '';
+  });
 }
 
-var WAN_VIDEO_EST_SECONDS = 380; // szacunek na podstawie zmierzonych testow (~6-6.5 min)
-function pollVideoGen(jid, btn, status) {
-  fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
+/* Szacunek czasu z dwóch pomiarów na RTX 3060 (640x640, 49 klatek, VAE na GPU):
+   4 kroki bez RIFE = 240 s, 8 kroków z RIFE = 400 s. Rozbite na stały narzut
+   (zwolnienie karty, załadowanie ~17 GB wag, encode klatki) i część zależną od kroków.
+   Pasek ma orientować, nie wróżyć. */
+var VIDEO_EST_FIXED_S = 110, VIDEO_EST_PER_STEP_S = 32,
+    VIDEO_EST_RIFE_S = 30, VIDEO_EST_BASE_PX = 640 * 640, VIDEO_EST_BASE_FRAMES = 49;
+function _videoEstSeconds(p) {
+  var scale = ((p.width * p.height) / VIDEO_EST_BASE_PX) * (p.length / VIDEO_EST_BASE_FRAMES);
+  var work  = (VIDEO_EST_PER_STEP_S * p.steps + (p.interpolate ? VIDEO_EST_RIFE_S : 0)) * scale;
+  return Math.max(90, Math.round(VIDEO_EST_FIXED_S + work));
+}
+
+function pollVideoGen(jid, btn, other, status, label, quality, params) {
+  var est = _videoEstSeconds(params);
+  fetch('/api/job/' + jid).then(function (r) { return r.json(); }).then(function (d) {
+    function reset() {
+      document.getElementById('video-progress-wrap').style.display = 'none';
+      btn.disabled = other.disabled = false; btn.textContent = label; status.textContent = '';
+    }
     if (d.status === 'generating' && d.progress && typeof d.progress.elapsed === 'number') {
       var el = d.progress.elapsed;
-      var pct = Math.min(95, Math.round(el / WAN_VIDEO_EST_SECONDS * 100));
+      var pct = Math.min(95, Math.round(el / est * 100));
       var mm = Math.floor(el / 60), ss = el % 60;
-      var phase = el < 60 ? 'Ladowanie modeli WAN 2.2...'
-                : el < 300 ? 'Generowanie klatek (sampling)...'
-                : 'Finalizacja / zapis wideo...';
+      var phase = el < 90  ? 'Zwalnianie karty i ładowanie modelu...'
+                : el < est * 0.85 ? 'Generowanie klatek...'
+                : 'Dekodowanie i zapis wideo...';
       document.getElementById('vid-prog-fill').style.width = pct + '%';
       document.getElementById('video-prog-pct').textContent = pct + '%';
       document.getElementById('video-prog-detail').textContent =
-        phase + '  (' + mm + ':' + (ss<10?'0':'') + ss + ')';
+        phase + '  (' + mm + ':' + (ss < 10 ? '0' : '') + ss + ' z ~' + Math.round(est / 60) + ' min)';
     }
     if (d.status === 'done') {
       document.getElementById('vid-prog-fill').style.width = '100%';
       document.getElementById('video-prog-pct').textContent = '100%';
-      document.getElementById('video-progress-wrap').style.display = 'none';
-      btn.disabled = false; btn.textContent = '🎬 GENERUJ WIDEO'; status.textContent = '';
-      var results = document.getElementById('video-results');
-      while (results.firstChild) results.removeChild(results.firstChild);
-      (d.images||[]).forEach(function(path){
-        var wrap = document.createElement('div'); wrap.style.cssText = 'position:relative;width:100%';
-        var vid = document.createElement('video');
-        vid.src = '/img/'+path; vid.controls = true; vid.autoplay = true; vid.loop = true;
-        vid.style.cssText = 'width:100%;border-radius:10px;border:1px solid var(--border)';
-        var dl = document.createElement('a');
-        dl.href = '/img/'+path; dl.download = path.split('/').pop();
-        dl.style.cssText = 'display:block;margin-top:6px;text-align:center;background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:5px 10px;border-radius:6px;font-size:.8rem;text-decoration:none';
-        dl.textContent = '⬇ Pobierz';
-        wrap.appendChild(vid); wrap.appendChild(dl); results.appendChild(wrap);
-      });
+      reset();
+      _vidLast = {seed: d.seed, quality: quality, params: params};
+      renderVideoResult(d.images || [], quality, d.seed);
+      loadHistory();
     } else if (d.status === 'error') {
-      document.getElementById('video-progress-wrap').style.display = 'none';
-      toast('Blad: '+(d.error||'nieznany'), 'err');
-      btn.disabled = false; btn.textContent = '🎬 GENERUJ WIDEO'; status.textContent = '';
+      reset();
+      toast('Blad: ' + (d.error || 'nieznany'), 'err');
     } else {
       status.textContent = 'Generowanie wideo...';
-      setTimeout(function(){ pollVideoGen(jid, btn, status); }, 3000);
+      setTimeout(function () { pollVideoGen(jid, btn, other, status, label, quality, params); }, 3000);
     }
+  });
+}
+
+function renderVideoResult(paths, quality, seed) {
+  var results = document.getElementById('video-results');
+  while (results.firstChild) results.removeChild(results.firstChild);
+
+  paths.forEach(function (path) {
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'position:relative;width:100%;max-width:620px';
+    var vid = document.createElement('video');
+    vid.src = '/img/' + encodeURI(path);
+    vid.controls = true; vid.autoplay = true; vid.loop = true; vid.muted = true;
+    vid.style.cssText = 'width:100%;border-radius:10px;border:1px solid var(--border)';
+    wrap.appendChild(vid);
+
+    var bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;gap:6px;margin-top:6px';
+
+    if (quality === 'draft') {
+      var fin = document.createElement('button');
+      fin.textContent = '🎬 Dokończ ten szkic (8 kroków, ten sam seed)';
+      fin.style.cssText = 'flex:2;background:linear-gradient(135deg,#7c3aed,#db2777);border:none;color:#fff;padding:8px;border-radius:8px;font-size:.82rem;font-weight:600;cursor:pointer';
+      fin.onclick = function () {
+        document.getElementById('video-seed').value = seed;
+        startVideoGen('final', seed);
+      };
+      bar.appendChild(fin);
+    }
+
+    var dl = document.createElement('a');
+    dl.href = '/img/' + encodeURI(path);
+    dl.download = path.split('/').pop();
+    dl.style.cssText = 'flex:1;text-align:center;background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:8px 10px;border-radius:8px;font-size:.82rem;text-decoration:none';
+    dl.textContent = '⬇ Pobierz';
+    bar.appendChild(dl);
+
+    wrap.appendChild(bar);
+
+    var meta = document.createElement('div');
+    meta.style.cssText = 'font-size:.7rem;color:var(--muted);margin-top:5px;text-align:center';
+    meta.textContent = (quality === 'draft' ? 'Szkic' : 'Finał') + ' · seed ' + seed;
+    wrap.appendChild(meta);
+
+    results.appendChild(wrap);
   });
 }
 
 /* ── Init ── */
 switchBackend(_backend);
+setVideoMode('wan_i2v');
 applyPreset('portrait');
 loadHistory();
 
