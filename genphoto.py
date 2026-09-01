@@ -349,8 +349,27 @@ def _stop_other_backends(backend):
         except Exception:
             pass
 
+def _comfy_free_memory(timeout=60):
+    """Poproś ComfyUI o wyrzucenie modeli z VRAM (endpoint /free).
+
+    Po zakończonym jobie ComfyUI trzyma wagi w pamięci karty pod kolejne żądanie. Przy
+    obrazach to zaleta, przy wideo — blokada: model Z-Image albo poprzedni ekspert WAN
+    zajmuje 5-7 GB, a nowy job potrzebuje 9,5 GB, więc samo zatrzymanie Forge i Krea 2
+    nie wystarcza. Odpowiedź nie jest JSON-em, więc nie używamy comfy_post."""
+    try:
+        req = urllib.request.Request(
+            f'{COMFY_URL}/free', data=json.dumps({'unload_models': True,
+                                                  'free_memory': True}).encode(),
+            headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status < 300
+    except Exception:
+        return False
+
+
 def _free_vram_for_video(need_mb, timeout_s=90):
-    """Zwolnij kartę pod job wideo: zatrzymaj konkurencyjne backendy i poczekaj na drenaż.
+    """Zwolnij kartę pod job wideo: wyrzuć modele z ComfyUI, zatrzymaj konkurencyjne
+    backendy, poczekaj na drenaż.
 
     Wideo zajmuje niemal całą kartę na kilkanaście minut, więc nie ma sensu, żeby
     konkurowało z Forge czy Krea 2 — a bez tego kroku job leciał w błąd "za mało VRAM"
@@ -359,6 +378,7 @@ def _free_vram_for_video(need_mb, timeout_s=90):
     nie kill — usługi mają Restart i wróciłyby po 10 s.
 
     Zwraca (ok, wolne_mb)."""
+    _comfy_free_memory()
     _stop_other_backends('wanvideo')
     deadline = time.time() + timeout_s
     free = None
