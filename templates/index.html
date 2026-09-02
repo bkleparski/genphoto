@@ -3319,16 +3319,32 @@ function pollVideoGen(jid, btn, other, status, label, quality, params) {
       btn.disabled = other.disabled = false; btn.textContent = label; status.textContent = '';
     }
     if (d.status === 'generating' && d.progress && typeof d.progress.elapsed === 'number') {
-      var el = d.progress.elapsed;
-      var pct = Math.min(95, Math.round(el / est * 100));
+      var pr = d.progress, el = pr.elapsed;
       var mm = Math.floor(el / 60), ss = el % 60;
-      var phase = el < 90  ? 'Zwalnianie karty i ładowanie modelu...'
-                : el < est * 0.85 ? 'Generowanie klatek...'
-                : 'Dekodowanie i zapis wideo...';
+      var clock = mm + ':' + (ss < 10 ? '0' : '') + ss;
+      var pct, phase, extra = '';
+
+      if (typeof pr.pct === 'number') {
+        /* Realny postęp z WebSocketa ComfyUI: procent liczony z wag wszystkich węzłów
+           grafu, nie z upływu czasu. Nazwa fazy mówi, co dzieje się teraz. */
+        pct = pr.pct;
+        phase = pr.phase || 'Generowanie...';
+        if (pr.step != null && pr.steps_total) extra = '  krok ' + pr.step + '/' + pr.steps_total;
+        var left = pct > 3 ? Math.round(el * (100 - pct) / pct) : null;
+        extra += left != null
+          ? '  ·  ' + clock + ', zostało ~' + Math.max(1, Math.round(left / 60)) + ' min'
+          : '  ·  ' + clock;
+      } else {
+        /* Fallback, gdy WebSocket nie odpowiada: szacunek z dwóch pomiarów. */
+        pct = Math.min(95, Math.round(el / est * 100));
+        phase = el < 90 ? 'Zwalnianie karty i ładowanie modelu...'
+              : el < est * 0.85 ? 'Generowanie klatek...'
+              : 'Dekodowanie i zapis wideo...';
+        extra = '  ·  ' + clock + ' z ~' + Math.round(est / 60) + ' min (szacunek)';
+      }
       document.getElementById('vid-prog-fill').style.width = pct + '%';
       document.getElementById('video-prog-pct').textContent = pct + '%';
-      document.getElementById('video-prog-detail').textContent =
-        phase + '  (' + mm + ':' + (ss < 10 ? '0' : '') + ss + ' z ~' + Math.round(est / 60) + ' min)';
+      document.getElementById('video-prog-detail').textContent = phase + extra;
     }
     if (d.status === 'done') {
       document.getElementById('vid-prog-fill').style.width = '100%';

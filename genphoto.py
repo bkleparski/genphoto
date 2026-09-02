@@ -367,8 +367,39 @@ def _comfy_free_memory(timeout=60):
         return False
 
 
-def _wait_vram(need_mb, timeout_s):
+def _comfy_held_vram_mb():
+    """Ile VRAM trzyma proces ComfyUI według nvidia-smi.
+
+    Dla jobów uruchamianych W ComfyUI ta pamięć jest efektywnie wolna: po `/free`
+    ComfyUI wyładowuje modele ze swojego rejestru, ale caching allocator PyTorcha
+    nie oddaje bloków systemowi — `nvidia-smi` nadal je widzi jako zajęte, a mimo to
+    ten sam proces użyje ich pod następny model. Bez tej korekty preflight odrzucał
+    job mający realnie dość pamięci ("3.9 GB wolne, wymagane 9.3 GB", gdy ComfyUI
+    trzymał 7,3 GB własnego cache'u).
+
+    Liczy się wyłącznie pod `_gpu_lock`, gdzie mamy pewność, że ComfyUI nic nie liczy."""
+    import subprocess as _sp
+    try:
+        pids = set(_sp.run(['pgrep', '-f', 'comfyui/main.py'], capture_output=True,
+                           text=True, timeout=5).stdout.split())
+        if not pids:
+            return 0
+        r = _sp.run(['nvidia-smi', '--query-compute-apps=pid,used_memory',
+                     '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=5)
+        total = 0
+        for line in r.stdout.strip().splitlines():
+            parts = [x.strip() for x in line.split(',')]
+            if len(parts) == 2 and parts[0] in pids:
+                total += int(parts[1])
+        return total
+    except Exception:
+        return 0
+
+
+def _wait_vram(need_mb, timeout_s, comfy_bonus=False):
     """Czekaj, aż wolny VRAM sięgnie progu. Zwraca (ok, wolne_mb).
+
+    comfy_bonus: dolicz pamięć trzymaną przez proces ComfyUI (patrz _comfy_held_vram_mb).
     Brak odczytu z nvidia-smi nie blokuje startu — wtedy (True, None)."""
     deadline = time.time() + timeout_s
     free = None
@@ -377,10 +408,11 @@ def _wait_vram(need_mb, timeout_s):
             free = _free_vram_mb()
         except Exception:
             return True, None
-        if free >= need_mb:
-            return True, free
+        effective = free + (_comfy_held_vram_mb() if comfy_bonus else 0)
+        if effective >= need_mb:
+            return True, effective
         if time.time() >= deadline:
-            return False, free
+            return False, effective
         time.sleep(3)
 
 
@@ -405,11 +437,16 @@ def _free_vram_for_backend(backend, need_mb):
         # tylko wydłużyłoby start o ponowne ładowanie.
         _comfy_free_memory()
 
+    # Backendy żyjące w ComfyUI odzyskują własny cache PyTorcha, więc liczy się on
+    # jako wolna pamięć. Forge i Krea 2 to osobne procesy — dla nich tylko to, co
+    # nvidia-smi realnie pokazuje jako wolne.
+    comfy_bonus = backend in ('zimage', 'wanvideo')
+
     if backend == 'wanvideo':
         _stop_other_backends('wanvideo')
-        ok, free = _wait_vram(need_mb, 90)
+        ok, free = _wait_vram(need_mb, 90, comfy_bonus)
     else:
-        ok, free = _wait_vram(need_mb, 30)
+        ok, free = _wait_vram(need_mb, 30, comfy_bonus)
 
     metric('vram_reclaim', backend=backend, ok=ok, free_mb=free, need_mb=need_mb)
     return free
@@ -1930,6 +1967,120 @@ def _video_frame_to_comfy(ref=None, b64=None):
     return comfy_upload_image(cand.read_bytes(), cand.name)
 
 
+# Fazy grafu wideo: (węzeł, etykieta dla użytkownika, udział w całości).
+# Wagi są normalizowane do węzłów faktycznie obecnych w grafie, więc ten sam zestaw
+# obsługuje T2V (bez kodowania klatki) i Finał z interpolacją.
+VIDEO_PHASES = (
+    ('clip_loader',   'Ładowanie enkodera tekstu',        0.04),
+    ('unet_high',     'Ładowanie modelu (high noise)',    0.08),
+    ('start_img',     'Wczytywanie klatki startowej',     0.01),
+    ('i2v',           'Kodowanie klatki startowej',       0.03),
+    ('flf',           'Kodowanie klatek brzegowych',      0.03),
+    ('sampler_high',  'Generowanie ruchu (ekspert high)', 0.32),
+    ('unet_low',      'Ładowanie modelu (low noise)',     0.05),
+    ('sampler_low',   'Dopracowanie detalu (ekspert low)', 0.32),
+    ('vae_decode',    'Dekodowanie klatek',               0.08),
+    ('rife',          'Wygładzanie do 32 fps',            0.05),
+    ('create_video',  'Składanie pliku wideo',            0.02),
+)
+
+
+class _VideoProgress:
+    """Stan postępu współdzielony między wątkiem WebSocket a pętlą joba."""
+    __slots__ = ('lock', 'pct', 'phase', 'step', 'steps_total', 'stop', 'live')
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pct = self.phase = self.step = self.steps_total = None
+        self.stop = False
+        self.live = False      # True dopiero, gdy WebSocket faktycznie coś przysłał
+
+    def snapshot(self):
+        with self.lock:
+            if not self.live:
+                return None
+            return {'pct': self.pct, 'phase': self.phase,
+                    'step': self.step, 'steps_total': self.steps_total}
+
+
+def _ws_progress_worker(client_id, prompt_id, state, graph_nodes):
+    """Czyta `progress_state` z WebSocketa ComfyUI i przelicza na jeden procent.
+
+    Do tej pory pasek zgadywał z upływu czasu, co przy 6-10 minutach na klip było
+    bezużyteczne. ComfyUI wysyła stan każdego węzła osobno (`{state, value, max}`),
+    więc wagi z VIDEO_PHASES scalają to w postęp całego grafu, a nie pojedynczego kroku.
+
+    Wątek jest daemonem i celowo cichy: każdy błąd kończy go bez ruszania joba, bo
+    pasek postępu nie może wywrócić generowania. Brak WebSocketa = fallback na czas."""
+    try:
+        import websocket
+    except Exception:
+        return
+    phases = [(k, lab, w) for k, lab, w in VIDEO_PHASES if k in graph_nodes]
+    total_w = sum(w for _, _, w in phases) or 1.0
+    ws_url = COMFY_URL.replace('https://', 'wss://').replace('http://', 'ws://')
+    try:
+        ws = websocket.WebSocket()
+        ws.connect(f'{ws_url}/ws?clientId={client_id}', timeout=10)
+        ws.settimeout(5)
+    except Exception:
+        return
+    try:
+        while not state.stop:
+            try:
+                msg = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                # Cisza między krokami samplera jest normalna — czekamy dalej.
+                # Łapane po typie, nie po treści: komunikat bywa pusty i wtedy
+                # wątek kończył się po pierwszych 5 s, zanim cokolwiek przyszło.
+                continue
+            except Exception:
+                break
+            if not isinstance(msg, str):
+                continue          # binarne ramki to podglądy obrazów — nieistotne
+            try:
+                d = json.loads(msg)
+            except Exception:
+                continue
+            data = d.get('data') or {}
+            if data.get('prompt_id') not in (None, prompt_id):
+                continue
+            mtype = d.get('type')
+            if mtype == 'progress_state':
+                nodes = data.get('nodes') or {}
+                done_w = cur_w = cur_frac = 0.0
+                cur_label = cur_val = cur_max = None
+                for key, label, w in phases:
+                    n = nodes.get(key)
+                    if not n:
+                        continue
+                    st = n.get('state')
+                    if st == 'finished':
+                        done_w += w
+                    elif st == 'running':
+                        cur_w, cur_label = w, label
+                        mx = n.get('max') or 0
+                        cur_val, cur_max = n.get('value'), mx
+                        cur_frac = (n.get('value') or 0) / mx if mx else 0.0
+                pct = int(min(99, (done_w + cur_w * cur_frac) / total_w * 100))
+                with state.lock:
+                    state.live = True
+                    state.pct = pct
+                    if cur_label:
+                        state.phase = cur_label
+                        state.step = int(cur_val) if cur_val is not None else None
+                        state.steps_total = int(cur_max) if cur_max else None
+            elif mtype == 'executing' and data.get('node') is None:
+                break             # ComfyUI sygnalizuje koniec pustym węzłem
+            elif mtype == 'execution_error':
+                break
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
 def wan_video_generate_thread(params, jid):
     """Generowanie wideo przez WAN 2.2 A14B (ComfyUI, port 8189).
 
@@ -1979,21 +2130,35 @@ def wan_video_generate_thread(params, jid):
             interpolate=bool(params.get('interpolate')),
         )
 
-        resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
+        # client_id musi trafić do /prompt, inaczej ComfyUI nie wyśle nam progress_state.
+        client_id = uuid.uuid4().hex
+        resp = comfy_post('/prompt', {'prompt': graph, 'client_id': client_id}, timeout=30)
         prompt_id = resp['prompt_id']
+
+        prog = _VideoProgress()
+        threading.Thread(target=_ws_progress_worker,
+                         args=(client_id, prompt_id, prog, set(graph.keys())),
+                         daemon=True).start()
 
         # Pierwsze uruchomienie laduje ~17GB modeli z dysku (Q4_K_S), a tryb Finał
         # (8 kroków, 720p) trwa dłużej niż dawne 4-krokowe 640x640 — stąd 30 min.
         t_start = time.time()
         deadline = t_start + 1800
         history = None
-        while time.time() < deadline:
-            job_set(jid, status='generating', progress={'elapsed': int(time.time() - t_start)})
-            h = comfy_get(f'/history/{prompt_id}', timeout=15)
-            if prompt_id in h and h[prompt_id].get('outputs'):
-                history = h[prompt_id]
-                break
-            time.sleep(3)
+        try:
+            while time.time() < deadline:
+                p = {'elapsed': int(time.time() - t_start)}
+                live = prog.snapshot()
+                if live:
+                    p.update(live)     # pct/phase/step z WebSocketa, gdy działa
+                job_set(jid, status='generating', progress=p)
+                h = comfy_get(f'/history/{prompt_id}', timeout=15)
+                if prompt_id in h and h[prompt_id].get('outputs'):
+                    history = h[prompt_id]
+                    break
+                time.sleep(3)
+        finally:
+            prog.stop = True
         if history is None:
             raise RuntimeError('Timeout oczekiwania na wygenerowanie wideo (WAN 2.2)')
 
