@@ -228,7 +228,11 @@ def job_get(jid):
 _gpu_lock  = threading.Lock()
 _gpu_wlock = threading.Lock()
 _gpu_waiters = 0             # liczba jobów oczekujących na mutex
-GPU_QUEUE_MAX_WAIT_S = 120   # timeout oczekiwania w kolejce
+# Timeout oczekiwania w kolejce. Było 120 s — dobrane pod obrazy (1-2 min). Od kiedy
+# jest wideo (Szkic 5 min, Finał 7-11 min), job czekający za klipem dostawał po dwóch
+# minutach "Przekroczono czas oczekiwania" mimo że nic złego się nie działo.
+# UI pokazuje status 'queued', więc użytkownik wie, że czeka, a nie że wisi.
+GPU_QUEUE_MAX_WAIT_S = 1200
 GPU_DRAIN_MAX_S      = 300   # ile czekac, az zawieszony job odda VRAM
 GPU_DRAIN_POLL_S     = 5     # co ile sprawdzac VRAM w trakcie drenazu
 GPU_QUEUE_MAX_DEPTH  = 1     # 1 job w toku + 1 w kolejce = "max 2"
@@ -246,7 +250,10 @@ GPU_WATCHDOG_S = {
 # Minimalny wolny VRAM (MB) przed startem joba.
 # "cold" = backend nie działa/nie trzyma modelu; "hot" = backend już jest w VRAM
 # (załadowany model nie musi alokować ponownie — wymóg dodatkowej pamięci niższy).
-VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 4500, 'zimage': 6500, 'wanvideo': 9500}
+# krea2 cold 7500, nie 4500: ładowanie checkpointu z kwantyzacją bnb kończy na ~7,2 GB
+# (pomiar z audytu 2026-08-27). Z 4500 preflight przepuszczał job, który padał w połowie
+# ładowania z torch.OutOfMemoryError — czytelny błąd na starcie jest lepszy niż OOM.
+VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 7500, 'zimage': 6500, 'wanvideo': 9500}
 VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000}
 
 # ── Metryki (ring buffer, endpoint /api/metrics) ─────────────────────────────
@@ -283,6 +290,22 @@ def _backend_health_url(backend, deep=False):
         # niż kończy się inicjalizacja nodów — bez tego health-check daje false-OK.
         return COMFY_URL + ('/object_info' if deep else '/system_stats')
     return None
+
+def _krea2_loaded_checkpoint(timeout=4):
+    """Który checkpoint Krea 2 trzyma w VRAM (None, gdy żaden albo brak odpowiedzi).
+
+    Krea 2 ładuje checkpoint dopiero przy pierwszym /generate i trzyma go między
+    żądaniami — ale po restarcie usługi (np. przez job wideo, który zatrzymuje
+    konkurentów) Flask odpowiada od razu, a modelu w VRAM nie ma. /health zwraca
+    `pipeline_loaded` i `pipeline_checkpoint`, więc nie trzeba zgadywać."""
+    try:
+        req = urllib.request.Request(KREA2_URL + '/health', headers={'User-Agent': _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            h = json.loads(r.read())
+        return h.get('pipeline_checkpoint') if h.get('pipeline_loaded') else None
+    except Exception:
+        return None
+
 
 def _backend_alive(backend, timeout=4):
     url = _backend_health_url(backend)
@@ -355,7 +378,13 @@ def _comfy_free_memory(timeout=60):
     Po zakończonym jobie ComfyUI trzyma wagi w pamięci karty pod kolejne żądanie. Przy
     obrazach to zaleta, przy wideo — blokada: model Z-Image albo poprzedni ekspert WAN
     zajmuje 5-7 GB, a nowy job potrzebuje 9,5 GB, więc samo zatrzymanie Forge i Krea 2
-    nie wystarcza. Odpowiedź nie jest JSON-em, więc nie używamy comfy_post."""
+    nie wystarcza.
+
+    UWAGA na opóźnienie: /free tylko ustawia flagę w kolejce. Pętla ComfyUI wyładowuje
+    modele od razu, ale torch.cuda.empty_cache() — czyli faktyczne oddanie pamięci innym
+    procesom — leci w cyklu GC co ~10 s. Zmierzone: t=6 s bez zmian, t=10 s pamięć
+    wolna. Kto mierzy wcześniej, wyciąga fałszywy wniosek, że /free nie działa.
+    Odpowiedź nie jest JSON-em, więc nie używamy comfy_post."""
     try:
         req = urllib.request.Request(
             f'{COMFY_URL}/free', data=json.dumps({'unload_models': True,
@@ -370,12 +399,14 @@ def _comfy_free_memory(timeout=60):
 def _comfy_held_vram_mb():
     """Ile VRAM trzyma proces ComfyUI według nvidia-smi.
 
-    Dla jobów uruchamianych W ComfyUI ta pamięć jest efektywnie wolna: po `/free`
-    ComfyUI wyładowuje modele ze swojego rejestru, ale caching allocator PyTorcha
-    nie oddaje bloków systemowi — `nvidia-smi` nadal je widzi jako zajęte, a mimo to
-    ten sam proces użyje ich pod następny model. Bez tej korekty preflight odrzucał
-    job mający realnie dość pamięci ("3.9 GB wolne, wymagane 9.3 GB", gdy ComfyUI
-    trzymał 7,3 GB własnego cache'u).
+    Dla jobów uruchamianych W ComfyUI ta pamięć jest efektywnie wolna: ComfyUI sam
+    zarządza swoimi modelami i przy ładowaniu nowego wyładuje stary (albo — gdy to ten
+    sam plik — użyje go bez ładowania). Doliczenie jej ma dwa skutki:
+
+    - job wideo/Z-Image nie jest odrzucany, gdy nvidia-smi widzi 3,9 GB wolnego,
+      a brakujące 7 GB trzyma sam ComfyUI;
+    - drugi klip z rzędu nie przechodzi przez /free, więc nie przeładowuje ~17 GB
+      wag od zera — model już siedzi na karcie.
 
     Liczy się wyłącznie pod `_gpu_lock`, gdzie mamy pewność, że ComfyUI nic nie liczy."""
     import subprocess as _sp
@@ -446,13 +477,15 @@ def _free_vram_for_backend(backend, need_mb):
         _stop_other_backends('wanvideo')
         ok, free = _wait_vram(need_mb, 90, comfy_bonus)
     else:
-        ok, free = _wait_vram(need_mb, 30, comfy_bonus)
+        # Forge i Krea 2 czekają na realne oddanie pamięci przez ComfyUI: pierwsze
+        # ~10 s to jego cykl GC, dopiero potem empty_cache. 45 s daje zapas.
+        ok, free = _wait_vram(need_mb, 45, comfy_bonus)
 
     metric('vram_reclaim', backend=backend, ok=ok, free_mb=free, need_mb=need_mb)
     return free
 
 
-def gpu_preflight(backend):
+def gpu_preflight(backend, params_model=None):
     """Warunki startu joba. Wywoływane W TRAKCIE trzymania _gpu_lock (atomowo
     ze startem). Zwraca None gdy OK, albo string z komunikatem błędu."""
     hot  = _backend_alive(backend)
@@ -462,11 +495,23 @@ def gpu_preflight(backend):
     # 8-gigabajtowemu modelowi przeciskać się warstwami obok krea-2 trzymającego 7 GB.
     if backend == 'wanvideo':
         hot = False
+    elif backend == 'krea2':
+        # Ten sam fałszywy sygnał zdrowia, co w wideo, tylko z drugiej strony: Flask
+        # żyje, a checkpointu w VRAM nie ma (po restarcie) albo jest inny niż żądany
+        # (przełączenie wariantu = pełne przeładowanie). Hot tylko, gdy /health
+        # potwierdza dokładnie ten checkpoint.
+        wanted = (params_model or '').removeprefix('krea2_') or None
+        loaded = _krea2_loaded_checkpoint()
+        hot = bool(loaded) and (wanted is None or loaded == wanted)
     need = (VRAM_NEED_HOT_MB if hot else VRAM_NEED_COLD_MB).get(backend, 4000)
     try:
         free = _free_vram_mb()
     except Exception:
         free = None
+    # Backendy żyjące w ComfyUI liczą jego własny cache jako dostępny już tutaj —
+    # dzięki temu drugi klip z rzędu nie wyrzuca załadowanego modelu przez /free.
+    if free is not None and backend in ('zimage', 'wanvideo'):
+        free += _comfy_held_vram_mb()
     if free is not None and free < need:
         free = _free_vram_for_backend(backend, need)
     if free is not None and free < need:
@@ -544,7 +589,7 @@ def gpu_run(kind, backend, target, params, jid):
     try:
         if params.get('stop_other_backends'):
             _stop_other_backends(backend)
-        err = gpu_preflight(backend)
+        err = gpu_preflight(backend, params.get('model'))
         if err:
             job_set(jid, status='error', error=err)
             metric('preflight_fail', backend=backend)

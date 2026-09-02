@@ -3357,7 +3357,11 @@ function pollVideoGen(jid, btn, other, status, label, quality, params) {
       reset();
       toast('Blad: ' + (d.error || 'nieznany'), 'err');
     } else {
-      status.textContent = 'Generowanie wideo...';
+      /* 'queued' = czeka na mutex GPU za innym zadaniem (np. Finał kliknięty podczas szkicu).
+         Bez tego komunikatu wyglądało to jak zawieszenie. */
+      status.textContent = (d.status === 'queued')
+        ? 'W kolejce - start, gdy karta skończy poprzednie zadanie...'
+        : 'Generowanie wideo...';
       setTimeout(function () { pollVideoGen(jid, btn, other, status, label, quality, params); }, 3000);
     }
   });
