@@ -367,32 +367,52 @@ def _comfy_free_memory(timeout=60):
         return False
 
 
-def _free_vram_for_video(need_mb, timeout_s=90):
-    """Zwolnij kartę pod job wideo: wyrzuć modele z ComfyUI, zatrzymaj konkurencyjne
-    backendy, poczekaj na drenaż.
-
-    Wideo zajmuje niemal całą kartę na kilkanaście minut, więc nie ma sensu, żeby
-    konkurowało z Forge czy Krea 2 — a bez tego kroku job leciał w błąd "za mało VRAM"
-    i kazał użytkownikowi ręcznie klikać ZWOLNIJ (w spoczynku samo krea-2 trzyma ~7 GB
-    z 12, więc trafiało to praktycznie w każdą próbę). Zatrzymanie idzie przez systemd,
-    nie kill — usługi mają Restart i wróciłyby po 10 s.
-
-    Zwraca (ok, wolne_mb)."""
-    _comfy_free_memory()
-    _stop_other_backends('wanvideo')
+def _wait_vram(need_mb, timeout_s):
+    """Czekaj, aż wolny VRAM sięgnie progu. Zwraca (ok, wolne_mb).
+    Brak odczytu z nvidia-smi nie blokuje startu — wtedy (True, None)."""
     deadline = time.time() + timeout_s
     free = None
-    while time.time() < deadline:
+    while True:
         try:
             free = _free_vram_mb()
         except Exception:
-            return True, None      # bez odczytu VRAM nie blokujemy startu
+            return True, None
         if free >= need_mb:
-            metric('video_vram_freed', free_mb=free, need_mb=need_mb)
             return True, free
+        if time.time() >= deadline:
+            return False, free
         time.sleep(3)
-    metric('video_vram_drain_timeout', free_mb=free, need_mb=need_mb)
-    return False, free
+
+
+def _free_vram_for_backend(backend, need_mb):
+    """Spróbuj zwolnić kartę pod job, zamiast od razu odsyłać użytkownika do przycisku
+    ZWOLNIJ. Zwraca wolny VRAM po próbie (albo None, gdy nie da się odczytać).
+
+    Dwie strategie, bo backendy mają różne apetyty:
+
+    - **wideo** zajmuje niemal całą kartę na kilkanaście minut, więc nie ma sensu, żeby
+      konkurowało z Forge i Krea 2 — zatrzymujemy je przez systemd (nie kill: usługi mają
+      Restart i wróciłyby po 10 s) i czekamy na drenaż.
+    - **obrazy** (Forge, Krea 2, Z-Image) normalnie współistnieją, więc niczego nie
+      zatrzymujemy. Wystarczy, że ComfyUI odda wagi trzymane w zapasie po swoim ostatnim
+      jobie — po klipie wideo to 5-6 GB, przez które Krea 2 nie miał gdzie dokwantować
+      checkpointu i padał z `torch.OutOfMemoryError` w bitsandbytes.
+
+    W obu przypadkach zaczynamy od `/free` na ComfyUI: to najtańsze źródło pamięci na tej
+    karcie, bo ComfyUI przeładuje wagi sam, gdy znów będą potrzebne."""
+    if backend != 'zimage':
+        # Z-Image jest sam w ComfyUI — wyrzucanie jego wag tuż przed jego własnym jobem
+        # tylko wydłużyłoby start o ponowne ładowanie.
+        _comfy_free_memory()
+
+    if backend == 'wanvideo':
+        _stop_other_backends('wanvideo')
+        ok, free = _wait_vram(need_mb, 90)
+    else:
+        ok, free = _wait_vram(need_mb, 30)
+
+    metric('vram_reclaim', backend=backend, ok=ok, free_mb=free, need_mb=need_mb)
+    return free
 
 
 def gpu_preflight(backend):
@@ -410,8 +430,8 @@ def gpu_preflight(backend):
         free = _free_vram_mb()
     except Exception:
         free = None
-    if backend == 'wanvideo' and free is not None and free < need:
-        _, free = _free_vram_for_video(need)
+    if free is not None and free < need:
+        free = _free_vram_for_backend(backend, need)
     if free is not None and free < need:
         return (f'Za mało wolnego VRAM: {free/1024:.1f} GB wolne, '
                 f'wymagane ~{need/1024:.1f} GB. '

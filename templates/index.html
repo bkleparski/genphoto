@@ -1122,8 +1122,12 @@ select{resize:none;cursor:pointer}
     </button>
   </div>
   <div style="font-size:.7rem;color:var(--muted);margin-top:5px;line-height:1.45">
-    Szkic i Finał mają ten sam format, długość i seed &#8212; różni je liczba kroków (4 kontra 8).
-    Dlatego szkic pokazuje realnie ten sam ruch, tylko mniej ostry. Finał dokłada też interpolację RIFE (16 &#8594; 32 fps). Szkic ok. 4 min, Finał ok. 8-10 min.
+    Szkic i Finał mają ten sam kadr, format, długość i seed &#8212; różni je liczba kroków (4 kontra 8)
+    i interpolacja RIFE (16 &#8594; 32 fps), którą dokłada tylko Finał.
+    Szkic pokazuje kompozycję, styl i charakter ruchu; <b>dokładny przebieg klatka po klatce
+    będzie się różnił</b>, bo inna liczba kroków to inna trajektoria denoisingu.
+    Zmierzone na 640&times;640 / 49 klatek: Szkic ok. 5 min, Finał ok. 6,5 min &#8212; różnica jest
+    mniejsza, niż się wydaje, więc gdy prompt ruchu już działa, opłaca się iść od razu na Finał.
   </div>
 
   <div id="video-status" style="margin-top:8px;font-size:.85rem;color:var(--muted);text-align:center"></div>
@@ -3361,7 +3365,7 @@ function renderVideoResult(paths, quality, seed) {
 
     if (quality === 'draft') {
       var fin = document.createElement('button');
-      fin.textContent = '🎬 Dokończ ten szkic (8 kroków, ten sam seed)';
+      fin.textContent = '🎬 Powtórz w Finale (8 kroków, ten sam seed i kadr)';
       fin.style.cssText = 'flex:2;background:linear-gradient(135deg,#7c3aed,#db2777);border:none;color:#fff;padding:8px;border-radius:8px;font-size:.82rem;font-weight:600;cursor:pointer';
       fin.onclick = function () {
         document.getElementById('video-seed').value = seed;
