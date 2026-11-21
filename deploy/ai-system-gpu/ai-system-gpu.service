@@ -1,0 +1,15 @@
+[Unit]
+Description=Coordinate AI System GPU turns
+After=network-online.target ollama.service ollama-embed-hot.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/ai-system-gpu/gpu.py
+ExecStopPost=/usr/bin/python3 /opt/ai-system-gpu/gpu.py --restore
+StateDirectory=ai-system-gpu
+RuntimeDirectory=ai-system-gpu
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=4
+
+[Install]
+WantedBy=multi-user.target

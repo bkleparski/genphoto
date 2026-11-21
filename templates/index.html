@@ -297,7 +297,7 @@ select{resize:none;cursor:pointer}
       <canvas class="vram-canvas" id="vram-canvas" width="80" height="28"></canvas>
       <div class="vram-info">
         <span class="vram-nums" id="vram-nums">-- / --</span>
-        <span class="vram-label">GB zajęte / wolne</span>
+        <span class="vram-label" id="vram-label">GB zajęte / wolne</span>
       </div>
       <button class="vram-free-btn" id="vram-free-btn" onclick="vramFree()">ZWOLNIJ</button>
     </div>
@@ -458,19 +458,8 @@ select{resize:none;cursor:pointer}
         <button id="backend-zimage" class="backend-btn" onclick="switchBackend('zimage')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#127916; Z-Image</button>
         <button id="backend-flux" class="backend-btn" onclick="switchBackend('flux')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#128248; FLUX</button>
       </div>
-      <div style="display:flex;gap:8px;margin-top:6px">
-        <div style="flex:1;display:flex;gap:4px">
-          <button onclick="serviceControl('forge','start')" title="Uruchom Forge" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
-          <button onclick="serviceControl('forge','stop')" title="Zatrzymaj Forge (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
-        </div>
-        <div style="flex:1;display:flex;gap:4px">
-          <button onclick="serviceControl('krea2','start')" title="Uruchom Krea 2" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
-          <button onclick="serviceControl('krea2','stop')" title="Zatrzymaj Krea 2 (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
-        </div>
-        <div style="flex:1;display:flex;gap:4px">
-          <button onclick="serviceControl('comfyui','start')" title="Uruchom Z-Image / ComfyUI" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#86efac;cursor:pointer;font-size:.72rem">&#9654;</button>
-          <button onclick="serviceControl('comfyui','stop')" title="Zatrzymaj Z-Image / ComfyUI (zwalnia cały VRAM)" style="flex:1;padding:5px 4px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:#fca5a5;cursor:pointer;font-size:.72rem">&#9632;</button>
-        </div>
+      <div id="gpu-coord-bar" style="margin-top:6px;padding:6px 10px;border-radius:8px;background:#0f172a;border:1px solid #1e3a5f;font-size:.73rem;color:#94a3b8;display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span id="gpu-coord-text">&#9889; Koordynator GPU: auto start/stop po kliknięciu GENERUJ (powrót embeddingu po grupie)</span>
       </div>
     </div>
     <div class="field forge-lora-only" id="forge-lora-section" style="display:none">
@@ -533,11 +522,7 @@ select{resize:none;cursor:pointer}
         <input type="checkbox" id="krea-variants-check" style="width:auto;margin:0">
         Krea 2: generuj ze wszystkich wariantów (Moody → GPT → Krealism → RedCraft, po 2 zdjęcia)
       </label>
-      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:.82rem;cursor:pointer"
-             title="Przed generacją zatrzyma pozostałe backendy (Forge/Krea2/ComfyUI) — zwalnia VRAM dla ciężkich jobów, ale ich późniejszy restart potrwa ~30-90s">
-        <input type="checkbox" id="stop-backends-check" style="width:auto;margin:0">
-        zatrzymaj inne backendy przed generacją (ciężki job)
-      </label>
+      <div id="model-unavail-banner" style="display:none;background:#451a03;border:1px solid #d97706;border-radius:8px;padding:8px 12px;font-size:.8rem;color:#fcd34d;margin-top:8px"></div>
     </div>
     <div class="row2">
       <div class="field krea2-hide">
@@ -624,7 +609,13 @@ select{resize:none;cursor:pointer}
   </div>
   <div id="progress-wrap">
     <div id="batch-progress-label" style="display:none;font-size:.8rem;color:#93c5fd;margin-bottom:4px"></div>
-    <div class="progress-label"><span id="prog-label">Generowanie...</span><span id="prog-pct"></span></div>
+    <div class="progress-label">
+      <span id="prog-label">Generowanie...</span>
+      <span style="display:flex;align-items:center;gap:8px">
+        <span id="prog-pct"></span>
+        <button id="gen-cancel-btn" onclick="cancelActiveJob()" style="display:none;background:#7f1d1d;border:1px solid #991b1b;color:#fca5a5;padding:2px 8px;border-radius:5px;font-size:.7rem;cursor:pointer">&#9632; Anuluj</button>
+      </span>
+    </div>
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog-fill"></div></div>
   </div>
   <div id="img-grid"></div>
@@ -1204,6 +1195,7 @@ select{resize:none;cursor:pointer}
 
 <script>
 var PRESETS = __PRESETS_JSON__;
+var MODELS_CATALOG = __MODELS_JSON__;
 var GALLERY_URL = '__GALLERY_URL__';
 var _refImageB64 = null;
 var _curPreset = null;
@@ -1211,38 +1203,66 @@ var _lbImgs = [], _lbIdx = 0;
 var _pollTimer = null;
 var _histOpen = false;
 var _backend = 'forge';
+var _activeJobId = null;
+var _modelsCache = Array.isArray(MODELS_CATALOG) ? MODELS_CATALOG.slice() : [];
+
+function _findModel(name) {
+  return _modelsCache.find(function(m){ return (m.name || m.title) === name; }) || null;
+}
+
+function _updateModelAvailBanner(val) {
+  var banner = document.getElementById('model-unavail-banner');
+  if (!banner) return;
+  var m = _findModel(val);
+  if (m && m.available === false) {
+    banner.textContent = '⚠ Model niedostępny: ' + (m.reason || 'brak plików na dysku');
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
 function switchBackend(b, desiredModel) {
   _backend = b;
   document.querySelectorAll('.backend-btn').forEach(function(el) { el.classList.remove('active'); });
   var btn = document.getElementById('backend-' + b);
   if (btn) btn.classList.add('active');
-  // Sampler + scheduler hidden in Krea 2 / Z-Image mode (fixed sampler internally)
+  // Sampler + scheduler hidden in Krea 2 / Z-Image / FLUX mode (fixed sampler internally)
   document.querySelectorAll('.krea2-hide').forEach(function(el) {
     el.style.display = (b === 'krea2' || b === 'zimage' || b === 'flux') ? 'none' : '';
   });
-  fetch('/api/models').then(function(r){return r.json();}).then(function(models){
-    _applyOrderToSelect(models);
-    var sel = document.getElementById('model-sel');
-    if (!sel) return;
-    // Jesli wywolujacy zna konkretny docelowy model (preset albo reczny wybor
-    // w dropdownie) — uzyj go. W przeciwnym razie dopiero zgadnij pierwszy
-    // pasujacy (np. przy pierwszym wejsciu na dana zakladke backendu).
+
+  var sel = document.getElementById('model-sel');
+  if (sel) {
+    if (!sel.options.length && _modelsCache.length) {
+      _applyOrderToSelect(_modelsCache);
+    }
+    var picked = false;
     if (desiredModel) {
-      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === desiredModel) { sel.selectedIndex = i; return; } }
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === desiredModel) { sel.selectedIndex = i; picked = true; break; }
+      }
     }
-    if (b === 'zimage') {
-      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'zimage_turbo') { sel.selectedIndex = i; break; } }
-    } else if (b === 'flux') {
-      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'flux1_krea_dev') { sel.selectedIndex = i; break; } }
-    } else if (b === 'krea2') {
-      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value.indexOf('krea2_') === 0) { sel.selectedIndex = i; break; } }
+    if (!picked) {
+      var curInfo = _findModel(sel.value);
+      if (!curInfo || curInfo.backend !== b) {
+        var first = _modelsCache.find(function(m){ return m.backend === b && m.available !== false; })
+                 || _modelsCache.find(function(m){ return m.backend === b; });
+        if (first) {
+          for (var j = 0; j < sel.options.length; j++) {
+            if (sel.options[j].value === first.name) { sel.selectedIndex = j; break; }
+          }
+        }
+      }
     }
-  });
+    _updateModelAvailBanner(sel.value);
+  }
+
   document.querySelectorAll('.zimage-only').forEach(function(el) {
     el.style.display = (b === 'zimage') ? '' : 'none';
   });
   document.querySelectorAll('.flux-only').forEach(function(el) {
-    el.style.display = (b === 'flux') ? '' : 'none';
+    el.style.display = (b === 'flux' && (!sel || sel.value !== 'flux_moss_sft')) ? '' : 'none';
   });
   document.querySelectorAll('.comfy-lora-only').forEach(function(el) {
     el.style.display = (b === 'zimage' || b === 'flux') ? '' : 'none';
@@ -1252,6 +1272,7 @@ function switchBackend(b, desiredModel) {
   });
   if (b === 'zimage' || b === 'flux') loadLoraList();
   if (b === 'forge') loadForgeLoraList();
+  updateParamsBar();
 }
 
 /* ── Presets ── */
@@ -1305,7 +1326,6 @@ function _sortByOrder(models) {
   Object.values(map).forEach(function(m){ sorted.push(m); });
   return sorted;
 }
-var _modelsCache = [];
 function _applyOrderToSelect(models) {
   _modelsCache = models;
   var sel = document.getElementById('model-sel');
@@ -1314,7 +1334,8 @@ function _applyOrderToSelect(models) {
   var sorted = _sortByOrder(models);
   sel.innerHTML = sorted.map(function(m){
     var v = m.name || m.title || '';
-    return '<option value="' + v + '"' + (v===cur?' selected':'') + '>' + v + '</option>';
+    var lbl = m.available === false ? (v + ' (brak plików)') : v;
+    return '<option value="' + escHtml(v) + '"' + (v===cur?' selected':'') + '>' + escHtml(lbl) + '</option>';
   }).join('');
 }
 
@@ -1631,7 +1652,8 @@ function markCustom() {
 
 function updateParamsBar() {
   var model   = document.getElementById('model-sel');
-  var modelTxt = model ? model.options[model.selectedIndex].text : '—';
+  var modelTxt = (model && model.selectedIndex >= 0 && model.options[model.selectedIndex])
+    ? model.options[model.selectedIndex].text : '—';
   document.getElementById('pb-model').textContent   = modelTxt;
   document.getElementById('pb-sampler').textContent = document.getElementById('sampler-sel').value;
   document.getElementById('pb-steps').textContent   = document.getElementById('steps-in').value;
@@ -1901,27 +1923,18 @@ function toggleAllModels() {
 }
 
 function onModelChange(val) {
-  var vl = val.toLowerCase();
-  // Przelaczaj backend TYLKO gdy faktycznie sie zmienia — w przeciwnym razie
-  // switchBackend() odpala async refetch listy modeli, ktorego callback
-  // nadpisuje reczny/presetowy wybor (wybiera 'pierwszy z brzegu' krea2_*).
-  if (vl.startsWith('krea2_')) {
-    if (_backend !== 'krea2') switchBackend('krea2', val);
-  }
-  else if (vl.startsWith('zimage')) {
-    if (_backend !== 'zimage') switchBackend('zimage', val);
-  }
-  else if (vl.indexOf('flux1_') === 0 || vl.indexOf('flux2_') === 0 || vl === 'flux_moss_sft') {
-    if (_backend !== 'flux') switchBackend('flux', val);
-  }
-  else if (_backend === 'krea2' || _backend === 'zimage' || _backend === 'flux') switchBackend('forge');
+  var vl = (val || '').toLowerCase();
+  var modelInfo = _findModel(val);
+  var targetBackend = (modelInfo && modelInfo.backend) ? modelInfo.backend
+    : (vl.startsWith('krea2_') ? 'krea2'
+    : (vl.startsWith('zimage') ? 'zimage'
+    : ((vl.indexOf('flux1_') === 0 || vl.indexOf('flux2_') === 0 || vl === 'flux_moss_sft') ? 'flux' : 'forge')));
+  if (_backend !== targetBackend) switchBackend(targetBackend, val);
+  _updateModelAvailBanner(val);
 
-  // Flux wykrywany po prawdziwej zawartości pliku (backend, is_flux), nie po nazwie —
-  // nazwy modeli bywają mylące (np. "gonzalomoXLFluxPony" to zwykły SDXL).
-  var modelInfo = _modelsCache.find(function(m){ return (m.name || m.title) === val; });
-  var isFlux = val !== 'flux_moss_sft' && ((modelInfo && modelInfo.is_flux) || val.toLowerCase().indexOf('krea') !== -1);
+  var isFlux = val !== 'flux_moss_sft' && ((modelInfo && modelInfo.is_flux) || vl.indexOf('krea') !== -1);
   var fluxInfo = document.getElementById('flux-info');
-  if (fluxInfo && val === 'flux_moss_sft') fluxInfo.style.display = 'none';
+  if (fluxInfo) fluxInfo.style.display = (_backend === 'flux' && val !== 'flux_moss_sft') ? '' : 'none';
   var fluxBanner = document.getElementById('flux-banner');
   if (isFlux) {
     if (!fluxBanner) {
@@ -1962,12 +1975,30 @@ function swapWH() {
   markCustom();
 }
 
+function cancelActiveJob() {
+  if (!_activeJobId) return;
+  var btn = document.getElementById('gen-cancel-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Anulowanie...'; }
+  fetch('/api/job/' + _activeJobId + '/cancel', {method: 'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ toast(d.msg || 'Przerywanie zadania...', d.ok ? 'info' : 'err'); })
+    .catch(function(){ toast('Błąd anulowania', 'err'); });
+}
+
 /* ── Generate ── */
 function startGenerate() {
   var pos = document.getElementById('positive-ta').value.trim();
   if(!pos) return toast('Wpisz positive prompt lub użyj AI Prompt', 'err');
   var p = _curPreset ? PRESETS.find(function(x){return x.id===_curPreset;}) : null;
   var modelVal = document.getElementById('model-sel').value;
+  var allModels = document.getElementById('all-models-check').checked;
+  var kreaAllVar = document.getElementById('krea-variants-check') && document.getElementById('krea-variants-check').checked;
+  if (!allModels && !kreaAllVar) {
+    var mInfo = _findModel(modelVal);
+    if (mInfo && mInfo.available === false) {
+      return toast('Model niedostępny: ' + (mInfo.reason || 'brak plików na dysku'), 'err');
+    }
+  }
   var triggers = getModelTriggers(modelVal);
   var modelPrefix = triggers ? triggers.positive_prefix : '';
   var presetPrefix = p ? p.prefix : '';
@@ -1995,16 +2026,11 @@ function startGenerate() {
     params.adetailer_prompt  = document.getElementById('ad-prompt-in').value.trim();
     params.adetailer_denoise = parseFloat(document.getElementById('ad-denoise-in').value);
   }
-  if (document.getElementById('all-models-check').checked) {
+  if (allModels) {
     params.all_models = true;
   }
-  var _kreaVar = document.getElementById('krea-variants-check');
-  if (_kreaVar && _kreaVar.checked) {
+  if (kreaAllVar) {
     params.krea_all_variants = true;
-  }
-  var _stopBk = document.getElementById('stop-backends-check');
-  if (_stopBk && _stopBk.checked) {
-    params.stop_other_backends = true;
   }
   if (_backend === 'zimage') {
     params.loras = getSelectedLoras();
@@ -2015,7 +2041,6 @@ function startGenerate() {
     params.loras = getSelectedForgeLoras();
   }
   if (_backend === 'flux') {
-    // Backend FLUX rozroznia modele po wartosci z dropdownu, nie po nazwie pliku.
     params.model = document.getElementById('model-sel').value;
     params.loras = getSelectedLoras();
   }
@@ -2025,37 +2050,72 @@ function startGenerate() {
     params.batch      = 1;
   }
   document.getElementById('gen-btn').disabled = true;
-  document.getElementById('gen-btn').textContent = 'Generowanie...';
+  document.getElementById('gen-btn').textContent = 'Przygotowanie GPU...';
   showProgress(true);
   fetch('/api/generate', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify(params)
   }).then(function(r){return r.json();}).then(function(d){
-    if(d.job_id) pollJob(d.job_id, 0);
-    else { resetBtn(); toast('Błąd: '+d.error, 'err'); showProgress(false); }
+    if(d.job_id) {
+      _activeJobId = d.job_id;
+      var cb = document.getElementById('gen-cancel-btn');
+      if (cb) { cb.style.display = ''; cb.disabled = false; cb.textContent = '■ Anuluj'; }
+      pollJob(d.job_id, 0);
+    } else { resetBtn(); toast('Błąd: '+d.error, 'err'); showProgress(false); }
   }).catch(function(){resetBtn(); toast('Błąd połączenia', 'err'); showProgress(false);});
 }
 
+var PHASE_PCT = {
+  queued: 4,
+  waiting_for_lease: 8,
+  unloading_embedding: 12,
+  starting_backend: 20,
+  generating: 30,
+  stopping_backend: 92,
+  restoring_embedding: 96
+};
+
 function pollJob(jid, tick) {
   fetch('/api/job/'+jid).then(function(r){return r.json();}).then(function(d){
-    if (d.progress) {
+    var lbl = document.getElementById('prog-label');
+    var fill = document.getElementById('prog-fill');
+    if (lbl && d.phase_label) lbl.textContent = d.phase_label;
+
+    if (d.progress && d.progress.total) {
       var bl = document.getElementById('batch-progress-label');
       bl.style.display = 'block';
-      bl.textContent = 'Model ' + d.progress.current + '/' + d.progress.total + ': ' + d.progress.model +
+      bl.textContent = 'Element ' + d.progress.current + '/' + d.progress.total + ': ' + (d.progress.model || '') +
         (d.progress.error ? ' (błąd, pomijam)' : '');
+      if (d.phase === 'generating' && fill) {
+        var bpct = 25 + Math.round(((d.progress.current - 1) / d.progress.total) * 65);
+        fill.style.width = Math.max(25, bpct) + '%';
+      }
     }
-    if(d.status === 'done') {
+
+    if (d.phase === 'generating' && d.backend === 'forge') {
+      if (!_fpTimer) startForgeProgress('prog-fill', 'prog-pct');
+    } else {
       stopForgeProgress();
-      document.getElementById('prog-fill').style.width='100%';
+      if (fill && PHASE_PCT[d.phase]) fill.style.width = PHASE_PCT[d.phase] + '%';
+    }
+
+    if(d.status === 'done') {
+      _activeJobId = null;
+      stopForgeProgress();
+      fill.style.width='100%';
       document.getElementById('prog-pct').textContent='';
       document.getElementById('batch-progress-label').style.display = 'none';
       if (d.error) toast('Część modeli zwróciła błąd: ' + d.error, 'err');
-      setTimeout(function(){showProgress(false); showImages(d.images, d.seed); resetBtn(); loadHistory();}, 400);
-    } else if(d.status === 'error') {
+      setTimeout(function(){showProgress(false); showImages(d.images, d.seed); resetBtn(); loadHistory();}, 350);
+    } else if(d.status === 'error' || d.status === 'cancelled') {
+      _activeJobId = null;
       stopForgeProgress();
       document.getElementById('batch-progress-label').style.display = 'none';
-      showProgress(false); resetBtn(); toast('Błąd: '+d.error, 'err');
+      showProgress(false); resetBtn();
+      if (d.images && d.images.length) showImages(d.images, d.seed);
+      toast((d.status === 'cancelled' ? 'Anulowano: ' : 'Błąd: ') + (d.error || d.status), d.status === 'cancelled' ? 'info' : 'err');
+      loadHistory();
     } else {
       _pollTimer = setTimeout(function(){pollJob(jid, tick+1);}, 2000);
     }
@@ -2066,14 +2126,15 @@ function pollJob(jid, tick) {
 
 function showProgress(on) {
   document.getElementById('progress-wrap').style.display = on ? 'block' : 'none';
+  var cb = document.getElementById('gen-cancel-btn');
   if(on) {
     document.getElementById('prog-fill').style.width='5%';
-    document.getElementById('prog-label').textContent='Generowanie...';
+    document.getElementById('prog-label').textContent='Przygotowanie GPU...';
     document.getElementById('prog-pct').textContent='';
-    startForgeProgress('prog-fill', 'prog-pct');
   } else {
     stopForgeProgress();
     document.getElementById('prog-pct').textContent='';
+    if (cb) cb.style.display = 'none';
   }
 }
 
@@ -2477,6 +2538,18 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
         nums.textContent = used.toFixed(1) + ' / ' + free.toFixed(1);
         nums.style.color = pct >= 0.95 ? '#ef4444' : pct >= 0.80 ? '#f59e0b' : '#93c5fd';
       }
+      var vlbl = document.getElementById('vram-label');
+      var coordTxt = document.getElementById('gpu-coord-text');
+      if (d.coordinator_ok) {
+        var stateTxt = d.coordinator_busy
+          ? ('GPU: ' + (d.coordinator_owner || 'zajęte'))
+          : (d.embedding_loaded ? 'Embedding aktywny' : 'GPU wolne');
+        if (vlbl) vlbl.textContent = 'GB · ' + stateTxt;
+        if (coordTxt) {
+          var act = (d.active_backends && d.active_backends.length) ? (' · aktywne: ' + d.active_backends.join(', ')) : ' · backendy uśpione';
+          coordTxt.textContent = '⚡ Koordynator GPU: ' + stateTxt + act;
+        }
+      }
     }).catch(function(){
       var nums = document.getElementById('vram-nums');
       if (nums) { nums.textContent = 'brak laczn.'; nums.style.color = '#ef4444'; }
@@ -2485,35 +2558,19 @@ function stopForgeProgress() { clearTimeout(_fpTimer); _fpTimer = null; }
   }
 
   window.vramFree = function() {
-    if (!confirm('Restart WSZYSTKICH backendów GPU (Forge, Krea2, ComfyUI) — przerwa ~60-90s. Kontynuować?')) return;
+    if (!confirm('Zatrzymać ewentualne pozostałe backendy GPU i przywrócić model embeddingu?')) return;
     var btn = document.getElementById('vram-free-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Restart...'; }
-    var nums = document.getElementById('vram-nums');
+    if (btn) { btn.disabled = true; btn.textContent = 'Czyszczenie...'; }
     fetch('/api/vram-free', {method:'POST'}).then(function(r){ return r.json(); }).then(function(d) {
+      if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
       if (!d.ok) {
-        if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
-        toast('Błąd: ' + (d.error || '?'), 'error');
+        toast(d.error || 'Błąd zwalniania GPU', 'err');
         return;
       }
-      toast('Backendy restartują — pełna gotowość za ~60-90s', 'info');
-      // polling aż VRAM się zwolni
-      var tries = 0;
-      (function waitForge(){
-        setTimeout(function(){
-          tries++;
-          fetch('/api/vram').then(function(r){ return r.json(); }).then(function(v){
-            if (v.ok) {
-              if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
-              toast('VRAM zwolniony: ' + v.free_gb + ' GB wolne · backendy wstają', 'success');
-            } else if (tries < 30) { waitForge(); }
-            else {
-              if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
-            }
-          }).catch(function(){ if (tries < 30) waitForge(); else { if(btn){btn.disabled=false;btn.textContent='ZWOLNIJ';} } });
-        }, 3000);
-      })();
+      toast(d.msg || 'GPU wyczyszczone, embedding przywrócony', 'ok');
     }).catch(function() {
       if (btn) { btn.disabled = false; btn.textContent = 'ZWOLNIJ'; }
+      toast('Błąd połączenia', 'err');
     });
   };
 
@@ -2675,15 +2732,15 @@ function pollPortrait(jid, btn, status) {
         wrap.appendChild(dl);
         results.appendChild(wrap);
       });
-    } else if (d.status === 'error') {
-      toast('Błąd: '+d.error, 'err');
+    } else if (d.status === 'error' || d.status === 'cancelled') {
+      toast((d.status === 'cancelled' ? 'Anulowano: ' : 'Błąd: ')+d.error, d.status === 'cancelled' ? 'info' : 'err');
       btn.disabled = false;
       stopForgeProgress();
       document.getElementById('portrait-progress-wrap').style.display = 'none';
       btn.textContent = '👤 GENERUJ PORTRET';
       status.textContent = '';
     } else {
-      status.textContent = d.status === 'generating' ? 'Generowanie portretu...' : 'Oczekiwanie...';
+      status.textContent = d.phase_label || (d.status === 'generating' ? 'Generowanie portretu...' : 'Przygotowanie GPU...');
       setTimeout(function(){ pollPortrait(jid, btn, status); }, 2000);
     }
   });
@@ -2904,11 +2961,12 @@ function pollEditJob(jid, tick) {
         resetEditBtn();
         loadEditHistory();
       },400);
-    } else if(d.status==='error') {
+    } else if(d.status==='error' || d.status==='cancelled') {
       stopForgeProgress();
       document.getElementById('edit-progress-wrap').style.display='none';
-      resetEditBtn(); toast('Błąd: '+d.error,'err');
+      resetEditBtn(); toast((d.status==='cancelled'?'Anulowano: ':'Błąd: ')+d.error, d.status==='cancelled'?'info':'err');
     } else {
+      if (d.phase_label) document.getElementById('edit-prog-label').textContent = d.phase_label;
       setTimeout(function(){pollEditJob(jid, tick+1);}, 2000);
     }
   }).catch(function(){ setTimeout(function(){pollEditJob(jid, tick+1);}, 3000); });
@@ -3100,13 +3158,13 @@ function pollPose(jid, btn, status) {
         dl.textContent = '⬇ Pobierz';
         wrap.appendChild(img); wrap.appendChild(dl); results.appendChild(wrap);
       });
-    } else if (d.status === 'error') {
+    } else if (d.status === 'error' || d.status === 'cancelled') {
       stopForgeProgress();
       document.getElementById('pose-progress-wrap').style.display = 'none';
-      toast('Błąd: '+(d.error||'nieznany'), 'err');
+      toast((d.status === 'cancelled' ? 'Anulowano: ' : 'Błąd: ')+(d.error||'nieznany'), d.status === 'cancelled' ? 'info' : 'err');
       btn.disabled = false; btn.textContent = '🚴 GENERUJ Z POZĄ'; status.textContent = '';
     } else {
-      status.textContent = 'Generowanie z pozą...';
+      status.textContent = d.phase_label || 'Generowanie z pozą...';
       setTimeout(function(){ pollPose(jid, btn, status); }, 2000);
     }
   });
@@ -3389,15 +3447,13 @@ function pollVideoGen(jid, btn, other, status, label, quality, params) {
       _vidLast = {seed: d.seed, quality: quality, params: params};
       renderVideoResult(d.images || [], quality, d.seed);
       loadHistory();
-    } else if (d.status === 'error') {
+    } else if (d.status === 'error' || d.status === 'cancelled') {
       reset();
-      toast('Blad: ' + (d.error || 'nieznany'), 'err');
+      toast((d.status === 'cancelled' ? 'Anulowano: ' : 'Blad: ') + (d.error || 'nieznany'), d.status === 'cancelled' ? 'info' : 'err');
     } else {
-      /* 'queued' = czeka na mutex GPU za innym zadaniem (np. Finał kliknięty podczas szkicu).
-         Bez tego komunikatu wyglądało to jak zawieszenie. */
-      status.textContent = (d.status === 'queued')
+      status.textContent = d.phase_label || ((d.status === 'queued')
         ? 'W kolejce - start, gdy karta skończy poprzednie zadanie...'
-        : 'Generowanie wideo...';
+        : 'Generowanie wideo...');
       setTimeout(function () { pollVideoGen(jid, btn, other, status, label, quality, params); }, 3000);
     }
   });
@@ -3451,7 +3507,7 @@ function renderVideoResult(paths, quality, seed) {
 /* ── Init ── */
 switchBackend(_backend);
 setVideoMode('wan_i2v');
-applyPreset('portrait');
+updateParamsBar();
 loadHistory();
 
 /* Auto-detect mobile — większy pędzel i bezpieczna skala */

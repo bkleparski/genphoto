@@ -200,89 +200,98 @@ def auto_cache_put(key, value):
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 JOBS = {}
 _jlock = threading.Lock()
+TERMINAL_JOB_STATUSES = ('done', 'error', 'cancelled')
+
+
+class JobCancelled(Exception):
+    """Wyjątek sygnalizujący przerwanie zadania przez użytkownika lub timeout."""
+
 
 def job_create():
     jid = uuid.uuid4().hex
     with _jlock:
-        JOBS[jid] = {'status': 'queued', 'images': [], 'error': None, 'seed': -1, 't': time.time()}
+        JOBS[jid] = {
+            'status': 'queued',
+            'phase': 'queued',
+            'phase_label': 'W kolejce...',
+            'images': [],
+            'error': None,
+            'seed': -1,
+            't': time.time(),
+            '_result_status': None,
+        }
         if len(JOBS) > 60:
-            for k in sorted(JOBS, key=lambda j: JOBS[j]['t'])[:10]:
+            terminal = [
+                k for k in sorted(JOBS, key=lambda j: JOBS[j]['t'])
+                if JOBS[k].get('status') in TERMINAL_JOB_STATUSES
+            ]
+            for k in terminal[:10]:
                 del JOBS[k]
     return jid
+
 
 def job_set(jid, **kw):
     with _jlock:
         if jid in JOBS:
             JOBS[jid].update(kw)
 
+
+def job_finish(jid, status='done', **kw):
+    """Zapisz wynik końcowy joba bez przedwczesnego otwierania statusu terminalnego.
+
+    Końcowy status ('done'/'error'/'cancelled') publikuje dopiero koordynator
+    w _execute_gpu_job PO zatrzymaniu backendu i potwierdzeniu powrotu embeddingu.
+    """
+    with _jlock:
+        if jid in JOBS:
+            JOBS[jid].update(kw)
+            JOBS[jid]['_result_status'] = status
+
+
 def job_get(jid):
     with _jlock:
-        return dict(JOBS.get(jid, {}))
+        raw = JOBS.get(jid)
+        if not raw:
+            return {}
+        return {k: v for k, v in raw.items() if not k.startswith('_')}
 
-# ── GPU orchestration (RTX 3060 12 GB) ───────────────────────────────────────
-# Jeden job GPU na raz + kolejka FIFO (max 1 oczekujący) + pre-flight VRAM.
-# Mutex obejmuje pre-flight ORAZ całą generację — atomowo, bez race między
-# sprawdzeniem wolnego VRAM a startem joba. Watchdog zwalnia mutex awaryjnie,
-# gdy job się zawiesi (threading.Lock — w przeciwieństwie do RLock — może
-# zwolnić dowolny wątek; release() na odblokowanym rzuca RuntimeError, łapiemy).
-_gpu_lock  = threading.Lock()
-_gpu_wlock = threading.Lock()
-_gpu_waiters = 0             # liczba jobów oczekujących na mutex
-# Timeout oczekiwania w kolejce. Było 120 s — dobrane pod obrazy (1-2 min). Od kiedy
-# jest wideo (Szkic 5 min, Finał 7-11 min), job czekający za klipem dostawał po dwóch
-# minutach "Przekroczono czas oczekiwania" mimo że nic złego się nie działo.
-# UI pokazuje status 'queued', więc użytkownik wie, że czeka, a nie że wisi.
-GPU_QUEUE_MAX_WAIT_S = 1200
-GPU_DRAIN_MAX_S      = 300   # ile czekac, az zawieszony job odda VRAM
-GPU_DRAIN_POLL_S     = 5     # co ile sprawdzac VRAM w trakcie drenazu
-GPU_QUEUE_MAX_DEPTH  = 1     # 1 job w toku + 1 w kolejce = "max 2"
 
-# Watchdog per typ joba (s) — powyżej najdłuższego legalnego czasu danego typu.
-GPU_WATCHDOG_S = {
-    'forge':     900,    # txt2img/img2img/edit/instantid/pose (forge_post timeout 600s + zapas)
-    'krea2':     900,    # pętla batch po 1 obrazie
-    'zimage':    600,    # 8 kroków turbo + ewentualny reload GGUF
-    'flux':     1500,    # Krea dev / Klein 9B: ładowanie 9-12 GB fp8 + sampling z offloadem
-    'wanvideo':  2100,   # wewnętrzny deadline wątku WAN to 1800s + ładowanie ~17GB GGUF
-    'batch_all': 3600,   # ~20 modeli × (load + generowanie + unload)
-    'krea2_batch': 1200, # 4 warianty Krea 2 × (load + 2 zdjęcia)
+# ── GPU orchestration via system coordinator (/run/ai-system-gpu/lease.sock) ─
+# Jeden nadrzędny koordynator GPU (ai-system-gpu.service) serializuje dostęp
+# do RTX 3060 12 GB między GenPhoto, VM ai-system, lokalnym pi oraz Hermesem.
+# Cykl życia każdego zadania w GenPhoto (także całych grup batch=4 / all_models / wideo):
+#   queued -> waiting_for_lease -> unloading_embedding -> starting_backend
+#   -> generating -> stopping_backend -> restoring_embedding -> done/error/cancelled
+GP_COORDINATOR_SOCK = os.environ.get('GP_COORDINATOR_SOCK', '/run/ai-system-gpu/lease.sock')
+GPU_QUEUE_MAX_DEPTH = 1      # 1 job w toku + 1 w kolejce
+GPU_LEASE_WAIT_MAX_S = int(os.environ.get('GP_LEASE_WAIT_MAX_S', '1800'))
+GPU_HEARTBEAT_S = 15
+
+PHASE_LABELS = {
+    'queued': 'W kolejce — czeka na zakończenie poprzedniego zadania...',
+    'waiting_for_lease': 'Czekam na wolną kartę GPU (koordynator)...',
+    'unloading_embedding': 'Zwalniam model embeddingu z VRAM...',
+    'starting_backend': 'Uruchamiam backend GPU...',
+    'generating': 'Generowanie...',
+    'stopping_backend': 'Wyłączam backend GPU i zwalniam VRAM...',
+    'restoring_embedding': 'Przywracam model embeddingu do VRAM...',
 }
-# Dodatkowy czas (s) za kazdy obraz ponad pierwszy w jobie (params['batch']).
-GPU_WATCHDOG_PER_EXTRA_IMAGE_S = {'zimage': 180}
 
-# Minimalny wolny VRAM (MB) przed startem joba.
-# "cold" = backend nie działa/nie trzyma modelu; "hot" = backend już jest w VRAM
-# (załadowany model nie musi alokować ponownie — wymóg dodatkowej pamięci niższy).
-# krea2 cold 7500, nie 4500: ładowanie checkpointu z kwantyzacją bnb kończy na ~7,2 GB
-# (pomiar z audytu 2026-08-27). Z 4500 preflight przepuszczał job, który padał w połowie
-# ładowania z torch.OutOfMemoryError — czytelny błąd na starcie jest lepszy niż OOM.
-VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 7500, 'zimage': 6500, 'wanvideo': 9500,
-                     'flux': 9000}
-VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000,
-                     'flux': 3000}
+_queue_lock = threading.Lock()
+_queue_cond = threading.Condition(_queue_lock)
+_gpu_active_job = None
+_gpu_pending = collections.deque()
 
-# ── Metryki (ring buffer, endpoint /api/metrics) ─────────────────────────────
+# ── Metryki (ring buffer + JSONL, endpoint /api/metrics) ──────────────────────
 _metrics = collections.deque(maxlen=200)
 _mlock   = threading.Lock()
 
-# Ring buffer ginie przy kazdym restarcie uslugi, wiec sam nie odpowie na pytanie
-# "ktore modele sa martwe" - a od tego zalezy, co z 551 GB checkpointow trafia na
-# NVMe, a co do kasacji (audyt 2026-09-10). Stad drugi zapis: jedna linia JSON na
-# zdarzenie. Zdarzen jest kilkanascie na job, wiec koszt open+write+close jest
-# pomijalny, a zamkniecie pliku po kazdym wpisie przezywa kill -9 uslugi - inaczej
-# niz bufor trzymany w otwartym uchwycie.
 METRICS_LOG     = os.environ.get("GP_METRICS_LOG",
                                  os.path.expanduser("~/genphoto-metrics.jsonl"))
 METRICS_LOG_MAX = int(os.environ.get("GP_METRICS_LOG_MAX", 64 * 1024 * 1024))
 
 
 def _metrics_rotate():
-    """Po przekroczeniu limitu: biezacy log -> .1, poprzedni .1 przepada.
-
-    Dwie generacje wystarczaja - log sluzy do analizy uzycia modeli w oknie
-    tygodni, nie do audytu wstecz. os.replace jest atomowe, wiec rownolegly
-    czytelnik nigdy nie zobaczy pliku w polowie podmiany.
-    """
     try:
         if os.path.getsize(METRICS_LOG) < METRICS_LOG_MAX:
             return
@@ -290,68 +299,12 @@ def _metrics_rotate():
     except OSError:
         pass
 
+
 def _free_vram_mb():
     import subprocess as _sp
     r = _sp.run(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=5)
     return int(r.stdout.strip().splitlines()[0].strip())
-
-# ── Ollama: zwolnienie modeli embeddingowych przed jobem GPU ─────────────────
-# Hub, kh-lab i prasowka trzymaja qwen3-embedding w VRAM bez limitu czasu (ok. 7 GB
-# z 12). Przed generowaniem obrazu wyladowujemy go, zeby Forge/Krea 2/ComfyUI dostaly
-# karte w calosci. Ollama przeladuje model sama przy nastepnym zapytaniu o embedding.
-OLLAMA_URL = os.environ.get('GP_OLLAMA_URL', 'http://localhost:11434').rstrip('/')
-OLLAMA_UNLOAD_MATCH = os.environ.get('GP_OLLAMA_UNLOAD_MATCH', 'embed').lower()
-
-
-def _ollama_unload_embeddings(wait_s=12):
-    """Wyladuj z VRAM modele ollamy, ktorych nazwa zawiera GP_OLLAMA_UNLOAD_MATCH.
-
-    Zwraca liste wyladowanych modeli. Nigdy nie rzuca wyjatku: brak ollamy albo blad
-    sieci ma kosztowac tylko pominiety krok, nie przerwany job. Czeka (max wait_s), az
-    nvidia-smi pokaze wiecej wolnej pamieci, bo keep_alive=0 oddaje karte z opoznieniem."""
-    try:
-        with urllib.request.urlopen(
-                urllib.request.Request(OLLAMA_URL + '/api/ps', headers={'User-Agent': _UA}),
-                timeout=5) as r:
-            loaded = [m.get('name') for m in json.loads(r.read()).get('models', [])
-                      if m.get('name')]
-    except Exception:
-        return []
-    targets = [m for m in loaded if OLLAMA_UNLOAD_MATCH in m.lower()]
-    if not targets:
-        return []
-    try:
-        before = _free_vram_mb()
-    except Exception:
-        before = None
-    done = []
-    for name in targets:
-        try:
-            # /api/embed z keep_alive=0 to oficjalny sposob wyladowania modelu
-            # embeddingowego (/api/generate go nie obsluguje).
-            req = urllib.request.Request(
-                OLLAMA_URL + '/api/embed',
-                data=json.dumps({'model': name, 'input': '', 'keep_alive': 0}).encode(),
-                headers={'Content-Type': 'application/json', 'User-Agent': _UA},
-                method='POST')
-            with urllib.request.urlopen(req, timeout=20) as r:
-                r.read()
-            done.append(name)
-        except Exception:
-            pass
-    after = before
-    deadline = time.time() + wait_s
-    while done and time.time() < deadline:
-        time.sleep(1)
-        try:
-            after = _free_vram_mb()
-        except Exception:
-            break
-        if before is not None and after - before >= 1000:
-            break
-    metric('ollama_unload', models=done, free_before_mb=before, free_after_mb=after)
-    return done
 
 
 def metric(event, **kw):
@@ -363,8 +316,6 @@ def metric(event, **kw):
         pass
     with _mlock:
         _metrics.append(entry)
-        # Metryka nigdy nie moze wywrocic joba - pelny dysk albo brak praw do pliku
-        # ma kosztowac utrate wpisu, nie przerwane generowanie.
         try:
             _metrics_rotate()
             with open(METRICS_LOG, "a", encoding="utf-8") as fh:
@@ -372,10 +323,26 @@ def metric(event, **kw):
         except Exception:
             pass
 
+
 def _service_for_backend(backend):
-    return {'forge': 'forge', 'krea2': 'krea2',
-            'zimage': 'comfyui', 'wanvideo': 'comfyui',
-            'flux': 'comfyui'}.get(backend)
+    return {
+        'forge': 'forge',
+        'krea2': 'krea2',
+        'zimage': 'comfyui',
+        'wanvideo': 'comfyui',
+        'flux': 'comfyui',
+    }.get(backend)
+
+
+def _backend_display_name(backend):
+    return {
+        'forge': 'Forge',
+        'krea2': 'Krea 2',
+        'zimage': 'ComfyUI (Z-Image)',
+        'flux': 'ComfyUI (FLUX / MOSS)',
+        'wanvideo': 'ComfyUI (Wideo WAN 2.2)',
+    }.get(backend, backend)
+
 
 def _backend_health_url(backend, deep=False):
     if backend == 'forge':
@@ -383,448 +350,615 @@ def _backend_health_url(backend, deep=False):
     if backend == 'krea2':
         return KREA2_URL + '/health'
     if backend in ('zimage', 'wanvideo', 'flux'):
-        # deep=True → /object_info: po restarcie ComfyUI port otwiera się wcześniej
-        # niż kończy się inicjalizacja nodów — bez tego health-check daje false-OK.
         return COMFY_URL + ('/object_info' if deep else '/system_stats')
     return None
 
-def _krea2_loaded_checkpoint(timeout=4):
-    """Który checkpoint Krea 2 trzyma w VRAM (None, gdy żaden albo brak odpowiedzi).
 
-    Krea 2 ładuje checkpoint dopiero przy pierwszym /generate i trzyma go między
-    żądaniami — ale po restarcie usługi (np. przez job wideo, który zatrzymuje
-    konkurentów) Flask odpowiada od razu, a modelu w VRAM nie ma. /health zwraca
-    `pipeline_loaded` i `pipeline_checkpoint`, więc nie trzeba zgadywać."""
-    try:
-        req = urllib.request.Request(KREA2_URL + '/health', headers={'User-Agent': _UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            h = json.loads(r.read())
-        return h.get('pipeline_checkpoint') if h.get('pipeline_loaded') else None
-    except Exception:
-        return None
-
-
-def _backend_alive(backend, timeout=4):
-    url = _backend_health_url(backend)
+def _wait_backend_health(backend, timeout_s=180, cancel_evt=None):
+    url = _backend_health_url(backend, deep=True)
     if not url:
         return False
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': _UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-def _wait_backend_health(backend, timeout_s=120):
-    url = _backend_health_url(backend, deep=True)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
+        if cancel_evt and cancel_evt.is_set():
+            return False
         try:
             req = urllib.request.Request(url, headers={'User-Agent': _UA})
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with urllib.request.urlopen(req, timeout=8) as r:
                 if r.status == 200:
                     return True
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(2)
     return False
 
-def _ensure_backend_running(backend):
-    """Backend nie odpowiada → start serwisu systemd + czekanie na health."""
-    if _backend_alive(backend):
-        return True
+
+def _job_budget_s(kind, params):
+    try:
+        batch = max(1, int(params.get('batch', 1)))
+    except (TypeError, ValueError):
+        batch = 1
+    extra = batch - 1
+    if kind == 'flux' and params.get('model') == 'flux_moss_sft':
+        return min(14000, 3000 * batch + 600)
+    if kind == 'flux':
+        return min(14000, 900 + extra * 600)
+    if kind == 'zimage':
+        return min(7200, 420 + extra * 240)
+    if kind == 'krea2':
+        return min(7200, 600 + extra * 300)
+    if kind == 'krea2_batch':
+        return 2400
+    if kind == 'wanvideo':
+        return 2400
+    if kind == 'batch_all':
+        return 4200
+    # forge (txt2img / img2img / edit / portrait / pose)
+    return min(7200, 600 + extra * 180)
+
+
+def coordinator_status(timeout=5):
+    import socket as _sock
+    try:
+        with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(GP_COORDINATOR_SOCK)
+            s.sendall(b'STATUS\n')
+            data = b''
+            while not data.endswith(b'\n'):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            return json.loads(data.decode('utf-8').strip())
+    except Exception:
+        return None
+
+
+def coordinator_cleanup(timeout=120):
+    import socket as _sock
+    with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(GP_COORDINATOR_SOCK)
+        s.sendall(b'CLEANUP\n')
+        line = s.makefile('rb').readline(256).decode('utf-8', errors='replace').strip()
+        return line == 'RESTORED', line
+
+
+class GpuLease:
+    """Klient protokołu v2 koordynatora ai-system-gpu z heartbeatem."""
+
+    def __init__(self, sock_path=GP_COORDINATOR_SOCK):
+        self.sock_path = sock_path
+        self.sock = None
+        self.rfile = None
+        self.lease_id = None
+        self._io_lock = threading.Lock()
+        self._hb_stop = threading.Event()
+        self._hb_thread = None
+
+    def _close_raw(self):
+        try:
+            if self.rfile:
+                self.rfile.close()
+        except Exception:
+            pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.rfile = None
+        self.sock = None
+
+    def _heartbeat_loop(self):
+        while not self._hb_stop.wait(GPU_HEARTBEAT_S):
+            with self._io_lock:
+                if not self.sock or not self.rfile:
+                    return
+                try:
+                    self.sock.settimeout(15)
+                    self.sock.sendall(b'PING\n')
+                    resp = self.rfile.readline(64).decode('utf-8', errors='replace').strip()
+                    if resp != 'PONG':
+                        return
+                except Exception:
+                    return
+
+    def acquire(self, job_id, service, budget_s, on_state=None, cancel_evt=None, max_wait_s=GPU_LEASE_WAIT_MAX_S):
+        import socket as _sock
+        deadline = time.monotonic() + max_wait_s
+        while True:
+            if cancel_evt and cancel_evt.is_set():
+                raise JobCancelled('Anulowano podczas oczekiwania na kartę GPU')
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'Przekroczono czas oczekiwania na koordynator GPU ({max_wait_s}s)')
+
+            s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            rf = None
+            try:
+                s.settimeout(120)
+                s.connect(self.sock_path)
+                rf = s.makefile('rb')
+                s.sendall(f'ACQUIRE {job_id} {service} {int(budget_s)}\n'.encode('utf-8'))
+                while True:
+                    raw = rf.readline(256)
+                    if not raw:
+                        raise RuntimeError('Koordynator GPU zamknął połączenie przed READY')
+                    line = raw.decode('utf-8', errors='replace').strip()
+                    if line.startswith('STATE '):
+                        st = line.split(' ', 1)[1].strip()
+                        if on_state:
+                            on_state(st, '')
+                        continue
+                    if line.startswith('READY '):
+                        self.sock = s
+                        self.rfile = rf
+                        self.lease_id = line.split(' ', 1)[1].strip()
+                        self._hb_stop.clear()
+                        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+                        self._hb_thread.start()
+                        return self.lease_id
+                    if line.startswith('BUSY') or line.startswith('GPU_BUSY'):
+                        info = line.split(' ', 1)[1].strip() if ' ' in line else line
+                        if on_state:
+                            on_state('waiting_for_lease', info)
+                        break
+                    raise RuntimeError(f'Błąd koordynatora GPU: {line}')
+            except JobCancelled:
+                if rf:
+                    rf.close()
+                s.close()
+                raise
+            except OSError as exc:
+                if rf:
+                    try:
+                        rf.close()
+                    except Exception:
+                        pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f'Brak połączenia z koordynatorem GPU ({self.sock_path}): {exc}')
+            else:
+                if rf:
+                    rf.close()
+                s.close()
+
+            for _ in range(4):
+                if cancel_evt and cancel_evt.is_set():
+                    raise JobCancelled('Anulowano podczas oczekiwania na kartę GPU')
+                time.sleep(0.5)
+
+    def start_backend(self, service):
+        with self._io_lock:
+            if not self.sock or not self.rfile:
+                raise RuntimeError('Brak aktywnej dzierżawy GPU')
+            self.sock.settimeout(60)
+            self.sock.sendall(f'START {service}\n'.encode('utf-8'))
+            line = self.rfile.readline(256).decode('utf-8', errors='replace').strip()
+            if not line.startswith('STARTED'):
+                raise RuntimeError(f'Koordynator nie uruchomił {service}: {line}')
+
+    def stop_backend(self):
+        with self._io_lock:
+            if not self.sock or not self.rfile:
+                return
+            try:
+                self.sock.settimeout(60)
+                self.sock.sendall(b'STOP\n')
+                self.rfile.readline(256)
+            except Exception:
+                pass
+
+    def finish(self, abort=False, on_state=None):
+        self._hb_stop.set()
+        if self._hb_thread and self._hb_thread.is_alive():
+            self._hb_thread.join(timeout=2)
+        with self._io_lock:
+            if not self.sock or not self.rfile:
+                return False
+            cmd = b'ABORT\n' if abort else b'FINISH\n'
+            restored = False
+            try:
+                self.sock.settimeout(120)
+                self.sock.sendall(cmd)
+                while True:
+                    raw = self.rfile.readline(256)
+                    if not raw:
+                        break
+                    line = raw.decode('utf-8', errors='replace').strip()
+                    if line.startswith('STATE '):
+                        st = line.split(' ', 1)[1].strip()
+                        if on_state:
+                            on_state(st, '')
+                        continue
+                    if line == 'RESTORED':
+                        restored = True
+                        break
+                    if line.startswith('ERR '):
+                        metric('coordinator_restore_error', error=line[:160])
+                        break
+            except Exception as exc:
+                metric('coordinator_finish_error', error=str(exc)[:160])
+            finally:
+                self._close_raw()
+            return restored
+
+
+def _check_cancelled(params):
+    evt = params.get('_cancel_evt')
+    if evt is not None and evt.is_set():
+        raise JobCancelled('Zadanie anulowane przez użytkownika')
+
+
+def _validate_gpu_job(kind, backend, params):
+    """Walidacja modelu, backendu i zasobów PRZED kolejką i PRZED dotknięciem GPU."""
     svc = _service_for_backend(backend)
     if not svc:
-        return False
-    import subprocess as _sp
-    metric('backend_autostart', backend=backend, service=svc)
-    try:
-        _sp.run(['systemctl', '--user', 'start', svc], timeout=20,
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-    except Exception:
-        metric('backend_autostart_done', backend=backend, ok=False)
-        return False
-    ok = _wait_backend_health(backend, timeout_s=150)
-    metric('backend_autostart_done', backend=backend, ok=ok)
-    if ok:
+        return f'Nieznany backend: {backend}'
+
+    if kind == 'wanvideo':
+        mode_key = params.get('video_mode') or DEFAULT_VIDEO_MODE
+        mode = VIDEO_MODES.get(mode_key)
+        if not mode:
+            return f'Nieznany tryb wideo: {mode_key}'
+        w = WAN_WEIGHTS[mode['family']]
+        missing = []
+        for fn, dirs in (
+            (WAN_CLIP_NAME, ('text_encoders', 'clip')),
+            (WAN_VAE_NAME, ('vae',)),
+            (w['unet_high'], ('unet', 'diffusion_models')),
+            (w['unet_low'], ('unet', 'diffusion_models')),
+            (w['lora_high'], ('loras',)),
+            (w['lora_low'], ('loras',)),
+        ):
+            if not any((COMFY_MODELS_DIR / d / fn).exists() for d in dirs):
+                missing.append(fn)
+        if missing:
+            return 'Brak plików modelu WAN na dysku: ' + ', '.join(missing)
+        return None
+
+    if kind == 'krea2_batch':
+        _refresh_models_once()
+        missing = []
+        for ckpt in KREA2_BATCH_VARIANTS:
+            entry = _find_model_entry(f'krea2_{ckpt}')
+            if not entry or not entry.get('available', True):
+                missing.append(ckpt)
+        if missing:
+            return 'Brak wariantów Krea 2 na dysku: ' + ', '.join(missing)
+        return None
+
+    if kind == 'batch_all':
+        _refresh_models_once()
+        with _models_lock:
+            eligible = [
+                m for m in _models_cache
+                if m.get('backend') == 'forge' and m.get('available', True)
+                and m.get('filename') and not m.get('is_flux')
+            ]
+        if not eligible:
+            return 'Brak modeli Forge SDXL/SD1.5 na dysku'
+        return None
+
+    model = (params.get('model') or '').strip()
+    if backend == 'zimage':
         try:
-            # Odśwież cache modeli — auto-start w tle oznaczał, że dropdown
-            # na stronie nie miał wpisów tego backendu (np. krea2_oss_turbo).
+            _zimage_unet_name(params)
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    if backend == 'flux':
+        m = FLUX_MODELS.get(model)
+        if not m:
+            return (f'Nieznany model FLUX/MOSS: {model!r} '
+                    f'(dostępne: {", ".join(FLUX_MODELS)})')
+        try:
+            _flux_check_files(m)
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    if backend == 'krea2':
+        if not model.startswith('krea2_'):
+            return f'Wybrany model ({model!r}) nie należy do backendu Krea 2.'
+        entry = _find_model_entry(model)
+        if not entry:
             _refresh_models_once()
-        except Exception:
-            pass
-    return ok
+            entry = _find_model_entry(model)
+        if not entry:
+            return f'Nieznany model Krea 2: {model!r}'
+        if not entry.get('available', True):
+            return entry.get('reason') or f'Model Krea 2 niedostępny na dysku: {model}'
+        return None
 
-def _stop_other_backends(backend):
-    """Zatrzymaj serwisy niepotrzebne dla tego joba (flaga stop_other_backends)."""
-    import subprocess as _sp
-    keep = _service_for_backend(backend)
-    for svc in ('forge', 'krea2', 'comfyui'):
-        if svc == keep:
-            continue
-        try:
-            _sp.run(['systemctl', '--user', 'stop', svc], timeout=15,
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-            metric('backend_autostop', service=svc, for_backend=backend)
-        except Exception:
-            pass
+    if backend == 'forge':
+        if not model:
+            return 'Nie wybrano modelu Forge.'
+        entry = _find_model_entry(model)
+        if not entry:
+            _refresh_models_once()
+            entry = _find_model_entry(model)
+        if not entry or entry.get('backend') != 'forge':
+            return f'Nie znaleziono modelu Forge na dysku: {model!r}'
+        if not entry.get('available', True):
+            return entry.get('reason') or f'Model Forge niedostępny: {model}'
+        return None
 
-def _comfy_free_memory(timeout=60):
-    """Poproś ComfyUI o wyrzucenie modeli z VRAM (endpoint /free).
-
-    Po zakończonym jobie ComfyUI trzyma wagi w pamięci karty pod kolejne żądanie. Przy
-    obrazach to zaleta, przy wideo — blokada: model Z-Image albo poprzedni ekspert WAN
-    zajmuje 5-7 GB, a nowy job potrzebuje 9,5 GB, więc samo zatrzymanie Forge i Krea 2
-    nie wystarcza.
-
-    UWAGA na opóźnienie: /free tylko ustawia flagę w kolejce. Pętla ComfyUI wyładowuje
-    modele od razu, ale torch.cuda.empty_cache() — czyli faktyczne oddanie pamięci innym
-    procesom — leci w cyklu GC co ~10 s. Zmierzone: t=6 s bez zmian, t=10 s pamięć
-    wolna. Kto mierzy wcześniej, wyciąga fałszywy wniosek, że /free nie działa.
-    Odpowiedź nie jest JSON-em, więc nie używamy comfy_post."""
-    try:
-        req = urllib.request.Request(
-            f'{COMFY_URL}/free', data=json.dumps({'unload_models': True,
-                                                  'free_memory': True}).encode(),
-            headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status < 300
-    except Exception:
-        return False
-
-
-def _comfy_held_vram_mb():
-    """Ile VRAM trzyma proces ComfyUI według nvidia-smi.
-
-    Dla jobów uruchamianych W ComfyUI ta pamięć jest efektywnie wolna: ComfyUI sam
-    zarządza swoimi modelami i przy ładowaniu nowego wyładuje stary (albo — gdy to ten
-    sam plik — użyje go bez ładowania). Doliczenie jej ma dwa skutki:
-
-    - job wideo/Z-Image nie jest odrzucany, gdy nvidia-smi widzi 3,9 GB wolnego,
-      a brakujące 7 GB trzyma sam ComfyUI;
-    - drugi klip z rzędu nie przechodzi przez /free, więc nie przeładowuje ~17 GB
-      wag od zera — model już siedzi na karcie.
-
-    Liczy się wyłącznie pod `_gpu_lock`, gdzie mamy pewność, że ComfyUI nic nie liczy."""
-    import subprocess as _sp
-    try:
-        pids = set(_sp.run(['pgrep', '-f', 'comfyui/main.py'], capture_output=True,
-                           text=True, timeout=5).stdout.split())
-        if not pids:
-            return 0
-        r = _sp.run(['nvidia-smi', '--query-compute-apps=pid,used_memory',
-                     '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=5)
-        total = 0
-        for line in r.stdout.strip().splitlines():
-            parts = [x.strip() for x in line.split(',')]
-            if len(parts) == 2 and parts[0] in pids:
-                total += int(parts[1])
-        return total
-    except Exception:
-        return 0
-
-
-def _wait_vram(need_mb, timeout_s, comfy_bonus=False):
-    """Czekaj, aż wolny VRAM sięgnie progu. Zwraca (ok, wolne_mb).
-
-    comfy_bonus: dolicz pamięć trzymaną przez proces ComfyUI (patrz _comfy_held_vram_mb).
-    Brak odczytu z nvidia-smi nie blokuje startu — wtedy (True, None)."""
-    deadline = time.time() + timeout_s
-    free = None
-    while True:
-        try:
-            free = _free_vram_mb()
-        except Exception:
-            return True, None
-        effective = free + (_comfy_held_vram_mb() if comfy_bonus else 0)
-        if effective >= need_mb:
-            return True, effective
-        if time.time() >= deadline:
-            return False, effective
-        time.sleep(3)
-
-
-def _free_vram_for_backend(backend, need_mb):
-    """Spróbuj zwolnić kartę pod job, zamiast od razu odsyłać użytkownika do przycisku
-    ZWOLNIJ. Zwraca wolny VRAM po próbie (albo None, gdy nie da się odczytać).
-
-    Dwie strategie, bo backendy mają różne apetyty:
-
-    - **wideo** zajmuje niemal całą kartę na kilkanaście minut, więc nie ma sensu, żeby
-      konkurowało z Forge i Krea 2 — zatrzymujemy je przez systemd (nie kill: usługi mają
-      Restart i wróciłyby po 10 s) i czekamy na drenaż.
-    - **obrazy** (Forge, Krea 2, Z-Image) normalnie współistnieją, więc niczego nie
-      zatrzymujemy. Wystarczy, że ComfyUI odda wagi trzymane w zapasie po swoim ostatnim
-      jobie — po klipie wideo to 5-6 GB, przez które Krea 2 nie miał gdzie dokwantować
-      checkpointu i padał z `torch.OutOfMemoryError` w bitsandbytes.
-
-    W obu przypadkach zaczynamy od `/free` na ComfyUI: to najtańsze źródło pamięci na tej
-    karcie, bo ComfyUI przeładuje wagi sam, gdy znów będą potrzebne."""
-    if backend not in ('zimage', 'flux'):
-        # Z-Image i FLUX siedzą same w ComfyUI — wyrzucanie ich wag tuż przed ich
-        # własnym jobem tylko wydłużyłoby start o ponowne ładowanie.
-        _comfy_free_memory()
-
-    # Backendy żyjące w ComfyUI odzyskują własny cache PyTorcha, więc liczy się on
-    # jako wolna pamięć. Forge i Krea 2 to osobne procesy — dla nich tylko to, co
-    # nvidia-smi realnie pokazuje jako wolne.
-    comfy_bonus = backend in ('zimage', 'wanvideo', 'flux')
-
-    if backend == 'wanvideo':
-        _stop_other_backends('wanvideo')
-        ok, free = _wait_vram(need_mb, 90, comfy_bonus)
-    else:
-        # Forge i Krea 2 czekają na realne oddanie pamięci przez ComfyUI: pierwsze
-        # ~10 s to jego cykl GC, dopiero potem empty_cache. 45 s daje zapas.
-        ok, free = _wait_vram(need_mb, 45, comfy_bonus)
-
-    metric('vram_reclaim', backend=backend, ok=ok, free_mb=free, need_mb=need_mb)
-    return free
-
-
-def gpu_preflight(backend, params_model=None):
-    """Warunki startu joba. Wywoływane W TRAKCIE trzymania _gpu_lock (atomowo
-    ze startem). Zwraca None gdy OK, albo string z komunikatem błędu."""
-    _ollama_unload_embeddings()
-    hot  = _backend_alive(backend)
-    # Dla wideo "backend odpowiada" nie znaczy "model jest w VRAM": ComfyUI z --lowvram
-    # zwalnia wagi między jobami, więc każdy job wideo ładuje ~8 GB od zera. Bez tego
-    # preflight brał próg HOT (3 GB), przepuszczał job przy 3,9 GB wolnego i kazał
-    # 8-gigabajtowemu modelowi przeciskać się warstwami obok krea-2 trzymającego 7 GB.
-    if backend in ('wanvideo', 'flux'):
-        # ComfyUI z --lowvram zwalnia wagi między jobami, więc Krea dev (11,9 GB)
-        # i Klein 9B (9,4 GB + 8,7 GB text encoder) ładują się za każdym razem od
-        # zera — próg HOT przepuściłby job, który padnie w połowie ładowania.
-        hot = False
-    elif backend == 'krea2':
-        # Ten sam fałszywy sygnał zdrowia, co w wideo, tylko z drugiej strony: Flask
-        # żyje, a checkpointu w VRAM nie ma (po restarcie) albo jest inny niż żądany
-        # (przełączenie wariantu = pełne przeładowanie). Hot tylko, gdy /health
-        # potwierdza dokładnie ten checkpoint.
-        wanted = (params_model or '').removeprefix('krea2_') or None
-        loaded = _krea2_loaded_checkpoint()
-        hot = bool(loaded) and (wanted is None or loaded == wanted)
-    need = (VRAM_NEED_HOT_MB if hot else VRAM_NEED_COLD_MB).get(backend, 4000)
-    try:
-        free = _free_vram_mb()
-    except Exception:
-        free = None
-    # Backendy żyjące w ComfyUI liczą jego własny cache jako dostępny już tutaj —
-    # dzięki temu drugi klip z rzędu nie wyrzuca załadowanego modelu przez /free.
-    if free is not None and backend in ('zimage', 'wanvideo', 'flux'):
-        free += _comfy_held_vram_mb()
-    if free is not None and free < need:
-        free = _free_vram_for_backend(backend, need)
-    if free is not None and free < need:
-        return (f'Za mało wolnego VRAM: {free/1024:.1f} GB wolne, '
-                f'wymagane ~{need/1024:.1f} GB. '
-                f'Zatrzymaj inne backendy (przycisk ZWOLNIJ) i spróbuj ponownie.')
-    if not _ensure_backend_running(backend):
-        return f'Backend {backend} nie odpowiada (auto-start serwisu nie powiódł się).'
     return None
 
-def gpu_run(kind, backend, target, params, jid):
-    """FIFO + mutex + watchdog dla wszystkich jobów GPU."""
-    global _gpu_waiters
-    with _gpu_wlock:
-        if _gpu_lock.locked() and _gpu_waiters >= GPU_QUEUE_MAX_DEPTH:
-            job_set(jid, status='error',
-                    error='GPU zajęte, a kolejka pełna (1 job w toku + 1 oczekujący). '
-                          'Spróbuj za chwilę.')
-            metric('queue_reject', backend=backend)
-            return
-        _gpu_waiters += 1
-    t0 = time.time()
-    acquired = _gpu_lock.acquire(timeout=GPU_QUEUE_MAX_WAIT_S)
-    with _gpu_wlock:
-        _gpu_waiters -= 1
-    if not acquired:
-        job_set(jid, status='error',
-                error=f'Przekroczono czas oczekiwania na GPU ({GPU_QUEUE_MAX_WAIT_S}s).')
-        metric('queue_timeout', backend=backend, waited_s=int(time.time() - t0))
-        return
-    if time.time() - t0 > 1:
-        metric('queue_wait', backend=backend, waited_s=int(time.time() - t0))
-    # Od tego miejsca trzymamy mutex — pre-flight i job atomowo.
-    done_evt  = threading.Event()
-    fired_evt = threading.Event()
-    # Mutex GPU wolno zwolnic dokladnie raz. Bez tego strazy: watchdog zwalnial
-    # mutex, nowy job go przejmowal, a finally starego watku robilo release()
-    # na CUDZYM juz mutexie (threading.Lock zwalnia dowolny watek) — i trzeci
-    # job wchodzil na zajete GPU.
-    released_evt = threading.Event()
-    def _release_gpu_once():
-        if released_evt.is_set():
-            return False
-        released_evt.set()
-        try:
-            _gpu_lock.release()
-            return True
-        except RuntimeError:
-            return False
-
-    watchdog_s = GPU_WATCHDOG_S.get(kind, 900)
-    if kind == 'flux' and params.get('model') == 'flux_moss_sft':
-        watchdog_s = 3600
-    if kind in GPU_WATCHDOG_PER_EXTRA_IMAGE_S:
-        # Limit bazowy liczy jeden obraz. Z-Image generuje batch po jednym obrazie
-        # (~140 s na 3060), wiec 4 obrazy przekraczaly 600 s i watchdog ubijal job
-        # tuz przed ostatnim obrazem (2026-10-14).
-        try:
-            extra = max(0, int(params.get('batch', 1)) - 1)
-        except (TypeError, ValueError):
-            extra = 0
-        watchdog_s += extra * GPU_WATCHDOG_PER_EXTRA_IMAGE_S[kind]
-    def _watch():
-        if done_evt.wait(watchdog_s):
-            return
-        fired_evt.set()
-        job_set(jid, status='error',
-                error=f'Watchdog: job przekroczył {watchdog_s}s — zgłoszony jako nieudany.')
-        metric('watchdog_fire', backend=backend, kind=kind)
-        # Zawieszony watek dalej zyje i trzyma VRAM. Zwolnienie mutexu od razu
-        # wpuscilo by drugi job na to samo GPU — czyli OOM. Czekamy, az watek
-        # sam skonczy albo VRAM faktycznie wroci.
-        need_mb  = VRAM_NEED_COLD_MB.get(backend, 6000)
-        deadline = time.time() + GPU_DRAIN_MAX_S
-        while time.time() < deadline:
-            if done_evt.wait(GPU_DRAIN_POLL_S):
-                return          # watek skonczyl — mutex zwolni jego finally
-            if _free_vram_mb() >= need_mb:
-                metric('watchdog_drain_ok', backend=backend, kind=kind)
-                break
-        else:
-            metric('watchdog_drain_timeout', backend=backend, kind=kind)
-        if _release_gpu_once():
-            metric('watchdog_release', backend=backend, kind=kind)
-    threading.Thread(target=_watch, daemon=True).start()
-    try:
-        if params.get('stop_other_backends'):
-            _stop_other_backends(backend)
-        err = gpu_preflight(backend, params.get('model'))
-        if err:
-            job_set(jid, status='error', error=err)
-            metric('preflight_fail', backend=backend)
-            return
-        metric('job_start', backend=backend, kind=kind, model=str(params.get('model', '')))
-        tj = time.time()
-        target(params, jid)
-        if fired_evt.is_set():
-            # Wątek odwiesił się PO strzeleniu watchdogu — nie pozwól, aby
-            # status 'done' z końca wątku nadpisał awaryjny 'error'.
-            job_set(jid, status='error',
-                    error=f'Watchdog: job przekroczył {watchdog_s}s — wątek zwolnił się '
-                          f'po awaryjnym zwolnieniu mutexa (wynik joba wątpliwy).')
-        metric('job_end', backend=backend, kind=kind, duration_s=int(time.time() - tj),
-               final_status=job_get(jid).get('status'))
-    finally:
-        done_evt.set()
-        _gpu_touch(job_end=True)
-        _release_gpu_once()
-
-
-# ── Sprzatacz GPU: po jobie zostaje tylko Forge, a jego model idzie z VRAM ─────
-# Decyzja Bartka (2026-10-16): comfyui i krea2 dzialaja tylko na czas jobu, Forge
-# (usluga) jest wlaczony caly czas, ale jego checkpoint laduje sie przy uzyciu i jest
-# zwalniany, gdy nikt go nie uzywa. Sprzatacz dziala co 15 s i NIGDY nie rusza GPU,
-# gdy trwa job albo ktos czeka (bierze ten sam mutex nieblokujaco).
-GP_BACKEND_STOP_IDLE_S = int(os.environ.get('GP_BACKEND_STOP_IDLE_S', '0'))    # 0 = zaraz po jobie
-GP_FORGE_UNLOAD_IDLE_S = int(os.environ.get('GP_FORGE_UNLOAD_IDLE_S', '300'))  # bezczynnosc Forge
-_gpu_last_activity = time.time()   # koniec ostatniego joba albo ostatnia aktywnosc Forge
-_forge_clean_ts    = 0.0           # kiedy ostatnio kazalismy Forge zwolnic checkpoint
-_backend_stop_pending = False      # True po jobie genphoto: wtedy (raz) zatrzymujemy comfyui/krea2
-
-
-def _gpu_touch(job_end=False):
-    global _gpu_last_activity, _backend_stop_pending
-    _gpu_last_activity = time.time()
-    if job_end:
-        _backend_stop_pending = True
-
-
-def _comfy_busy():
-    """True, gdy ComfyUI ma job w toku (takze uruchomiony recznie z jego UI)."""
-    try:
-        req = urllib.request.Request(COMFY_URL + '/queue', headers={'User-Agent': _UA})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            d = json.loads(r.read())
-        return bool(d.get('queue_running') or d.get('queue_pending'))
-    except Exception:
-        return False
-
-
-def _forge_busy():
-    """True, gdy Forge liczy (takze z jego wlasnego WebUI, poza genphoto)."""
-    try:
-        req = urllib.request.Request(
-            FORGE_URL + '/sdapi/v1/progress?skip_current_image=true',
-            headers={'User-Agent': _UA})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            d = json.loads(r.read())
-        return bool(d.get('state', {}).get('job_count')) or float(d.get('progress') or 0) > 0
-    except Exception:
-        return False
-
-
-def _forge_unload_checkpoint():
-    try:
-        req = urllib.request.Request(FORGE_URL + '/sdapi/v1/unload-checkpoint', data=b'',
-                                     headers={'User-Agent': _UA}, method='POST')
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status < 300
-    except Exception:
-        return False
-
-
-def _gpu_janitor_tick():
-    global _forge_clean_ts, _backend_stop_pending
-    import subprocess as _sp
-    if _forge_busy():
-        _gpu_touch()
-        return
-    idle = time.time() - _gpu_last_activity
-    with _gpu_wlock:
-        if _gpu_waiters > 0:
-            return
-    # Mutex bierzemy nieblokujaco: gdy job wlasnie startuje, nie przeszkadzamy.
-    if not _gpu_lock.acquire(blocking=False):
-        return
-    try:
-        # Zatrzymujemy tylko raz po jobie genphoto (flaga), zeby nie ubijac comfyui
-        # wlaczonego pozniej recznie, i nigdy przy jobie w toku w ComfyUI.
-        if _backend_stop_pending and idle >= GP_BACKEND_STOP_IDLE_S and not _comfy_busy():
-            _backend_stop_pending = False
-            for svc in ('comfyui', 'krea2'):
-                if _sp.run(['systemctl', '--user', 'is-active', '--quiet', svc],
-                           timeout=10).returncode == 0:
-                    _sp.run(['systemctl', '--user', 'stop', svc], timeout=30,
-                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                    metric('backend_idle_stop', service=svc, idle_s=int(idle))
-        if idle >= GP_FORGE_UNLOAD_IDLE_S and _forge_clean_ts < _gpu_last_activity:
-            if _backend_alive('forge'):
-                ok = _forge_unload_checkpoint()
-                metric('forge_idle_unload', ok=ok, idle_s=int(idle))
-                if ok:
-                    _forge_clean_ts = time.time()
-            else:
-                _forge_clean_ts = time.time()
-    except Exception as e:
-        metric('gpu_janitor_error', error=str(e)[:120])
-    finally:
-        _gpu_lock.release()
-
-
-def _gpu_janitor():
-    while True:
-        time.sleep(15)
-        try:
-            _gpu_janitor_tick()
-        except Exception:
-            pass
 
 def gpu_queue_full():
-    with _gpu_wlock:
-        return _gpu_lock.locked() and _gpu_waiters >= GPU_QUEUE_MAX_DEPTH
+    with _queue_lock:
+        return _gpu_active_job is not None and len(_gpu_pending) >= GPU_QUEUE_MAX_DEPTH
+
+
+def submit_gpu_job(kind, backend, target, params):
+    """Zwaliduj i wstaw zadanie do kolejki FIFO koordynatora GPU."""
+    err = _validate_gpu_job(kind, backend, params)
+    if err:
+        return None, err, 400
+    with _queue_lock:
+        if _gpu_active_job is not None and len(_gpu_pending) >= GPU_QUEUE_MAX_DEPTH:
+            metric('queue_reject', backend=backend, kind=kind)
+            return None, (
+                'GPU zajęte — 1 generacja w toku i 1 w kolejce. '
+                'Poczekaj na zakończenie.'
+            ), 503
+        jid = job_create()
+        job_set(
+            jid,
+            status='queued',
+            phase='queued',
+            phase_label=PHASE_LABELS['queued'],
+            backend=backend,
+            kind=kind,
+            model=str(params.get('model', '')),
+        )
+        rec = {
+            'jid': jid,
+            'kind': kind,
+            'backend': backend,
+            'service': _service_for_backend(backend),
+            'target': target,
+            'params': params,
+            'cancel_evt': threading.Event(),
+            'done_evt': threading.Event(),
+            'enqueued_at': time.time(),
+        }
+        _gpu_pending.append(rec)
+        _queue_cond.notify()
+        return jid, None, 200
+
+
+def cancel_gpu_job(jid):
+    with _queue_lock:
+        for idx, rec in enumerate(_gpu_pending):
+            if rec['jid'] == jid:
+                del _gpu_pending[idx]
+                rec['cancel_evt'].set()
+                rec['done_evt'].set()
+                job_set(
+                    jid,
+                    status='cancelled',
+                    phase='cancelled',
+                    phase_label='Anulowano',
+                    error='Zadanie anulowane przez użytkownika',
+                )
+                return True, 'Anulowano zadanie z kolejki'
+        if _gpu_active_job and _gpu_active_job['jid'] == jid:
+            _gpu_active_job['cancel_evt'].set()
+            job_set(jid, phase_label='Anulowanie — zatrzymuję backend i przywracam embedding...')
+            return True, 'Przerywam aktywne zadanie i zwalniam GPU...'
+    return False, 'Zadanie nie jest aktywne ani w kolejce'
+
+
+def _execute_gpu_job(rec):
+    jid = rec['jid']
+    kind = rec['kind']
+    backend = rec['backend']
+    svc = rec['service']
+    target = rec['target']
+    params = dict(rec['params'])
+    cancel_evt = rec['cancel_evt']
+    params['_cancel_evt'] = cancel_evt
+
+    budget_s = _job_budget_s(kind, params)
+    lease = GpuLease()
+    lease_acquired = False
+    abort = False
+    final_status = 'error'
+    final_error = None
+    tj = time.time()
+
+    def _on_state(phase, detail=''):
+        label = PHASE_LABELS.get(phase, phase)
+        if phase == 'waiting_for_lease' and detail:
+            label = f'Czekam na wolną kartę GPU ({detail})...'
+        job_set(jid, status=phase, phase=phase, phase_label=label)
+
+    try:
+        waited = int(time.time() - rec['enqueued_at'])
+        if waited > 1:
+            metric('queue_wait', backend=backend, kind=kind, waited_s=waited)
+
+        _on_state('waiting_for_lease')
+        lease_id = lease.acquire(
+            job_id=jid,
+            service=svc,
+            budget_s=budget_s + 240,
+            on_state=_on_state,
+            cancel_evt=cancel_evt,
+            max_wait_s=GPU_LEASE_WAIT_MAX_S,
+        )
+        lease_acquired = True
+        metric('lease_acquired', backend=backend, service=svc, lease_id=lease_id, budget_s=budget_s)
+
+        if cancel_evt.is_set():
+            raise JobCancelled('Anulowano przed uruchomieniem backendu')
+
+        job_set(
+            jid,
+            status='starting_backend',
+            phase='starting_backend',
+            phase_label=f'Uruchamiam {_backend_display_name(backend)}...',
+        )
+        metric('backend_autostart', backend=backend, service=svc)
+        lease.start_backend(svc)
+        ok_health = _wait_backend_health(backend, timeout_s=180, cancel_evt=cancel_evt)
+        metric('backend_autostart_done', backend=backend, service=svc, ok=ok_health)
+        if cancel_evt.is_set():
+            raise JobCancelled('Anulowano podczas uruchamiania backendu')
+        if not ok_health:
+            raise RuntimeError(f'Backend {_backend_display_name(backend)} nie odpowiedział w czasie 180s.')
+
+        if backend == 'forge':
+            _refresh_forge_live_titles()
+
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie...')
+        metric('job_start', backend=backend, kind=kind, model=str(params.get('model', '')))
+        tj = time.time()
+
+        worker_done = threading.Event()
+        worker_exc = [None]
+
+        def _run_target():
+            try:
+                target(params, jid)
+            except Exception as exc:
+                worker_exc[0] = exc
+            finally:
+                worker_done.set()
+
+        wt = threading.Thread(target=_run_target, daemon=True)
+        wt.start()
+
+        deadline = time.monotonic() + budget_s
+        while not worker_done.wait(timeout=0.5):
+            if cancel_evt.is_set():
+                abort = True
+                if backend in ('zimage', 'flux', 'wanvideo'):
+                    try:
+                        comfy_post('/interrupt', {}, timeout=5)
+                    except Exception:
+                        pass
+                elif backend == 'forge':
+                    try:
+                        forge_post('/sdapi/v1/interrupt', {}, timeout=5)
+                    except Exception:
+                        pass
+                lease.stop_backend()
+                worker_done.wait(timeout=15)
+                raise JobCancelled('Zadanie anulowane przez użytkownika')
+            if time.monotonic() >= deadline:
+                abort = True
+                metric('watchdog_fire', backend=backend, kind=kind, budget_s=budget_s)
+                lease.stop_backend()
+                worker_done.wait(timeout=15)
+                raise RuntimeError(f'Watchdog: zadanie przekroczyło limit {budget_s}s — zatrzymano backend.')
+
+        if worker_exc[0] is not None:
+            raise worker_exc[0]
+
+        with _jlock:
+            cur = dict(JOBS.get(jid, {}))
+        res_st = cur.get('_result_status')
+        if res_st == 'done':
+            final_status = 'done'
+            final_error = cur.get('error')
+        elif res_st == 'cancelled':
+            final_status = 'cancelled'
+            final_error = cur.get('error') or 'Zadanie anulowane'
+        elif res_st == 'error':
+            final_status = 'error'
+            final_error = cur.get('error') or 'Nieznany błąd generowania'
+        else:
+            # Fallback gdyby wątek ustawił bezpośrednio status lub nic nie ustawił
+            final_status = 'done' if cur.get('images') else 'error'
+            final_error = cur.get('error')
+    except JobCancelled as exc:
+        abort = True
+        final_status = 'cancelled'
+        final_error = str(exc)
+    except Exception as exc:
+        abort = True
+        final_status = 'error'
+        final_error = str(exc)
+    finally:
+        if lease_acquired:
+            job_set(
+                jid,
+                status='finalizing',
+                phase='stopping_backend',
+                phase_label=PHASE_LABELS['stopping_backend'],
+            )
+            restored = lease.finish(abort=abort, on_state=lambda st, _: job_set(
+                jid,
+                status='finalizing',
+                phase=st,
+                phase_label=PHASE_LABELS.get(st, st),
+            ))
+            metric('lease_released', backend=backend, service=svc, abort=abort, restored=restored)
+        job_set(
+            jid,
+            status=final_status,
+            phase=final_status,
+            phase_label='Gotowe' if final_status == 'done' else (final_error or final_status),
+            error=final_error,
+        )
+        metric('job_end', backend=backend, kind=kind, duration_s=int(time.time() - tj),
+               final_status=final_status)
+
+
+def _gpu_worker_loop():
+    global _gpu_active_job
+    while True:
+        with _queue_lock:
+            while not _gpu_pending:
+                _queue_cond.wait()
+            rec = _gpu_pending.popleft()
+            _gpu_active_job = rec
+        try:
+            _execute_gpu_job(rec)
+        except Exception as exc:
+            metric('gpu_worker_error', error=str(exc)[:160])
+        finally:
+            rec['done_evt'].set()
+            with _queue_lock:
+                _gpu_active_job = None
+
+
+_gpu_worker_started = False
+_gpu_worker_start_lock = threading.Lock()
+
+
+def ensure_gpu_worker():
+    global _gpu_worker_started
+    with _gpu_worker_start_lock:
+        if not _gpu_worker_started:
+            threading.Thread(target=_gpu_worker_loop, daemon=True).start()
+            _gpu_worker_started = True
+
+
+def gpu_run(kind, backend, target, params, jid=None):
+    """Kompatybilnościowe wywołanie synchroniczne (np. dla skryptów testowych)."""
+    ensure_gpu_worker()
+    submitted_jid, err, _code = submit_gpu_job(kind, backend, target, params)
+    if err:
+        if jid:
+            job_set(jid, status='error', error=err)
+        return
+    # Czekaj aż worker skończy to zadanie
+    while True:
+        st = job_get(submitted_jid)
+        if st.get('status') in TERMINAL_JOB_STATUSES:
+            if jid and jid != submitted_jid:
+                job_set(jid, **st)
+            return
+        time.sleep(0.5)
 
 # ── Presets ───────────────────────────────────────────────────────────────────
 NEG = ('(worst quality:2), (low quality:2), (blurry:1.3), deformed, ugly, extra limbs, '
@@ -928,17 +1062,19 @@ def build_model_optgroups(models):
     for m in models:
         name = m.get('model_name', '')
         info = get_model_info(name)
-        buckets.get(info['cat'], buckets['Inne']).append((name, info.get('desc', '')))
+        desc = m.get('reason') if not m.get('available', True) else info.get('desc', '')
+        buckets.get(info['cat'], buckets['Inne']).append((name, desc, m.get('available', True)))
     out = ''
     for cat in MODEL_CATEGORIES:
         items = buckets[cat]
         if not items:
             continue
         out += f'<optgroup label="{html.escape(cat)}">'
-        for name, desc in sorted(items, key=lambda x: x[0].lower()):
+        for name, desc, avail in sorted(items, key=lambda x: x[0].lower()):
             n = html.escape(name)
-            d = html.escape(desc)
-            out += f'<option value="{n}" title="{d}">{n}</option>'
+            d = html.escape(desc or '')
+            label = n if avail else f'{n} (brak plików)'
+            out += f'<option value="{n}" title="{d}" data-available="{1 if avail else 0}">{label}</option>'
         out += '</optgroup>'
     return out
 
@@ -1007,12 +1143,28 @@ def krea_post(path, data, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read(), dict(r.headers)
 
-# Cache modeli Forge — odnawiany w tle co 30s
+# Katalog modeli offline (skan dysku + konfiguracji) — działa przy wyłączonych backendach GPU
 _models_cache = []
 _models_lock  = threading.Lock()
+_forge_live_titles = {}   # model_name -> dokładny title z /sdapi/v1/sd-models po starcie Forge
+_sha256_cache = {}        # (path, size, mtime_ns) -> sha256 hex
+_sha256_lock  = threading.Lock()
 _downloads    = {}   # job_id -> {url,filename,percent,status,error,bytes_done,size,ts}
-DOWNLOADS_KEEP    = 40      # ile wpisow trzymac
-DOWNLOADS_KEEP_S  = 3600    # jak dlugo trzymac zakonczony wpis (front odpytuje progress)
+DOWNLOADS_KEEP    = 40
+DOWNLOADS_KEEP_S  = 3600
+
+KREA2_UNIT_PATH = Path(os.environ.get('GP_KREA2_UNIT', '/home/bartek/.config/systemd/user/krea2.service'))
+KREA2_DEFAULT_PATHS = {
+    'oss_turbo':    '/home/bartek/krea-2/models/turbo_sharded',
+    'oss_raw':      '/home/bartek/krea-2/models/raw_sharded',
+    'oss_moody':    '/home/bartek/krea-2/models/moody_sharded',
+    'oss_krea2gpt': '/home/bartek/krea-2/models/krea2gpt_sharded',
+    'oss_krealism': '/home/bartek/krea-2/models/krealism_sharded',
+    'oss_redcraft': '/home/bartek/krea-2/models/redcraft_sharded',
+}
+ZIMAGE_CLIP_NAME = 'Qwen3-4B-UD-Q5_K_XL.gguf'
+ZIMAGE_VAE_NAME  = 'ae.safetensors'
+
 
 def downloads_gc():
     """Usun stare zakonczone pobrania. Bez tego _downloads rosl bez konca."""
@@ -1025,36 +1177,190 @@ def downloads_gc():
         for k in sorted(_downloads, key=lambda j: _downloads[j].get('ts', 0))[:-DOWNLOADS_KEEP]:
             if _downloads[k].get('status') in ('done', 'error'):
                 _downloads.pop(k, None)
-MODELS_DIR    = Path('/home/bartek/forge/models/Stable-diffusion')
-LORAS_DIR     = Path(os.environ.get('GP_LORAS_DIR', '/home/bartek/comfyui/models/loras'))
+
+
+MODELS_DIR      = Path('/home/bartek/forge/models/Stable-diffusion')
+LORAS_DIR       = Path(os.environ.get('GP_LORAS_DIR', '/home/bartek/comfyui/models/loras'))
 FORGE_LORAS_DIR = Path('/home/bartek/forge/models/Lora')
 
-def _refresh_models_once(rescan_disk=False):
-    # rescan_disk=True wymusza na Forge pełny skan katalogu modeli
-    # (/sdapi/v1/refresh-checkpoints) — kosztowne I/O, więc tylko event-driven
-    # (upload/download/ręczny refresh/start procesu), NIE w cyklicznym workerze.
-    global _models_cache
-    data = []
+
+def _krea2_configured_paths():
+    paths = dict(KREA2_DEFAULT_PATHS)
     try:
-        if rescan_disk:
-            forge_post('/sdapi/v1/refresh-checkpoints', {})
-        data = forge_get('/sdapi/v1/sd-models') or []
+        for line in KREA2_UNIT_PATH.read_text(encoding='utf-8').splitlines():
+            m = re.match(r'^Environment=(OSS_[A-Z0-9_]+)=(.+)$', line.strip())
+            if m:
+                key = m.group(1).lower()
+                paths[key] = m.group(2).strip()
+    except OSError:
+        pass
+    return paths
+
+
+def _path_ready(path_str):
+    p = Path(path_str)
+    if not p.exists():
+        return False
+    if p.is_dir():
+        try:
+            return any(p.iterdir())
+        except OSError:
+            return False
+    return p.is_file() and p.stat().st_size > 0
+
+
+def _forge_family_and_caps(stem, is_flux):
+    if is_flux:
+        return 'flux', ['generate', 'edit']
+    sl = stem.lower()
+    if any(k in sl for k in ('v1-5', 'v1_5', 'sd15', 'sd1.5', 'pruned', 'epicphotogasm', 'epicrealism_pure')):
+        return 'sd15', ['generate', 'edit']
+    if 'pony' in sl:
+        return 'pony', ['generate', 'edit', 'portrait', 'pose']
+    return 'sdxl', ['generate', 'edit', 'portrait', 'pose']
+
+
+def _refresh_forge_live_titles():
+    """Po uruchomieniu Forge pobierz mapę dokładnych tytułów modeli (/sdapi/v1/sd-models)."""
+    try:
+        items = forge_get('/sdapi/v1/sd-models', timeout=15) or []
+        mapping = {}
+        for m in items:
+            mname = m.get('model_name') or ''
+            title = m.get('title') or ''
+            fname = m.get('filename') or ''
+            if mname and title:
+                mapping[mname] = title
+            if fname and title:
+                mapping[Path(fname).stem] = title
+                mapping[Path(fname).name] = title
+        with _models_lock:
+            _forge_live_titles.update(mapping)
     except Exception:
         pass
-    try:
-        krea_health = json.loads(urllib.request.urlopen(f'{KREA2_URL}/health', timeout=3).read())
-        for name, exists in (krea_health.get('models') or {}).items():
-            if exists:
-                data.append({'model_name': f'krea2_{name}', 'title': f'Krea 2 {name}', 'hash': ''})
-    except:
-        pass
-    try:
-        urllib.request.urlopen(f'{COMFY_URL}/system_stats', timeout=3).read()
-        data.append({'model_name': 'zimage_turbo', 'title': 'Z-Image Turbo', 'hash': ''})
-        for fid, fm in FLUX_MODELS.items():
-            data.append({'model_name': fid, 'title': fm['title'], 'hash': ''})
-    except:
-        pass
+
+
+def _file_sha256_cached(path_str):
+    p = Path(path_str)
+    st = p.stat()
+    key = (str(p), st.st_size, st.st_mtime_ns)
+    with _sha256_lock:
+        hit = _sha256_cache.get(key)
+        if hit:
+            return hit
+    h = hashlib.sha256()
+    with open(p, 'rb') as fh:
+        while True:
+            chunk = fh.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    digest = h.hexdigest()
+    with _sha256_lock:
+        if len(_sha256_cache) > 64:
+            _sha256_cache.clear()
+        _sha256_cache[key] = digest
+    return digest
+
+
+def _find_model_entry(model_name):
+    with _models_lock:
+        for m in _models_cache:
+            if m.get('model_name') == model_name:
+                return dict(m)
+    return None
+
+
+def _refresh_models_once(rescan_disk=False):
+    """Zbuduj pełny katalog modeli ze skanu dysku — bez potrzeby uruchamiania backendów GPU."""
+    global _models_cache
+    data = []
+
+    # 1. Forge (skan katalogu checkpointów na dysku)
+    if MODELS_DIR.exists():
+        for p in sorted(MODELS_DIR.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_file() or p.name.startswith('.') or p.name.startswith('put_'):
+                continue
+            if p.suffix.lower() not in ('.safetensors', '.ckpt', '.pt'):
+                continue
+            fname = str(p)
+            stem = p.stem
+            flux = is_flux_checkpoint(fname)
+            fam, caps = _forge_family_and_caps(stem, flux)
+            data.append({
+                'model_name': stem,
+                'title': p.name,
+                'filename': fname,
+                'hash': '',
+                'backend': 'forge',
+                'family': fam,
+                'is_flux': flux,
+                'capabilities': caps,
+                'available': True,
+                'reason': '',
+            })
+
+    # 2. Krea 2 (z konfiguracji krea2.service + sprawdzenie obecności na dysku)
+    for key, path_str in _krea2_configured_paths().items():
+        ok = _path_ready(path_str)
+        data.append({
+            'model_name': f'krea2_{key}',
+            'title': f'Krea 2 {key}',
+            'filename': path_str,
+            'hash': '',
+            'backend': 'krea2',
+            'family': 'krea2',
+            'is_flux': False,
+            'capabilities': ['generate'],
+            'available': ok,
+            'reason': '' if ok else f'Brak wag Krea 2 na dysku: {Path(path_str).name}',
+        })
+
+    # 3. ComfyUI: Z-Image Turbo
+    z_unets = sorted(COMFY_UNET_DIR.glob('z_image_turbo-*.gguf')) if COMFY_UNET_DIR.exists() else []
+    z_clip_ok = any((COMFY_MODELS_DIR / d / ZIMAGE_CLIP_NAME).exists() for d in ('text_encoders', 'clip'))
+    z_vae_ok = (COMFY_MODELS_DIR / 'vae' / ZIMAGE_VAE_NAME).exists()
+    z_ok = bool(z_unets) and z_clip_ok and z_vae_ok
+    z_reason = ''
+    if not z_ok:
+        miss = []
+        if not z_unets: miss.append('z_image_turbo-*.gguf')
+        if not z_clip_ok: miss.append(ZIMAGE_CLIP_NAME)
+        if not z_vae_ok: miss.append(ZIMAGE_VAE_NAME)
+        z_reason = 'Brak plików Z-Image: ' + ', '.join(miss)
+    data.append({
+        'model_name': 'zimage_turbo',
+        'title': 'Z-Image Turbo',
+        'filename': '',
+        'hash': '',
+        'backend': 'zimage',
+        'family': 'zimage',
+        'is_flux': False,
+        'capabilities': ['generate'],
+        'available': z_ok,
+        'reason': z_reason,
+    })
+
+    # 4. ComfyUI: FLUX + MOSS
+    for fid, fm in FLUX_MODELS.items():
+        missing = []
+        for kind, names in (('unet', (fm['unet'],)), ('clip', fm['clip']), ('vae', (fm['vae'],))):
+            for name in names:
+                if not any((COMFY_MODELS_DIR / d / name).exists() for d in _FLUX_DIRS[kind]):
+                    missing.append(name)
+        data.append({
+            'model_name': fid,
+            'title': fm['title'],
+            'filename': '',
+            'hash': '',
+            'backend': 'flux',
+            'family': fm['family'],
+            'is_flux': fm['family'] != 'moss',
+            'capabilities': ['generate'],
+            'available': not missing,
+            'reason': '' if not missing else 'Brak plików w ComfyUI: ' + ', '.join(missing),
+        })
+
     with _models_lock:
         _models_cache = data
 
@@ -1268,10 +1574,8 @@ def _download_model_thread(job_id, url, dest_dir=None, refresh=True):
 def _models_cache_worker():
     import time as _time
     while True:
-        _time.sleep(300)  # co 5 min wystarczy — skan dysku robią eventy (upload/download)
+        _time.sleep(300)
         try:
-            if _gpu_lock.locked():
-                continue  # backpressure: nie dokładać I/O na Forge podczas generowania
             _refresh_models_once()
         except Exception:
             pass
@@ -1354,10 +1658,17 @@ def is_flux_checkpoint(filename):
 def resolve_model(model_name):
     with _models_lock:
         models = list(_models_cache)
+        live_titles = dict(_forge_live_titles)
     for m in models:
         if m.get('model_name') == model_name:
-            return m['title'], m.get('filename', '')
-    return model_name, ''
+            fname = m.get('filename', '')
+            title = (
+                live_titles.get(model_name)
+                or (live_titles.get(Path(fname).name) if fname else None)
+                or m['title']
+            )
+            return title, fname
+    raise RuntimeError(f'Nie znaleziono modelu w katalogu: {model_name!r}')
 
 FLUX_ADDITIONAL_MODULES = [
     '/home/bartek/forge/models/text_encoder/clip_l.safetensors',
@@ -1414,45 +1725,59 @@ def _apply_lora_tags(prompt, loras):
     return prompt
 
 def forge_generate_thread(params, jid):
+    paths = []
+    first_seed = -1
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (Forge)...')
         title, fname = resolve_model(params['model'])
         prompt = _apply_lora_tags(params['positive'], params.get('loras'))
-        body = {
-            'prompt':          prompt,
-            'negative_prompt': params['negative'],
-            'sampler_name':    params['sampler'],
-            'scheduler':       params.get('scheduler', 'Karras'),
-            'steps':           int(params['steps']),
-            'cfg_scale':       float(params['cfg']),
-            'width':           int(params['width']),
-            'height':          int(params['height']),
-            'seed':            int(params.get('seed', -1)),
-            'batch_size':      int(params.get('batch', 1)),
-            'n_iter':          1,
-            'override_settings': model_override_settings(title, fname),
-            'override_settings_restore_afterwards': True,
-            'save_images': False,
-        }
-        adetailer_scripts = build_adetailer_scripts(params)
-        if adetailer_scripts:
-            body['alwayson_scripts'] = adetailer_scripts
-        data = forge_post('/sdapi/v1/txt2img', body)
-        imgs_b64 = data.get('images', [])
-        info     = json.loads(data.get('info', '{}'))
-        seed     = info.get('seed', -1)
-        seeds    = info.get('all_seeds', [seed] * len(imgs_b64))
+        batch = max(1, int(params.get('batch', 1)))
+        req_seed = int(params.get('seed', -1))
+        base_seed = req_seed if req_seed >= 0 else secrets.randbelow(2**31)
 
         today   = datetime.now().strftime('%Y-%m-%d')
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time() * 1000)
-        paths = []
-        for i, b64 in enumerate(imgs_b64):
-            s    = seeds[i] if i < len(seeds) else seed
-            name = f'gp_{ts}_{i:02d}_s{s}.png'
-            (out_dir / name).write_bytes(base64.b64decode(b64))
-            paths.append(f'genphoto/{today}/{name}')
+        adetailer_scripts = build_adetailer_scripts(params)
+        override = model_override_settings(title, fname)
+
+        # Sekwencyjnie batch_size=1 w jednej dzierżawie GPU: mniejszy szczyt VRAM na 12 GB,
+        # bieżący postęp X/N w UI oraz możliwość przerwania między obrazami.
+        for i in range(batch):
+            _check_cancelled(params)
+            if batch > 1:
+                job_set(jid, progress={'current': i + 1, 'total': batch, 'model': params['model']},
+                        phase_label=f'Generowanie (Forge) {i + 1}/{batch}...')
+            cur_seed = base_seed + i
+            body = {
+                'prompt':          prompt,
+                'negative_prompt': params['negative'],
+                'sampler_name':    params['sampler'],
+                'scheduler':       params.get('scheduler', 'Karras'),
+                'steps':           int(params['steps']),
+                'cfg_scale':       float(params['cfg']),
+                'width':           int(params['width']),
+                'height':          int(params['height']),
+                'seed':            cur_seed,
+                'batch_size':      1,
+                'n_iter':          1,
+                'override_settings': override,
+                'override_settings_restore_afterwards': False,
+                'save_images': False,
+            }
+            if adetailer_scripts:
+                body['alwayson_scripts'] = adetailer_scripts
+            data = forge_post('/sdapi/v1/txt2img', body)
+            imgs_b64 = data.get('images', [])
+            info     = json.loads(data.get('info', '{}'))
+            s        = int(info.get('seed', cur_seed))
+            if first_seed < 0:
+                first_seed = s
+            for b64 in imgs_b64:
+                name = f'gp_{ts}_{i:02d}_s{s}.png'
+                (out_dir / name).write_bytes(base64.b64decode(b64))
+                paths.append(f'genphoto/{today}/{name}')
 
         gid = params.get('gen_id', uuid.uuid4().hex)
         with _db_lock:
@@ -1464,12 +1789,14 @@ def forge_generate_thread(params, jid):
                      params['sampler'], params.get('scheduler','Karras'),
                      int(params['steps']), float(params['cfg']),
                      int(params['width']), int(params['height']),
-                     seed, int(params.get('batch',1)),
+                     first_seed, len(paths),
                      params.get('preset','custom'), json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=first_seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=paths, seed=first_seed, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=paths, seed=first_seed, error=str(e))
 
 def forge_batch_all_models_thread(params, jid):
     """Generuj ten sam prompt sekwencyjnie na wszystkich modelach Forge —
@@ -1478,15 +1805,17 @@ def forge_batch_all_models_thread(params, jid):
     biorą się z trwałej bazy model_settings (Etap 1), z fallbackiem do wartości
     z formularza dla modeli bez zapisanych ustawień.
     """
+    all_paths = []
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (wszystkie modele Forge)...')
         with _models_lock:
             # Pomijamy domyślnie modele architektury Flux (np. flux1-dev-fp8) —
             # znacznie wolniejsze od SDXL (minuty zamiast sekund na obraz),
             # rozwałałyby czas całego przebiegu "wszystkie modele".
             all_models = [
                 m for m in _models_cache
-                if m.get('filename') and not is_flux_checkpoint(m['filename'])
+                if m.get('backend') == 'forge' and m.get('available', True)
+                and m.get('filename') and not is_flux_checkpoint(m['filename'])
             ]
         total = len(all_models)
         if total == 0:
@@ -1497,16 +1826,16 @@ def forge_batch_all_models_thread(params, jid):
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time() * 1000)
         gid = params.get('gen_id', uuid.uuid4().hex)
-        all_paths = []
         errors = []
 
         for idx, m in enumerate(all_models):
+            _check_cancelled(params)
             model_name = m['model_name']
-            title = m['title']
-            fname = m.get('filename', '')
+            title, fname = resolve_model(model_name)
 
             job_set(jid, status='generating',
-                    progress={'current': idx + 1, 'total': total, 'model': model_name})
+                    progress={'current': idx + 1, 'total': total, 'model': model_name},
+                    phase_label=f'Model {idx + 1}/{total}: {model_name}')
 
             saved = _get_saved_model_settings(model_name)
             if saved:
@@ -1573,10 +1902,12 @@ def forge_batch_all_models_thread(params, jid):
                     pass
 
         status = 'done' if all_paths else 'error'
-        job_set(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
-                error=('; '.join(errors) if errors else None))
+        job_finish(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
+                   error=('; '.join(errors) if errors else None))
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=all_paths, seed=-1, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=all_paths, seed=-1, error=str(e))
 
 KREA2_BATCH_VARIANTS = ['oss_moody', 'oss_krea2gpt', 'oss_krealism', 'oss_redcraft']
 
@@ -1586,8 +1917,9 @@ def krea_batch_variants_thread(params, jid):
     samo zwalnia VRAM poprzedniego checkpointu przy zmianie (patrz get_pipeline
     w krea-2/api.py) — w przeciwienstwie do Forge nie trzeba tu wolac osobnego
     unload miedzy modelami."""
+    all_paths = []
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (Krea 2 warianty)...')
         total = len(KREA2_BATCH_VARIANTS)
         images_per_variant = 2
 
@@ -1602,17 +1934,19 @@ def krea_batch_variants_thread(params, jid):
         width  = min(int(params.get('width', 1024)), 2048)
         height = min(int(params.get('height', 1024)), 2048)
 
-        all_paths = []
         errors = []
 
         for idx, checkpoint in enumerate(KREA2_BATCH_VARIANTS):
+            _check_cancelled(params)
             model_name = f'krea2_{checkpoint}'
             job_set(jid, status='generating',
-                    progress={'current': idx + 1, 'total': total, 'model': model_name})
+                    progress={'current': idx + 1, 'total': total, 'model': model_name},
+                    phase_label=f'Wariant {idx + 1}/{total}: {model_name}')
             try:
                 paths = []
                 first_seed = None
                 for i in range(images_per_variant):
+                    _check_cancelled(params)
                     body = {
                         'prompt': params['positive'],
                         'negative_prompt': params.get('negative', '') or '',
@@ -1643,24 +1977,26 @@ def krea_batch_variants_thread(params, jid):
                                  int(first_seed), images_per_variant,
                                  'krea2_batch_variants', json.dumps(paths))
                             )
+            except JobCancelled:
+                raise
             except Exception as variant_err:
                 errors.append(f'{model_name}: {variant_err}')
 
         status = 'done' if all_paths else 'error'
-        job_set(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
-                error=('; '.join(errors) if errors else None))
+        job_finish(jid, status=status, images=all_paths, seed=-1, gen_id=gid,
+                   error=('; '.join(errors) if errors else None))
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=all_paths, seed=-1, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=all_paths, seed=-1, error=str(e))
 
 def krea_generate_thread(params, jid):
     """Generate using Krea 2 API."""
+    paths = []
+    first_seed = None
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (Krea 2)...')
         
-        # Determine checkpoint — model_name z listy zawsze ma postac 'krea2_<checkpoint>'
-        # (patrz _refresh_models_once, ktore buduje ta liste wprost z /health Krea2 API,
-        # wiec kazdy checkpoint zgloszony przez API automatycznie tu dziala, bez
-        # koniecznosci recznego dopisywania kolejnych 'elif' przy nowych modelach).
         model = (params.get('model') or '').strip()
         if model.startswith('krea2_'):
             checkpoint = model[len('krea2_'):]
@@ -1671,9 +2007,8 @@ def krea_generate_thread(params, jid):
                 f'jeden z modeli Krea 2 z listy.'
             )
 
-        # Krea 2 parameters — num_images always 1: a batched forward pass
-        # doubles VAE-decode activation memory and OOMs on 12 GB VRAM once
-        # the quantized model is loaded, so images are generated one at a time.
+        req_seed = int(params.get('seed', -1))
+        base_seed = req_seed if req_seed >= 0 else secrets.randbelow(2**31)
         body = {
             'prompt': params['positive'],
             'negative_prompt': params.get('negative', '') or '',
@@ -1681,14 +2016,12 @@ def krea_generate_thread(params, jid):
             'width': min(int(params['width']), 2048),
             'height': min(int(params['height']), 2048),
             'num_images': 1,
-            'seed': int(params.get('seed', 0)),
+            'seed': base_seed,
         }
 
-        # Steps: default 8 for turbo, 52 for raw
         if 'steps' in params and params['steps']:
             body['steps'] = int(params['steps'])
 
-        # CFG: default 0.0 for turbo, 3.5 for raw
         if 'cfg' in params and params['cfg']:
             body['cfg'] = float(params['cfg'])
 
@@ -1696,16 +2029,14 @@ def krea_generate_thread(params, jid):
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time() * 1000)
-        base_seed = body['seed']
-        batch = int(params.get('batch', 1))
-        paths = []
-        first_seed = None
+        batch = max(1, int(params.get('batch', 1)))
 
         for i in range(batch):
+            _check_cancelled(params)
+            if batch > 1:
+                job_set(jid, progress={'current': i + 1, 'total': batch, 'model': model},
+                        phase_label=f'Generowanie (Krea 2) {i + 1}/{batch}...')
             body['seed'] = base_seed + i
-            # timeout 600s: pierwsze wywołanie po starcie krea2 ładuje pipeline
-            # z dysku + kwantyzacja bnb — przy współdzielonym GPU to ~4 min,
-            # domyślne 120s zabijało nawet udane generowanie.
             img_data, headers = krea_post('/generate', body, timeout=600)
             seed = headers.get('X-Seed', str(body['seed']))
             if first_seed is None:
@@ -1727,14 +2058,17 @@ def krea_generate_thread(params, jid):
                      int(first_seed), batch,
                      params.get('preset','krea'), json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=first_seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=first_seed, gen_id=gid)
 
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=paths, seed=first_seed or -1, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=paths, seed=first_seed or -1, error=str(e))
 
 def forge_img2img_ref_thread(params, jid):
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie img2img (Forge)...')
+        _check_cancelled(params)
         title, fname = resolve_model(params['model'])
         data  = forge_post('/sdapi/v1/img2img', {
             'init_images':        [params['init_image']],
@@ -1750,10 +2084,10 @@ def forge_img2img_ref_thread(params, jid):
             'width':              int(params['width']),
             'height':             int(params['height']),
             'seed':               int(params.get('seed', -1)),
-            'batch_size':         int(params.get('batch', 1)),
-            'n_iter':             1,
+            'batch_size':         1,
+            'n_iter':             max(1, int(params.get('batch', 1))),
             'override_settings':  model_override_settings(title, fname),
-            'override_settings_restore_afterwards': True,
+            'override_settings_restore_afterwards': False,
             'save_images':        False,
         })
         imgs_b64 = data.get('images', [])
@@ -1785,13 +2119,16 @@ def forge_img2img_ref_thread(params, jid):
                      seed, int(params.get('batch', 1)),
                      'img2img', json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', error=str(e))
 
 def forge_edit_thread(params, jid):
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Edytowanie zdjęcia (Forge)...')
+        _check_cancelled(params)
         title, fname = resolve_model(params['model'])
         mask  = params.get('mask_b64') or None
         data  = forge_post('/sdapi/v1/img2img', {
@@ -1812,7 +2149,7 @@ def forge_edit_thread(params, jid):
             'batch_size':         1,
             'n_iter':             1,
             'override_settings':  model_override_settings(title, fname),
-            'override_settings_restore_afterwards': True,
+            'override_settings_restore_afterwards': False,
             'save_images':        False,
         })
         imgs_b64 = data.get('images', [])
@@ -1843,9 +2180,11 @@ def forge_edit_thread(params, jid):
                      seed, json.dumps(paths),
                      params.get('source_path', ''))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', error=str(e))
 
 def _find_recent_video(ts_before):
     """Znajdź MP4 wygenerowany przez AnimateDiff po podanym timestampie."""
@@ -1940,8 +2279,10 @@ def _zimage_unet_name(params):
 
 def zimage_generate_thread(params, jid):
     """Generate using Z-Image Turbo via local ComfyUI (GGUF, port 8189)."""
+    paths = []
+    seed = -1
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (Z-Image)...')
         import copy as _copy
 
         unet_name = _zimage_unet_name(params)
@@ -1949,7 +2290,7 @@ def zimage_generate_thread(params, jid):
         height = int(params['height'])
         steps  = int(params.get('steps', 8)) or 8
         cfg    = float(params.get('cfg', 1.0)) or 1.0
-        batch  = int(params.get('batch', 1))
+        batch  = max(1, int(params.get('batch', 1)))
         seed   = int(params.get('seed', -1))
         if seed < 0:
             seed = secrets.randbelow(2**32)
@@ -1958,13 +2299,16 @@ def zimage_generate_thread(params, jid):
         today   = datetime.now().strftime('%Y-%m-%d')
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
-        paths = []
 
         loras = params.get('loras') or []
 
         # Jeden obraz na raz — batch>1 w jednym forward passie podwaja pamięć
         # aktywacji przy dekodowaniu VAE i grozi OOM na 12 GB VRAM (patrz Krea 2).
         for i in range(batch):
+            _check_cancelled(params)
+            if batch > 1:
+                job_set(jid, progress={'current': i + 1, 'total': batch, 'model': 'zimage_turbo'},
+                        phase_label=f'Generowanie (Z-Image) {i + 1}/{batch}...')
             graph = _copy.deepcopy(ZIMAGE_TEMPLATE)
             graph['1']['inputs']['unet_name']      = unet_name
             graph['4']['inputs']['text']            = params['positive']
@@ -1976,8 +2320,6 @@ def zimage_generate_thread(params, jid):
             graph['7']['inputs']['cfg']              = cfg
             graph['9']['inputs']['filename_prefix']  = f'gp_zimage_{ts}'
 
-            # Wpinamy LoRA łańcuchowo między UnetLoaderGGUF (node "1") a samplerem —
-            # każda kolejna LoRA bierze MODEL z wyjścia poprzedniej.
             model_ref = ['1', 0]
             for li, lora in enumerate(loras):
                 node_id = f'lora{li}'
@@ -1998,10 +2340,14 @@ def zimage_generate_thread(params, jid):
             deadline = time.time() + 300
             history = None
             while time.time() < deadline:
+                _check_cancelled(params)
                 h = comfy_get(f'/history/{prompt_id}', timeout=15)
                 if prompt_id in h and h[prompt_id].get('outputs'):
                     history = h[prompt_id]
                     break
+                status = h.get(prompt_id, {}).get('status', {})
+                if status.get('status_str') == 'error':
+                    raise RuntimeError('Błąd ComfyUI: ' + str(status.get('messages', []))[-1200:])
                 time.sleep(2)
             if history is None:
                 raise RuntimeError('Timeout oczekiwania na wygenerowanie obrazu (Z-Image)')
@@ -2027,9 +2373,11 @@ def zimage_generate_thread(params, jid):
                      'euler', 'simple', steps, cfg, width, height,
                      seed, batch, params.get('preset','zimage'), json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=paths, seed=seed, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=paths, seed=seed, error=str(e))
 
 
 # ── FLUX (ComfyUI) — Krea dev i Klein 9B ─────────────────────────────────────
@@ -2118,9 +2466,11 @@ def _flux_check_files(m):
         raise RuntimeError('Brak plików modelu w ComfyUI: ' + ', '.join(missing))
 
 def flux_generate_thread(params, jid):
-    """Generate using FLUX.1 Krea dev / FLUX.2 Klein 9B via local ComfyUI (port 8189)."""
+    """Generate using FLUX.1 Krea dev / FLUX.2 Klein 9B / MOSS Image SFT via local ComfyUI (port 8189)."""
+    paths = []
+    seed = -1
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie (FLUX / MOSS)...')
         import copy as _copy
 
         model_id = params.get('model') or 'flux1_krea_dev'
@@ -2134,7 +2484,7 @@ def flux_generate_thread(params, jid):
         width  = max(256, int(params['width']))  // 16 * 16
         height = max(256, int(params['height'])) // 16 * 16
         steps  = int(params.get('steps') or m['steps'])
-        batch  = int(params.get('batch', 1))
+        batch  = max(1, int(params.get('batch', 1)))
         seed   = int(params.get('seed', -1))
         if seed < 0:
             seed = secrets.randbelow(2**32)
@@ -2144,15 +2494,14 @@ def flux_generate_thread(params, jid):
         today   = datetime.now().strftime('%Y-%m-%d')
         out_dir = OUTPUTS_DIR / 'genphoto' / today
         out_dir.mkdir(parents=True, exist_ok=True)
-        paths = []
         loras = params.get('loras') or []
 
-        if m['family'] == 'moss' and batch != 1:
-            raise RuntimeError('MOSS obsługuje obecnie jeden obraz na zadanie.')
-
-        # Jeden obraz na raz — batch>1 w jednym passie podwaja pamięć aktywacji
-        # przy dekodowaniu VAE i grozi OOM na 12 GB (ta sama zasada co w Z-Image).
+        # Jeden obraz na raz w jednej dzierżawie GPU — dotyczy też MOSS (batch_size=1, seed+i).
         for i in range(batch):
+            _check_cancelled(params)
+            if batch > 1:
+                job_set(jid, progress={'current': i + 1, 'total': batch, 'model': model_id},
+                        phase_label=f'Generowanie ({m["title"]}) {i + 1}/{batch}...')
             if m['family'] == 'flux1':
                 graph = _copy.deepcopy(FLUX1_TEMPLATE)
                 graph['1']['inputs']['unet_name']  = m['unet']
@@ -2195,7 +2544,6 @@ def flux_generate_thread(params, jid):
                 graph['12']['inputs']['filename_prefix'] = f'gp_flux_{ts}'
                 sampler_node, out_node = '9', '12'
 
-            # LoRA łańcuchowo między loaderem UNET a samplerem/guiderem.
             model_ref = ['1', 0]
             for li, lora in enumerate(loras):
                 node_id = f'lora{li}'
@@ -2213,11 +2561,10 @@ def flux_generate_thread(params, jid):
             resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
             prompt_id = resp['prompt_id']
 
-            # Krea dev na 12 GB ładuje 11,9 GB wag przy każdym jobie — 300 s jak
-            # w Z-Image bywało za mało, stąd 900 s na obraz.
             deadline = time.time() + (3000 if m['family'] == 'moss' else 900)
             history = None
             while time.time() < deadline:
+                _check_cancelled(params)
                 h = comfy_get(f'/history/{prompt_id}', timeout=15)
                 if prompt_id in h and h[prompt_id].get('outputs'):
                     history = h[prompt_id]
@@ -2254,9 +2601,11 @@ def flux_generate_thread(params, jid):
                      steps, guidance, width, height,
                      seed, batch, params.get('preset', 'flux'), json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', images=paths, seed=seed, error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', images=paths, seed=seed, error=str(e))
 
 
 def _wan_common_loaders(family, positive, negative, extra_lora_high=None, extra_lora_low=None):
@@ -2654,15 +3003,19 @@ def wan_video_generate_thread(params, jid):
         history = None
         try:
             while time.time() < deadline:
+                _check_cancelled(params)
                 p = {'elapsed': int(time.time() - t_start)}
                 live = prog.snapshot()
                 if live:
                     p.update(live)     # pct/phase/step z WebSocketa, gdy działa
-                job_set(jid, status='generating', progress=p)
+                job_set(jid, status='generating', phase='generating', progress=p)
                 h = comfy_get(f'/history/{prompt_id}', timeout=15)
                 if prompt_id in h and h[prompt_id].get('outputs'):
                     history = h[prompt_id]
                     break
+                status = h.get(prompt_id, {}).get('status', {})
+                if status.get('status_str') == 'error':
+                    raise RuntimeError('Błąd ComfyUI (WAN): ' + str(status.get('messages', []))[-1200:])
                 time.sleep(3)
         finally:
             prog.stop = True
@@ -2690,9 +3043,11 @@ def wan_video_generate_thread(params, jid):
                      'euler', 'simple', steps, 1.0, width, height,
                      seed, 1, 'wanvideo', json.dumps([path]))
                 )
-        job_set(jid, status='done', images=[path], seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=[path], seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', error=str(e))
 
 
 # ── Vision Describer ─────────────────────────────────────────────────────────
@@ -2720,7 +3075,8 @@ INSTANTID_CN_MODEL   = 'instantid-controlnet [c5c25a50]'
 
 def forge_instantid_thread(params, jid):
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie portretu (Forge)...')
+        _check_cancelled(params)
         face_b64 = auto_crop_face(params['face_image'])
         title, fname = resolve_model(params['model'])
         data = forge_post('/sdapi/v1/txt2img', {
@@ -2789,13 +3145,16 @@ def forge_instantid_thread(params, jid):
                      int(params.get('width', 832)), int(params.get('height', 1216)),
                      seed, 1, 'portrait', json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', error=str(e))
 
 def forge_pose_thread(params, jid):
     try:
-        job_set(jid, status='generating')
+        job_set(jid, status='generating', phase='generating', phase_label='Generowanie z pozą (Forge)...')
+        _check_cancelled(params)
         body_b64  = params['body_image']
         face_b64  = auto_crop_face(body_b64)  # auto-crop twarzy z tego samego zdjecia
         title, fname = resolve_model(params['model'])
@@ -2876,9 +3235,11 @@ def forge_pose_thread(params, jid):
                      int(params.get('width', 832)), int(params.get('height', 1216)),
                      seed, 1, 'pose', json.dumps(paths))
                 )
-        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+        job_finish(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except JobCancelled as e:
+        job_finish(jid, status='cancelled', error=str(e))
     except Exception as e:
-        job_set(jid, status='error', error=str(e))
+        job_finish(jid, status='error', error=str(e))
 
 def _vision_call(url, model, image_b64, style_prefix, style, headers_extra=None):
     mime = 'image/jpeg'
@@ -3118,12 +3479,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _build_page(self):
-        # Fetch models from Forge
         with _models_lock:
-            raw_models = [m for m in _models_cache if not m.get('model_name','').lower().startswith('flux')]
-        model_opts = build_model_optgroups(raw_models)
+            all_models = list(_models_cache)
+        model_opts = build_model_optgroups(all_models)
         if not model_opts:
-            model_opts = '<option value="RealVisXL_V5_fp16">RealVisXL_V5_fp16</option>'
+            model_opts = '<option value="" disabled>Brak modeli na dysku</option>'
+
+        forge_models = [m for m in all_models if m.get('backend') == 'forge' and m.get('available', True)]
+        edit_model_opts = build_model_optgroups(forge_models) or '<option value="" disabled>Brak modeli Forge</option>'
 
         preset_tabs = ''.join(
             f'<button class="preset-btn" data-id="{p["id"]}" onclick="applyPreset(\'{p["id"]}\')">'
@@ -3135,40 +3498,41 @@ class Handler(BaseHTTPRequestHandler):
                                 'steps','cfg','width','height','batch','prefix','negative')}
             for p in PRESETS
         ])
-        # Filtruj modele SD1.5 dla AnimateDiff
-        sd15_opts = ''
-        for m in raw_models:
-            n = html.escape(m.get('model_name',''))
-            t = html.escape(m.get('model_name',''))
-            nl = n.lower()
-            if any(k in nl for k in ('v1-5','v1_5','sd15','sd1.5','pruned')):
-                sd15_opts += f'<option value="{t}">{n}</option>'
-        if not sd15_opts:
-            sd15_opts = '<option value="v1-5-pruned-emaonly">v1-5-pruned-emaonly</option>'
+        models_json = json.dumps([{
+            'name': m.get('model_name', ''),
+            'title': m.get('title', ''),
+            'backend': m.get('backend', 'forge'),
+            'family': m.get('family', ''),
+            'is_flux': bool(m.get('is_flux')),
+            'capabilities': m.get('capabilities', ['generate']),
+            'available': bool(m.get('available', True)),
+            'reason': m.get('reason', ''),
+        } for m in all_models])
 
-        # Modele dla Portretu: tylko SDXL (bez FLUX i SD1.5)
+        sd15_opts = ''
+        for m in forge_models:
+            if m.get('family') == 'sd15':
+                n = html.escape(m.get('model_name', ''))
+                sd15_opts += f'<option value="{n}">{n}</option>'
+        if not sd15_opts:
+            sd15_opts = '<option value="" disabled>Brak modeli SD1.5</option>'
+
         portrait_opts = ''
-        for m in raw_models:
-            n = html.escape(m.get('model_name',''))
-            t = html.escape(m.get('model_name',''))
-            fn = m.get('filename', '')
-            nl = n.lower()
-            # pomiń FLUX (double_blocks) i SD1.5
-            if any(k in nl for k in ('v1-5','v1_5','sd15','pruned')):
-                continue
-            if is_flux_checkpoint(fn):
-                continue
-            portrait_opts += f'<option value="{t}">{n}</option>'
+        for m in forge_models:
+            if 'portrait' in (m.get('capabilities') or []):
+                n = html.escape(m.get('model_name', ''))
+                portrait_opts += f'<option value="{n}">{n}</option>'
         if not portrait_opts:
-            portrait_opts = '<option value="RealVisXL_V5_fp16">RealVisXL_V5_fp16</option>'
+            portrait_opts = '<option value="" disabled>Brak modeli SDXL/Pony</option>'
 
         return (HTML_TEMPLATE
                 .replace('__PRESET_TABS__', preset_tabs)
                 .replace('__MODEL_OPTIONS__', model_opts)
-                .replace('__EDIT_MODEL_OPTIONS__', model_opts)
+                .replace('__EDIT_MODEL_OPTIONS__', edit_model_opts)
                 .replace('__VID_MODEL_OPTIONS__', sd15_opts)
                 .replace('__PORTRAIT_MODEL_OPTIONS__', portrait_opts)
                 .replace('__PRESETS_JSON__', presets_json)
+                .replace('__MODELS_JSON__', models_json)
                 .replace('__GALLERY_URL__', GALLERY_URL)
                 .replace('__PORTAL_URL__', PORTAL_URL))
 
@@ -3299,12 +3663,12 @@ class Handler(BaseHTTPRequestHandler):
             mname = qs.get('model', [''])[0].strip()
             if not mname:
                 self._json({'ok': False, 'error': 'brak model'}); return
-            with _models_lock:
-                m = next((x for x in _models_cache if x.get('model_name') == mname), None)
-            sha256 = (m or {}).get('sha256', '')
-            if not sha256:
-                self._json({'ok': False, 'error': 'Brak hash pliku (Forge jeszcze go nie policzył — wygeneruj raz tym modelem, potem spróbuj ponownie)'}); return
+            m = _find_model_entry(mname)
+            fname = (m or {}).get('filename', '')
+            if not fname or (m or {}).get('backend') != 'forge' or not Path(fname).is_file():
+                self._json({'ok': False, 'error': 'Civitai działa dla plików checkpointów Forge obecnych na dysku'}); return
             try:
+                sha256 = _file_sha256_cached(fname)
                 result = _fetch_civitai_settings_by_hash(sha256)
                 if not result:
                     self._json({'ok': False, 'error': 'Civitai nie zwróciło danych dla tego pliku'}); return
@@ -3410,9 +3774,14 @@ class Handler(BaseHTTPRequestHandler):
             with _models_lock:
                 raw = list(_models_cache)
             self._json([{
-                'name': m.get('model_name',''),
-                'title': m.get('title',''),
-                'is_flux': bool(m.get('filename')) and is_flux_checkpoint(m['filename']),
+                'name': m.get('model_name', ''),
+                'title': m.get('title', ''),
+                'backend': m.get('backend', 'forge'),
+                'family': m.get('family', ''),
+                'is_flux': bool(m.get('is_flux')),
+                'capabilities': m.get('capabilities', ['generate']),
+                'available': bool(m.get('available', True)),
+                'reason': m.get('reason', ''),
             } for m in raw])
             return
 
@@ -3457,23 +3826,36 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/vram':
             try:
-                import subprocess as _sp
-                r = _sp.run(
-                    ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total',
-                     '--format=csv,noheader,nounits'],
-                    capture_output=True, text=True, timeout=5
-                )
-                parts = [int(x.strip()) for x in r.stdout.strip().split(',')]
-                used_mb, free_mb, total_mb = parts
+                st = coordinator_status(timeout=3)
+                if st and st.get('vram_total_mb'):
+                    used_mb = st['vram_used_mb']
+                    free_mb = st['vram_free_mb']
+                    total_mb = st['vram_total_mb']
+                else:
+                    import subprocess as _sp
+                    r = _sp.run(
+                        ['nvidia-smi', '--query-gpu=memory.used,memory.free,memory.total',
+                         '--format=csv,noheader,nounits'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    used_mb, free_mb, total_mb = [int(x.strip()) for x in r.stdout.strip().split(',')]
+                with _queue_lock:
+                    q_depth = len(_gpu_pending)
+                    act_jid = _gpu_active_job['jid'] if _gpu_active_job else None
                 self._json({
-                    'ok':       True,
-                    'used_gb':  round(used_mb  / 1024, 2),
-                    'free_gb':  round(free_mb  / 1024, 2),
-                    'total_gb': round(total_mb / 1024, 2),
+                    'ok':                True,
+                    'used_gb':           round(used_mb  / 1024, 2),
+                    'free_gb':           round(free_mb  / 1024, 2),
+                    'total_gb':          round(total_mb / 1024, 2),
+                    'coordinator_ok':    st is not None,
+                    'coordinator_busy':  bool(st and st.get('busy')),
+                    'coordinator_owner': st.get('owner') if st else None,
+                    'embedding_loaded':  bool(st and st.get('embedding_loaded')),
+                    'active_backends':   st.get('active_backends', []) if st else [],
+                    'queue_depth':       q_depth,
+                    'active_job_id':     act_jid,
                 })
             except Exception as e:
-                # Log do journalu — wczesniej wyjatek byl zwracany tylko jako
-                # ok:false i znikal bez sladu, co uniemozliwialo diagnoze.
                 print(f'[genphoto] /api/vram ERROR: {e!r}', flush=True)
                 self._json({'ok': False, 'error': str(e)})
             return
@@ -3720,35 +4102,28 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == '/api/vram-free':
-            # Restart WSZYSTKICH backendów GPU — poprzednio tylko Forge, a VRAM
-            # potrafił trzymać ComfyUI (Z-Image/WAN ~7-9 GB idle).
             try:
-                import subprocess as _sp
-                # Tylko dzialajace backendy: restart zatrzymanej uslugi ja URUCHAMIA,
-                # a backendy sa wlaczane na zadanie (2026-10-14) - ZWOLNIJ nie moze
-                # stawiac wszystkich trzech naraz.
-                active = [svc for svc in ('forge', 'krea2', 'comfyui')
-                          if _sp.run(['systemctl', '--user', 'is-active', '--quiet', svc],
-                                     timeout=10).returncode == 0]
-                for svc in active:
-                    _sp.Popen(['systemctl', '--user', 'restart', svc],
-                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                metric('vram_free_restart', services=','.join(active))
-                backends = [{'forge': 'forge', 'krea2': 'krea2', 'comfyui': 'zimage'}[s]
-                            for s in active]
-                def _health_watch():
-                    time.sleep(2)
-                    for b in backends:
-                        _wait_backend_health(b, timeout_s=150)
-                    metric('vram_free_healthy')
-                if backends:
-                    threading.Thread(target=_health_watch, daemon=True).start()
-                    msg = f'Restart: {", ".join(active)} — pełna gotowość za ~60-90s'
-                else:
-                    msg = 'Żaden backend nie działa — nie ma czego zwalniać'
-                self._json({'ok': True, 'msg': msg})
+                ok, line = coordinator_cleanup(timeout=120)
+                if not ok and line.startswith('BUSY'):
+                    owner = line.split(' ', 1)[1] if ' ' in line else 'aktywne zadanie'
+                    self._json({
+                        'ok': False,
+                        'error': f'GPU jest aktualnie używane ({owner}) — poczekaj na zakończenie lub anuluj zadanie.'
+                    }, 409)
+                    return
+                if not ok:
+                    self._json({'ok': False, 'error': f'Koordynator zwrócił: {line}'}, 500)
+                    return
+                metric('vram_free_coordinator_cleanup', ok=True)
+                self._json({'ok': True, 'msg': 'Zatrzymano pozostałe backendy GPU i przywrócono model embeddingu.'})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+                self._json({'ok': False, 'error': str(e)}, 500)
+            return
+
+        if self.path.startswith('/api/job/') and self.path.endswith('/cancel'):
+            jid = self.path[len('/api/job/'):-len('/cancel')].strip('/')
+            ok, msg = cancel_gpu_job(jid)
+            self._json({'ok': ok, 'msg': msg}, 200 if ok else 404)
             return
 
         if self.path.startswith('/api/service/'):
@@ -3756,14 +4131,22 @@ class Handler(BaseHTTPRequestHandler):
             valid_services = ('forge', 'krea2', 'comfyui')
             if len(parts) == 5 and parts[3] in valid_services and parts[4] in ('start', 'stop'):
                 name, action = parts[3], parts[4]
+                if action == 'start':
+                    self._json({
+                        'ok': False,
+                        'error': 'Backendy uruchamiają się automatycznie przez koordynator GPU po kliknięciu Generuj.'
+                    }, 409)
+                    return
                 try:
-                    import subprocess as _sp
-                    _sp.run(['systemctl', '--user', action, name], timeout=20, check=True)
-                    self._json({'ok': True})
+                    ok, line = coordinator_cleanup(timeout=120)
+                    if not ok and line.startswith('BUSY'):
+                        self._json({'ok': False, 'error': 'GPU jest zajęte aktywnym zadaniem.'}, 409)
+                        return
+                    self._json({'ok': ok, 'msg': 'Zatrzymano backendy i przywrócono embedding.' if ok else line})
                 except Exception as e:
-                    self._json({'ok': False, 'error': str(e)})
+                    self._json({'ok': False, 'error': str(e)}, 500)
             else:
-                self._json({'ok': False, 'error': 'nieprawidłowy serwis/akcja'})
+                self._json({'ok': False, 'error': 'nieprawidłowy serwis/akcja'}, 400)
             return
 
         if self.path == '/api/generate':
@@ -3787,21 +4170,16 @@ class Handler(BaseHTTPRequestHandler):
                     target, kind, backend = forge_img2img_ref_thread, 'forge', 'forge'
                 else:
                     target, kind, backend = forge_generate_thread, 'forge', 'forge'
-                if gpu_queue_full():
-                    metric('queue_reject', backend=backend)
-                    self._json({'ok': False,
-                                'error': 'GPU zajęte — 1 generacja w toku i 1 w kolejce. '
-                                         'Poczekaj na zakończenie.',
-                                'retry_after_s': 30}, 503)
+                jid, err, code = submit_gpu_job(kind, backend, target, params)
+                if err:
+                    resp = {'ok': False, 'error': err}
+                    if code == 503:
+                        resp['retry_after_s'] = 30
+                    self._json(resp, code)
                     return
-                jid = job_create()
-                t = threading.Thread(target=gpu_run,
-                                     args=(kind, backend, target, params, jid),
-                                     daemon=True)
-                t.start()
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+                self._json({'ok': False, 'error': str(e)}, 400)
             return
 
         if self.path == '/api/detect-face':
@@ -3820,33 +4198,29 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 params = json.loads(body)
                 if not params.get('face_image'):
-                    self._json({'ok': False, 'error': 'Brak zdjęcia twarzy'}); return
+                    self._json({'ok': False, 'error': 'Brak zdjęcia twarzy'}, 400); return
                 if not params.get('positive'):
-                    self._json({'ok': False, 'error': 'Brak promptu'}); return
+                    self._json({'ok': False, 'error': 'Brak promptu'}, 400); return
                 params['gen_id'] = uuid.uuid4().hex
-                jid = job_create()
-                t = threading.Thread(target=gpu_run,
-                                     args=('forge', 'forge', forge_instantid_thread, params, jid),
-                                     daemon=True)
-                t.start()
+                jid, err, code = submit_gpu_job('forge', 'forge', forge_instantid_thread, params)
+                if err:
+                    self._json({'ok': False, 'error': err}, code); return
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+                self._json({'ok': False, 'error': str(e)}, 400)
             return
 
         if self.path == '/api/pose':
             try:
                 params = json.loads(body)
                 if not params.get('body_image'):
-                    self._json({'ok': False, 'error': 'Brak zdjęcia ciała'}); return
-                jid = job_create()
-                t = threading.Thread(target=gpu_run,
-                                     args=('forge', 'forge', forge_pose_thread, params, jid),
-                                     daemon=True)
-                t.start()
+                    self._json({'ok': False, 'error': 'Brak zdjęcia ciała'}, 400); return
+                jid, err, code = submit_gpu_job('forge', 'forge', forge_pose_thread, params)
+                if err:
+                    self._json({'ok': False, 'error': err}, code); return
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+                self._json({'ok': False, 'error': str(e)}, 400)
             return
 
         if self.path == '/api/vision-describe':
@@ -3880,18 +4254,16 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 params = json.loads(body)
                 if not params.get('image_b64'):
-                    self._json({'ok': False, 'error': 'Brak image_b64'}); return
+                    self._json({'ok': False, 'error': 'Brak image_b64'}, 400); return
                 if not params.get('positive'):
-                    self._json({'ok': False, 'error': 'Brak positive prompt'}); return
+                    self._json({'ok': False, 'error': 'Brak positive prompt'}, 400); return
                 params['gen_id'] = uuid.uuid4().hex
-                jid = job_create()
-                t = threading.Thread(target=gpu_run,
-                                     args=('forge', 'forge', forge_edit_thread, params, jid),
-                                     daemon=True)
-                t.start()
+                jid, err, code = submit_gpu_job('forge', 'forge', forge_edit_thread, params)
+                if err:
+                    self._json({'ok': False, 'error': err}, code); return
                 self._json({'ok': True, 'job_id': jid})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)})
+                self._json({'ok': False, 'error': str(e)}, 400)
             return
 
         if self.path == '/api/publish_to_portal':
@@ -3974,6 +4346,6 @@ if __name__ == '__main__':
             super().server_bind()
     server = _DualStack(('::', PORT), Handler)
     threading.Thread(target=_models_cache_worker, daemon=True).start()
-    threading.Thread(target=_gpu_janitor, daemon=True).start()
-    _refresh_models_once(rescan_disk=True)  # zaladuj cache przed pierwszym requestem
+    ensure_gpu_worker()
+    _refresh_models_once(rescan_disk=True)  # zaladuj katalog dyskowy przed pierwszym requestem
     server.serve_forever()
