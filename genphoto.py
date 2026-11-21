@@ -242,10 +242,13 @@ GPU_WATCHDOG_S = {
     'forge':     900,    # txt2img/img2img/edit/instantid/pose (forge_post timeout 600s + zapas)
     'krea2':     900,    # pętla batch po 1 obrazie
     'zimage':    600,    # 8 kroków turbo + ewentualny reload GGUF
+    'flux':     1500,    # Krea dev / Klein 9B: ładowanie 9-12 GB fp8 + sampling z offloadem
     'wanvideo':  2100,   # wewnętrzny deadline wątku WAN to 1800s + ładowanie ~17GB GGUF
     'batch_all': 3600,   # ~20 modeli × (load + generowanie + unload)
     'krea2_batch': 1200, # 4 warianty Krea 2 × (load + 2 zdjęcia)
 }
+# Dodatkowy czas (s) za kazdy obraz ponad pierwszy w jobie (params['batch']).
+GPU_WATCHDOG_PER_EXTRA_IMAGE_S = {'zimage': 180}
 
 # Minimalny wolny VRAM (MB) przed startem joba.
 # "cold" = backend nie działa/nie trzyma modelu; "hot" = backend już jest w VRAM
@@ -253,18 +256,103 @@ GPU_WATCHDOG_S = {
 # krea2 cold 7500, nie 4500: ładowanie checkpointu z kwantyzacją bnb kończy na ~7,2 GB
 # (pomiar z audytu 2026-08-27). Z 4500 preflight przepuszczał job, który padał w połowie
 # ładowania z torch.OutOfMemoryError — czytelny błąd na starcie jest lepszy niż OOM.
-VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 7500, 'zimage': 6500, 'wanvideo': 9500}
-VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000}
+VRAM_NEED_COLD_MB = {'forge': 5000, 'krea2': 7500, 'zimage': 6500, 'wanvideo': 9500,
+                     'flux': 9000}
+VRAM_NEED_HOT_MB  = {'forge': 1500, 'krea2': 1500, 'zimage': 2000, 'wanvideo': 3000,
+                     'flux': 3000}
 
 # ── Metryki (ring buffer, endpoint /api/metrics) ─────────────────────────────
 _metrics = collections.deque(maxlen=200)
 _mlock   = threading.Lock()
+
+# Ring buffer ginie przy kazdym restarcie uslugi, wiec sam nie odpowie na pytanie
+# "ktore modele sa martwe" - a od tego zalezy, co z 551 GB checkpointow trafia na
+# NVMe, a co do kasacji (audyt 2026-09-10). Stad drugi zapis: jedna linia JSON na
+# zdarzenie. Zdarzen jest kilkanascie na job, wiec koszt open+write+close jest
+# pomijalny, a zamkniecie pliku po kazdym wpisie przezywa kill -9 uslugi - inaczej
+# niz bufor trzymany w otwartym uchwycie.
+METRICS_LOG     = os.environ.get("GP_METRICS_LOG",
+                                 os.path.expanduser("~/genphoto-metrics.jsonl"))
+METRICS_LOG_MAX = int(os.environ.get("GP_METRICS_LOG_MAX", 64 * 1024 * 1024))
+
+
+def _metrics_rotate():
+    """Po przekroczeniu limitu: biezacy log -> .1, poprzedni .1 przepada.
+
+    Dwie generacje wystarczaja - log sluzy do analizy uzycia modeli w oknie
+    tygodni, nie do audytu wstecz. os.replace jest atomowe, wiec rownolegly
+    czytelnik nigdy nie zobaczy pliku w polowie podmiany.
+    """
+    try:
+        if os.path.getsize(METRICS_LOG) < METRICS_LOG_MAX:
+            return
+        os.replace(METRICS_LOG, METRICS_LOG + ".1")
+    except OSError:
+        pass
 
 def _free_vram_mb():
     import subprocess as _sp
     r = _sp.run(['nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=5)
     return int(r.stdout.strip().splitlines()[0].strip())
+
+# ── Ollama: zwolnienie modeli embeddingowych przed jobem GPU ─────────────────
+# Hub, kh-lab i prasowka trzymaja qwen3-embedding w VRAM bez limitu czasu (ok. 7 GB
+# z 12). Przed generowaniem obrazu wyladowujemy go, zeby Forge/Krea 2/ComfyUI dostaly
+# karte w calosci. Ollama przeladuje model sama przy nastepnym zapytaniu o embedding.
+OLLAMA_URL = os.environ.get('GP_OLLAMA_URL', 'http://localhost:11434').rstrip('/')
+OLLAMA_UNLOAD_MATCH = os.environ.get('GP_OLLAMA_UNLOAD_MATCH', 'embed').lower()
+
+
+def _ollama_unload_embeddings(wait_s=12):
+    """Wyladuj z VRAM modele ollamy, ktorych nazwa zawiera GP_OLLAMA_UNLOAD_MATCH.
+
+    Zwraca liste wyladowanych modeli. Nigdy nie rzuca wyjatku: brak ollamy albo blad
+    sieci ma kosztowac tylko pominiety krok, nie przerwany job. Czeka (max wait_s), az
+    nvidia-smi pokaze wiecej wolnej pamieci, bo keep_alive=0 oddaje karte z opoznieniem."""
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(OLLAMA_URL + '/api/ps', headers={'User-Agent': _UA}),
+                timeout=5) as r:
+            loaded = [m.get('name') for m in json.loads(r.read()).get('models', [])
+                      if m.get('name')]
+    except Exception:
+        return []
+    targets = [m for m in loaded if OLLAMA_UNLOAD_MATCH in m.lower()]
+    if not targets:
+        return []
+    try:
+        before = _free_vram_mb()
+    except Exception:
+        before = None
+    done = []
+    for name in targets:
+        try:
+            # /api/embed z keep_alive=0 to oficjalny sposob wyladowania modelu
+            # embeddingowego (/api/generate go nie obsluguje).
+            req = urllib.request.Request(
+                OLLAMA_URL + '/api/embed',
+                data=json.dumps({'model': name, 'input': '', 'keep_alive': 0}).encode(),
+                headers={'Content-Type': 'application/json', 'User-Agent': _UA},
+                method='POST')
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            done.append(name)
+        except Exception:
+            pass
+    after = before
+    deadline = time.time() + wait_s
+    while done and time.time() < deadline:
+        time.sleep(1)
+        try:
+            after = _free_vram_mb()
+        except Exception:
+            break
+        if before is not None and after - before >= 1000:
+            break
+    metric('ollama_unload', models=done, free_before_mb=before, free_after_mb=after)
+    return done
+
 
 def metric(event, **kw):
     entry = {'ts': int(time.time()), 'event': event}
@@ -275,17 +363,26 @@ def metric(event, **kw):
         pass
     with _mlock:
         _metrics.append(entry)
+        # Metryka nigdy nie moze wywrocic joba - pelny dysk albo brak praw do pliku
+        # ma kosztowac utrate wpisu, nie przerwane generowanie.
+        try:
+            _metrics_rotate()
+            with open(METRICS_LOG, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 def _service_for_backend(backend):
     return {'forge': 'forge', 'krea2': 'krea2',
-            'zimage': 'comfyui', 'wanvideo': 'comfyui'}.get(backend)
+            'zimage': 'comfyui', 'wanvideo': 'comfyui',
+            'flux': 'comfyui'}.get(backend)
 
 def _backend_health_url(backend, deep=False):
     if backend == 'forge':
         return FORGE_URL + '/sdapi/v1/sd-models'
     if backend == 'krea2':
         return KREA2_URL + '/health'
-    if backend in ('zimage', 'wanvideo'):
+    if backend in ('zimage', 'wanvideo', 'flux'):
         # deep=True → /object_info: po restarcie ComfyUI port otwiera się wcześniej
         # niż kończy się inicjalizacja nodów — bez tego health-check daje false-OK.
         return COMFY_URL + ('/object_info' if deep else '/system_stats')
@@ -463,15 +560,15 @@ def _free_vram_for_backend(backend, need_mb):
 
     W obu przypadkach zaczynamy od `/free` na ComfyUI: to najtańsze źródło pamięci na tej
     karcie, bo ComfyUI przeładuje wagi sam, gdy znów będą potrzebne."""
-    if backend != 'zimage':
-        # Z-Image jest sam w ComfyUI — wyrzucanie jego wag tuż przed jego własnym jobem
-        # tylko wydłużyłoby start o ponowne ładowanie.
+    if backend not in ('zimage', 'flux'):
+        # Z-Image i FLUX siedzą same w ComfyUI — wyrzucanie ich wag tuż przed ich
+        # własnym jobem tylko wydłużyłoby start o ponowne ładowanie.
         _comfy_free_memory()
 
     # Backendy żyjące w ComfyUI odzyskują własny cache PyTorcha, więc liczy się on
     # jako wolna pamięć. Forge i Krea 2 to osobne procesy — dla nich tylko to, co
     # nvidia-smi realnie pokazuje jako wolne.
-    comfy_bonus = backend in ('zimage', 'wanvideo')
+    comfy_bonus = backend in ('zimage', 'wanvideo', 'flux')
 
     if backend == 'wanvideo':
         _stop_other_backends('wanvideo')
@@ -488,12 +585,16 @@ def _free_vram_for_backend(backend, need_mb):
 def gpu_preflight(backend, params_model=None):
     """Warunki startu joba. Wywoływane W TRAKCIE trzymania _gpu_lock (atomowo
     ze startem). Zwraca None gdy OK, albo string z komunikatem błędu."""
+    _ollama_unload_embeddings()
     hot  = _backend_alive(backend)
     # Dla wideo "backend odpowiada" nie znaczy "model jest w VRAM": ComfyUI z --lowvram
     # zwalnia wagi między jobami, więc każdy job wideo ładuje ~8 GB od zera. Bez tego
     # preflight brał próg HOT (3 GB), przepuszczał job przy 3,9 GB wolnego i kazał
     # 8-gigabajtowemu modelowi przeciskać się warstwami obok krea-2 trzymającego 7 GB.
-    if backend == 'wanvideo':
+    if backend in ('wanvideo', 'flux'):
+        # ComfyUI z --lowvram zwalnia wagi między jobami, więc Krea dev (11,9 GB)
+        # i Klein 9B (9,4 GB + 8,7 GB text encoder) ładują się za każdym razem od
+        # zera — próg HOT przepuściłby job, który padnie w połowie ładowania.
         hot = False
     elif backend == 'krea2':
         # Ten sam fałszywy sygnał zdrowia, co w wideo, tylko z drugiej strony: Flask
@@ -510,7 +611,7 @@ def gpu_preflight(backend, params_model=None):
         free = None
     # Backendy żyjące w ComfyUI liczą jego własny cache jako dostępny już tutaj —
     # dzięki temu drugi klip z rzędu nie wyrzuca załadowanego modelu przez /free.
-    if free is not None and backend in ('zimage', 'wanvideo'):
+    if free is not None and backend in ('zimage', 'wanvideo', 'flux'):
         free += _comfy_held_vram_mb()
     if free is not None and free < need:
         free = _free_vram_for_backend(backend, need)
@@ -563,6 +664,17 @@ def gpu_run(kind, backend, target, params, jid):
             return False
 
     watchdog_s = GPU_WATCHDOG_S.get(kind, 900)
+    if kind == 'flux' and params.get('model') == 'flux_moss_sft':
+        watchdog_s = 3600
+    if kind in GPU_WATCHDOG_PER_EXTRA_IMAGE_S:
+        # Limit bazowy liczy jeden obraz. Z-Image generuje batch po jednym obrazie
+        # (~140 s na 3060), wiec 4 obrazy przekraczaly 600 s i watchdog ubijal job
+        # tuz przed ostatnim obrazem (2026-10-14).
+        try:
+            extra = max(0, int(params.get('batch', 1)) - 1)
+        except (TypeError, ValueError):
+            extra = 0
+        watchdog_s += extra * GPU_WATCHDOG_PER_EXTRA_IMAGE_S[kind]
     def _watch():
         if done_evt.wait(watchdog_s):
             return
@@ -607,7 +719,108 @@ def gpu_run(kind, backend, target, params, jid):
                final_status=job_get(jid).get('status'))
     finally:
         done_evt.set()
+        _gpu_touch(job_end=True)
         _release_gpu_once()
+
+
+# ── Sprzatacz GPU: po jobie zostaje tylko Forge, a jego model idzie z VRAM ─────
+# Decyzja Bartka (2026-10-16): comfyui i krea2 dzialaja tylko na czas jobu, Forge
+# (usluga) jest wlaczony caly czas, ale jego checkpoint laduje sie przy uzyciu i jest
+# zwalniany, gdy nikt go nie uzywa. Sprzatacz dziala co 15 s i NIGDY nie rusza GPU,
+# gdy trwa job albo ktos czeka (bierze ten sam mutex nieblokujaco).
+GP_BACKEND_STOP_IDLE_S = int(os.environ.get('GP_BACKEND_STOP_IDLE_S', '0'))    # 0 = zaraz po jobie
+GP_FORGE_UNLOAD_IDLE_S = int(os.environ.get('GP_FORGE_UNLOAD_IDLE_S', '300'))  # bezczynnosc Forge
+_gpu_last_activity = time.time()   # koniec ostatniego joba albo ostatnia aktywnosc Forge
+_forge_clean_ts    = 0.0           # kiedy ostatnio kazalismy Forge zwolnic checkpoint
+_backend_stop_pending = False      # True po jobie genphoto: wtedy (raz) zatrzymujemy comfyui/krea2
+
+
+def _gpu_touch(job_end=False):
+    global _gpu_last_activity, _backend_stop_pending
+    _gpu_last_activity = time.time()
+    if job_end:
+        _backend_stop_pending = True
+
+
+def _comfy_busy():
+    """True, gdy ComfyUI ma job w toku (takze uruchomiony recznie z jego UI)."""
+    try:
+        req = urllib.request.Request(COMFY_URL + '/queue', headers={'User-Agent': _UA})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            d = json.loads(r.read())
+        return bool(d.get('queue_running') or d.get('queue_pending'))
+    except Exception:
+        return False
+
+
+def _forge_busy():
+    """True, gdy Forge liczy (takze z jego wlasnego WebUI, poza genphoto)."""
+    try:
+        req = urllib.request.Request(
+            FORGE_URL + '/sdapi/v1/progress?skip_current_image=true',
+            headers={'User-Agent': _UA})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            d = json.loads(r.read())
+        return bool(d.get('state', {}).get('job_count')) or float(d.get('progress') or 0) > 0
+    except Exception:
+        return False
+
+
+def _forge_unload_checkpoint():
+    try:
+        req = urllib.request.Request(FORGE_URL + '/sdapi/v1/unload-checkpoint', data=b'',
+                                     headers={'User-Agent': _UA}, method='POST')
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status < 300
+    except Exception:
+        return False
+
+
+def _gpu_janitor_tick():
+    global _forge_clean_ts, _backend_stop_pending
+    import subprocess as _sp
+    if _forge_busy():
+        _gpu_touch()
+        return
+    idle = time.time() - _gpu_last_activity
+    with _gpu_wlock:
+        if _gpu_waiters > 0:
+            return
+    # Mutex bierzemy nieblokujaco: gdy job wlasnie startuje, nie przeszkadzamy.
+    if not _gpu_lock.acquire(blocking=False):
+        return
+    try:
+        # Zatrzymujemy tylko raz po jobie genphoto (flaga), zeby nie ubijac comfyui
+        # wlaczonego pozniej recznie, i nigdy przy jobie w toku w ComfyUI.
+        if _backend_stop_pending and idle >= GP_BACKEND_STOP_IDLE_S and not _comfy_busy():
+            _backend_stop_pending = False
+            for svc in ('comfyui', 'krea2'):
+                if _sp.run(['systemctl', '--user', 'is-active', '--quiet', svc],
+                           timeout=10).returncode == 0:
+                    _sp.run(['systemctl', '--user', 'stop', svc], timeout=30,
+                            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    metric('backend_idle_stop', service=svc, idle_s=int(idle))
+        if idle >= GP_FORGE_UNLOAD_IDLE_S and _forge_clean_ts < _gpu_last_activity:
+            if _backend_alive('forge'):
+                ok = _forge_unload_checkpoint()
+                metric('forge_idle_unload', ok=ok, idle_s=int(idle))
+                if ok:
+                    _forge_clean_ts = time.time()
+            else:
+                _forge_clean_ts = time.time()
+    except Exception as e:
+        metric('gpu_janitor_error', error=str(e)[:120])
+    finally:
+        _gpu_lock.release()
+
+
+def _gpu_janitor():
+    while True:
+        time.sleep(15)
+        try:
+            _gpu_janitor_tick()
+        except Exception:
+            pass
 
 def gpu_queue_full():
     with _gpu_wlock:
@@ -655,10 +868,28 @@ PRESETS = [
      'steps':8, 'cfg':1.0, 'width':832, 'height':1216, 'batch':1,
      'prefix':'',
      'negative': ''},
+    {'id':'moss_sft', 'name':'MOSS Image SFT', 'icon':'&#127807;',
+     'model':'flux_moss_sft','sampler':'','scheduler':'',
+     'steps':25, 'cfg':2.5, 'width':1024, 'height':1024, 'batch':1,
+     'prefix':'', 'negative':''},
+    # FLUX — ustawienia dobrane pod realphoto. Prefiks mówi modelowi językiem
+    # fotografii (obiektyw, światło, faktura), bo na tym Krea dev reaguje
+    # najmocniej; guidance 3.0 zamiast domyślnych 3.5 zdejmuje "wypolerowanie".
+    {'id':'flux_photo', 'name':'FLUX Foto', 'icon':'&#128248;',
+     'model':'flux1_krea_dev','sampler':'','scheduler':'',
+     'steps':24, 'cfg':3.0, 'width':896, 'height':1152, 'batch':1,
+     'prefix':'editorial photograph, 50mm lens, soft natural light, shallow depth '
+              'of field, natural skin texture with visible pores, subtle film grain, ',
+     'negative': ''},
+    {'id':'flux_klein', 'name':'FLUX Klein 9B', 'icon':'&#129513;',
+     'model':'flux2_klein_9b','sampler':'','scheduler':'',
+     'steps':20, 'cfg':0.0, 'width':1024, 'height':1024, 'batch':1,
+     'prefix':'',
+     'negative': ''},
 ]
 
 # ── Kategorie i opisy modeli (dla dropdownu — optgroup + tooltip) ─────────────
-MODEL_CATEGORIES = ['Fotorealizm', 'Anime / Stylizowane', 'Krea 2', 'Z-Image', 'Inne']
+MODEL_CATEGORIES = ['Fotorealizm', 'Anime / Stylizowane', 'Krea 2', 'FLUX', 'Z-Image', 'Inne']
 
 MODEL_INFO = {
     'animagine-xl-3.1': {'cat': 'Anime / Stylizowane', 'desc': 'Anime/ilustracje — żywe kolory, dobre do postaci 2D'},
@@ -688,6 +919,8 @@ def get_model_info(name):
         return {'cat': 'Krea 2', 'desc': 'Model Krea 2 (MMDiT + Qwen3-VL)'}
     if nl.startswith('zimage'):
         return {'cat': 'Z-Image', 'desc': 'Z-Image Turbo — szybki, dobre portrety, GGUF przez ComfyUI'}
+    if name in FLUX_MODELS:
+        return {'cat': 'FLUX', 'desc': FLUX_MODELS[name]['desc']}
     return {'cat': 'Inne', 'desc': ''}
 
 def build_model_optgroups(models):
@@ -818,6 +1051,8 @@ def _refresh_models_once(rescan_disk=False):
     try:
         urllib.request.urlopen(f'{COMFY_URL}/system_stats', timeout=3).read()
         data.append({'model_name': 'zimage_turbo', 'title': 'Z-Image Turbo', 'hash': ''})
+        for fid, fm in FLUX_MODELS.items():
+            data.append({'model_name': fid, 'title': fm['title'], 'hash': ''})
     except:
         pass
     with _models_lock:
@@ -1791,6 +2026,233 @@ def zimage_generate_thread(params, jid):
                      f'z_image_turbo_{unet_name.replace("z_image_turbo-", "").replace(".gguf", "")}',
                      'euler', 'simple', steps, cfg, width, height,
                      seed, batch, params.get('preset','zimage'), json.dumps(paths))
+                )
+        job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
+    except Exception as e:
+        job_set(jid, status='error', error=str(e))
+
+
+# ── FLUX (ComfyUI) — Krea dev i Klein 9B ─────────────────────────────────────
+#
+# Dwa modele, dwie rodziny grafów. FLUX.1 Krea dev to klasyczny FLUX.1 z parą
+# text encoderów (clip_l + t5xxl) i węzłem FluxGuidance. FLUX.2 Klein 9B ma
+# jeden encoder (Qwen3-8B, typ "flux2"), własny latent i harmonogram sigm —
+# stąd SamplerCustomAdvanced zamiast KSamplera.
+#
+# Ten sam ComfyUI obsługuje serwer MCP "comfy-image" na MacBooku. ComfyUI
+# wykonuje prompty sekwencyjnie, więc równoległe żądanie z obu stron oznacza
+# czekanie w kolejce, nie walkę o VRAM.
+
+FLUX1_TEMPLATE = json.loads(r'''
+{
+  "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux1-krea-dev_fp8_scaled.safetensors", "weight_dtype": "default"}},
+  "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp8_e4m3fn.safetensors", "type": "flux"}},
+  "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+  "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+  "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": 3.5}},
+  "6": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+  "7": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+  "8": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "seed": 0, "steps": 24, "cfg": 1.0, "sampler_name": "euler", "scheduler": "beta", "denoise": 1.0, "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0]}},
+  "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+  "10": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "gp_flux"}}
+}
+''')
+
+FLUX2_TEMPLATE = json.loads(r'''
+{
+  "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux2Klein9bFp8_fp8.safetensors", "weight_dtype": "default"}},
+  "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2"}},
+  "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+  "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+  "5": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+  "6": {"class_type": "Flux2Scheduler", "inputs": {"steps": 20, "width": 1024, "height": 1024}},
+  "7": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+  "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+  "9": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["4", 0]}},
+  "10": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["9", 0], "sampler": ["7", 0], "sigmas": ["6", 0], "latent_image": ["5", 0]}},
+  "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
+  "12": {"class_type": "SaveImage", "inputs": {"images": ["11", 0], "filename_prefix": "gp_flux"}}
+}
+''')
+
+FLUX_MODELS = {
+    'flux_moss_sft': {
+        'title': 'MOSS Image SFT', 'family': 'moss',
+        'unet': 'moss_image_sft_int8_convrot.safetensors',
+        'clip': ('qwen3.5_9b_w4a8_gptq.safetensors',),
+        'vae': 'flux2-vae_small.safetensors',
+        'steps': 25, 'guidance': 2.5,
+        'desc': 'MOSS Image SFT - tekst i układ obrazu, INT8, RTX 12 GB',
+    },
+    'flux1_krea_dev': {
+        'title':  'FLUX.1 Krea dev',
+        'family': 'flux1',
+        'unet':   'flux1-krea-dev_fp8_scaled.safetensors',
+        'clip':   ('clip_l.safetensors', 't5xxl_fp8_e4m3fn.safetensors'),
+        'vae':    'ae.safetensors',
+        'steps':  24, 'guidance': 3.0,
+        'desc':   'Fotorealizm bez plastiku — naturalna skóra i światło, ~2 min/obraz',
+    },
+    'flux2_klein_9b': {
+        'title':  'FLUX.2 Klein 9B',
+        'family': 'flux2',
+        'unet':   'flux2Klein9bFp8_fp8.safetensors',
+        'clip':   ('qwen_3_8b_fp8mixed.safetensors',),
+        'vae':    'flux2-vae.safetensors',
+        'steps':  20, 'guidance': None,
+        'desc':   'Trzyma się złożonych opisów, czytelny tekst na obrazie, ~2-3 min/obraz',
+    },
+}
+
+COMFY_MODELS_DIR = Path(os.environ.get('GP_COMFY_MODELS_DIR', '/home/bartek/comfyui/models'))
+_FLUX_DIRS = {'unet': ('unet', 'diffusion_models'), 'clip': ('text_encoders', 'clip'), 'vae': ('vae',)}
+
+def _flux_check_files(m):
+    """Brak pliku na dysku ma dać czytelny błąd w UI, a nie 'Prompt has no outputs'."""
+    missing = []
+    for kind, names in (('unet', (m['unet'],)), ('clip', m['clip']), ('vae', (m['vae'],))):
+        for name in names:
+            if not any((COMFY_MODELS_DIR / d / name).exists() for d in _FLUX_DIRS[kind]):
+                missing.append(name)
+    if missing:
+        raise RuntimeError('Brak plików modelu w ComfyUI: ' + ', '.join(missing))
+
+def flux_generate_thread(params, jid):
+    """Generate using FLUX.1 Krea dev / FLUX.2 Klein 9B via local ComfyUI (port 8189)."""
+    try:
+        job_set(jid, status='generating')
+        import copy as _copy
+
+        model_id = params.get('model') or 'flux1_krea_dev'
+        m = FLUX_MODELS.get(model_id)
+        if not m:
+            raise RuntimeError(f'Nieznany model FLUX: {model_id!r} '
+                               f'(dostępne: {", ".join(FLUX_MODELS)})')
+        _flux_check_files(m)
+
+        # Wymiary muszą dzielić się przez 16 — inaczej latent nie zgadza się z VAE.
+        width  = max(256, int(params['width']))  // 16 * 16
+        height = max(256, int(params['height'])) // 16 * 16
+        steps  = int(params.get('steps') or m['steps'])
+        batch  = int(params.get('batch', 1))
+        seed   = int(params.get('seed', -1))
+        if seed < 0:
+            seed = secrets.randbelow(2**32)
+        guidance = float(params.get('cfg') or m.get('guidance') or 3.0)
+        ts = int(time.time() * 1000)
+
+        today   = datetime.now().strftime('%Y-%m-%d')
+        out_dir = OUTPUTS_DIR / 'genphoto' / today
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        loras = params.get('loras') or []
+
+        if m['family'] == 'moss' and batch != 1:
+            raise RuntimeError('MOSS obsługuje obecnie jeden obraz na zadanie.')
+
+        # Jeden obraz na raz — batch>1 w jednym passie podwaja pamięć aktywacji
+        # przy dekodowaniu VAE i grozi OOM na 12 GB (ta sama zasada co w Z-Image).
+        for i in range(batch):
+            if m['family'] == 'flux1':
+                graph = _copy.deepcopy(FLUX1_TEMPLATE)
+                graph['1']['inputs']['unet_name']  = m['unet']
+                graph['2']['inputs']['clip_name1'] = m['clip'][0]
+                graph['2']['inputs']['clip_name2'] = m['clip'][1]
+                graph['3']['inputs']['vae_name']   = m['vae']
+                graph['4']['inputs']['text']       = params['positive']
+                graph['5']['inputs']['guidance']   = guidance
+                graph['7']['inputs']['width']      = width
+                graph['7']['inputs']['height']     = height
+                graph['8']['inputs']['seed']       = seed + i
+                graph['8']['inputs']['steps']      = steps
+                graph['10']['inputs']['filename_prefix'] = f'gp_flux_{ts}'
+                sampler_node, out_node = '8', '10'
+            elif m['family'] == 'moss':
+                graph = {
+                    '1': {'class_type': 'UNETLoader', 'inputs': {'unet_name': m['unet'], 'weight_dtype': 'default'}},
+                    '2': {'class_type': 'CLIPLoader', 'inputs': {'clip_name': m['clip'][0], 'type': 'moss_image', 'device': 'default'}},
+                    '3': {'class_type': 'VAELoader', 'inputs': {'vae_name': m['vae']}},
+                    '4': {'class_type': 'CLIPTextEncode', 'inputs': {'text': params['positive'], 'clip': ['2', 0]}},
+                    '5': {'class_type': 'CLIPTextEncode', 'inputs': {'text': params.get('negative', ''), 'clip': ['2', 0]}},
+                    '6': {'class_type': 'EmptyFlux2LatentImage', 'inputs': {'width': width, 'height': height, 'batch_size': 1}},
+                    '7': {'class_type': 'KSampler', 'inputs': {'model': ['1', 0], 'seed': seed+i, 'steps': steps, 'cfg': guidance, 'sampler_name': 'er_sde', 'scheduler': 'simple', 'denoise': 1.0, 'positive': ['4', 0], 'negative': ['5', 0], 'latent_image': ['6', 0]}},
+                    '8': {'class_type': 'VAEDecodeTiled', 'inputs': {'samples': ['7', 0], 'vae': ['3', 0], 'tile_size': 512, 'overlap': 64, 'temporal_size': 64, 'temporal_overlap': 8}},
+                    '9': {'class_type': 'SaveImage', 'inputs': {'images': ['8', 0], 'filename_prefix': f'gp_moss_{ts}'}},
+                }
+                sampler_node, out_node = '7', '9'
+            else:
+                graph = _copy.deepcopy(FLUX2_TEMPLATE)
+                graph['1']['inputs']['unet_name'] = m['unet']
+                graph['2']['inputs']['clip_name'] = m['clip'][0]
+                graph['3']['inputs']['vae_name']  = m['vae']
+                graph['4']['inputs']['text']      = params['positive']
+                graph['5']['inputs']['width']     = width
+                graph['5']['inputs']['height']    = height
+                graph['6']['inputs']['steps']     = steps
+                graph['6']['inputs']['width']     = width
+                graph['6']['inputs']['height']    = height
+                graph['8']['inputs']['noise_seed'] = seed + i
+                graph['12']['inputs']['filename_prefix'] = f'gp_flux_{ts}'
+                sampler_node, out_node = '9', '12'
+
+            # LoRA łańcuchowo między loaderem UNET a samplerem/guiderem.
+            model_ref = ['1', 0]
+            for li, lora in enumerate(loras):
+                node_id = f'lora{li}'
+                graph[node_id] = {
+                    'class_type': 'LoraLoaderModelOnly',
+                    'inputs': {
+                        'model': model_ref,
+                        'lora_name': lora['name'],
+                        'strength_model': float(lora.get('strength', 1.0)),
+                    }
+                }
+                model_ref = [node_id, 0]
+            graph[sampler_node]['inputs']['model'] = model_ref
+
+            resp = comfy_post('/prompt', {'prompt': graph}, timeout=30)
+            prompt_id = resp['prompt_id']
+
+            # Krea dev na 12 GB ładuje 11,9 GB wag przy każdym jobie — 300 s jak
+            # w Z-Image bywało za mało, stąd 900 s na obraz.
+            deadline = time.time() + (3000 if m['family'] == 'moss' else 900)
+            history = None
+            while time.time() < deadline:
+                h = comfy_get(f'/history/{prompt_id}', timeout=15)
+                if prompt_id in h and h[prompt_id].get('outputs'):
+                    history = h[prompt_id]
+                    break
+                status = h.get(prompt_id, {}).get('status', {})
+                if status.get('status_str') == 'error':
+                    raise RuntimeError('Błąd ComfyUI: ' + str(status.get('messages', []))[-1200:])
+                time.sleep(2)
+            if history is None:
+                raise RuntimeError('Timeout oczekiwania na wygenerowanie obrazu (FLUX/MOSS)')
+
+            images_meta = history['outputs'].get(out_node, {}).get('images', [])
+            if not images_meta:
+                raise RuntimeError('ComfyUI nie zwróciło żadnego obrazu (FLUX)')
+
+            img  = images_meta[0]
+            src  = COMFY_OUTPUTS / img.get('subfolder', '') / img['filename']
+            name = f'{"moss" if m["family"] == "moss" else "flux"}_{ts}_{i:02d}_s{seed+i}.png'
+            if m['family'] == 'moss':
+                shutil.move(str(src), str(out_dir / name))
+            else:
+                (out_dir / name).write_bytes(src.read_bytes())
+            paths.append(f'genphoto/{today}/{name}')
+
+        gid = params.get('gen_id', uuid.uuid4().hex)
+        with _db_lock:
+            with db() as con:
+                con.execute(
+                    'INSERT INTO generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (gid, int(time.time()), params.get('description', ''),
+                     params['positive'], params.get('negative', ''),
+                     model_id, 'er_sde' if m['family'] == 'moss' else 'euler',
+                     'simple' if m['family'] == 'moss' else ('beta' if m['family'] == 'flux1' else 'flux2'),
+                     steps, guidance, width, height,
+                     seed, batch, params.get('preset', 'flux'), json.dumps(paths))
                 )
         job_set(jid, status='done', images=paths, seed=seed, gen_id=gid)
     except Exception as e:
@@ -3262,17 +3724,29 @@ class Handler(BaseHTTPRequestHandler):
             # potrafił trzymać ComfyUI (Z-Image/WAN ~7-9 GB idle).
             try:
                 import subprocess as _sp
-                for svc in ('forge', 'krea2', 'comfyui'):
+                # Tylko dzialajace backendy: restart zatrzymanej uslugi ja URUCHAMIA,
+                # a backendy sa wlaczane na zadanie (2026-10-14) - ZWOLNIJ nie moze
+                # stawiac wszystkich trzech naraz.
+                active = [svc for svc in ('forge', 'krea2', 'comfyui')
+                          if _sp.run(['systemctl', '--user', 'is-active', '--quiet', svc],
+                                     timeout=10).returncode == 0]
+                for svc in active:
                     _sp.Popen(['systemctl', '--user', 'restart', svc],
                               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                metric('vram_free_restart', services='forge,krea2,comfyui')
+                metric('vram_free_restart', services=','.join(active))
+                backends = [{'forge': 'forge', 'krea2': 'krea2', 'comfyui': 'zimage'}[s]
+                            for s in active]
                 def _health_watch():
                     time.sleep(2)
-                    for b in ('forge', 'krea2', 'zimage'):
+                    for b in backends:
                         _wait_backend_health(b, timeout_s=150)
                     metric('vram_free_healthy')
-                threading.Thread(target=_health_watch, daemon=True).start()
-                self._json({'ok': True, 'msg': 'Restart Forge + Krea2 + ComfyUI — pełna gotowość za ~60-90s'})
+                if backends:
+                    threading.Thread(target=_health_watch, daemon=True).start()
+                    msg = f'Restart: {", ".join(active)} — pełna gotowość za ~60-90s'
+                else:
+                    msg = 'Żaden backend nie działa — nie ma czego zwalniać'
+                self._json({'ok': True, 'msg': msg})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)})
             return
@@ -3303,6 +3777,8 @@ class Handler(BaseHTTPRequestHandler):
                     target, kind = krea_generate_thread, 'krea2'
                 elif backend == 'zimage':
                     target, kind = zimage_generate_thread, 'zimage'
+                elif backend == 'flux':
+                    target, kind = flux_generate_thread, 'flux'
                 elif backend == 'wanvideo':
                     target, kind = wan_video_generate_thread, 'wanvideo'
                 elif backend == 'forge' and params.get('all_models'):
@@ -3498,5 +3974,6 @@ if __name__ == '__main__':
             super().server_bind()
     server = _DualStack(('::', PORT), Handler)
     threading.Thread(target=_models_cache_worker, daemon=True).start()
+    threading.Thread(target=_gpu_janitor, daemon=True).start()
     _refresh_models_once(rescan_disk=True)  # zaladuj cache przed pierwszym requestem
     server.serve_forever()

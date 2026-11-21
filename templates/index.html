@@ -456,6 +456,7 @@ select{resize:none;cursor:pointer}
         <button id="backend-forge" class="backend-btn active" onclick="switchBackend('forge')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9881; Forge</button>
         <button id="backend-krea2" class="backend-btn" onclick="switchBackend('krea2')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#9889; Krea 2</button>
         <button id="backend-zimage" class="backend-btn" onclick="switchBackend('zimage')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#127916; Z-Image</button>
+        <button id="backend-flux" class="backend-btn" onclick="switchBackend('flux')" style="flex:1;padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;font-size:.8rem;transition:all .2s">&#128248; FLUX</button>
       </div>
       <div style="display:flex;gap:8px;margin-top:6px">
         <div style="flex:1;display:flex;gap:4px">
@@ -477,6 +478,21 @@ select{resize:none;cursor:pointer}
       <div id="forge-lora-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
       <div style="font-size:.72rem;color:var(--muted)">Nowe pliki wgraj przez <code>modelsLora</code> (rsync) do <code>forge/models/Lora</code>, potem odśwież stronę.</div>
     </div>
+    <div class="field flux-only" id="flux-info" style="display:none">
+      <label>Model FLUX</label>
+      <div style="font-size:.75rem;color:var(--muted);line-height:1.5">
+        <b style="color:var(--text)">FLUX.1 Krea dev</b> — fotorealizm bez plastiku: naturalna skóra,
+        miękkie światło, brak „wypolerowania". Preset <b>FLUX Foto</b> ustawia 24 kroki,
+        guidance 3.0 i dokleja do promptu język fotografii (obiektyw, światło, faktura).
+        Około 2 min na obraz.<br><br>
+        <b style="color:var(--text)">FLUX.2 Klein 9B</b> — trzyma się długich, złożonych opisów
+        i jako jedyny tutaj renderuje czytelny tekst na obrazie. Około 2-3 min na obraz.
+        Nazwy własne z nietypową pisownią (macOS, Apple Silicon) i tak wyjdą błędnie —
+        do takich napisów użyj nakładki, nie modelu.<br><br>
+        Prompt pisz <b style="color:var(--text)">po angielsku</b> — oba modele są na nim trenowane.
+        Przycisk „AI Prompt" tłumaczy polski opis na angielski prompt.
+      </div>
+    </div>
     <div class="field zimage-only" id="quant-section" style="display:none">
       <label>Kwantyzacja GGUF (A/B test)</label>
       <select id="quant-sel">
@@ -484,8 +500,8 @@ select{resize:none;cursor:pointer}
         <option value="Q5_K_M">Q5_K_M (5.3 GB — test: ~2 GB mniej VRAM)</option>
       </select>
     </div>
-    <div class="field zimage-only" id="lora-section" style="display:none">
-      <label>LoRA (Z-Image)</label>
+    <div class="field comfy-lora-only" id="lora-section" style="display:none">
+      <label>LoRA (ComfyUI — Z-Image / FLUX)</label>
       <div id="lora-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
       <div style="display:flex;gap:6px;margin-bottom:6px">
         <input type="text" id="lora-url-in" placeholder="Link do LoRA (Civitai/HuggingFace)" style="flex:1">
@@ -1202,7 +1218,7 @@ function switchBackend(b, desiredModel) {
   if (btn) btn.classList.add('active');
   // Sampler + scheduler hidden in Krea 2 / Z-Image mode (fixed sampler internally)
   document.querySelectorAll('.krea2-hide').forEach(function(el) {
-    el.style.display = (b === 'krea2' || b === 'zimage') ? 'none' : '';
+    el.style.display = (b === 'krea2' || b === 'zimage' || b === 'flux') ? 'none' : '';
   });
   fetch('/api/models').then(function(r){return r.json();}).then(function(models){
     _applyOrderToSelect(models);
@@ -1216,6 +1232,8 @@ function switchBackend(b, desiredModel) {
     }
     if (b === 'zimage') {
       for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'zimage_turbo') { sel.selectedIndex = i; break; } }
+    } else if (b === 'flux') {
+      for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value === 'flux1_krea_dev') { sel.selectedIndex = i; break; } }
     } else if (b === 'krea2') {
       for (var i=0;i<sel.options.length;i++){ if (sel.options[i].value.indexOf('krea2_') === 0) { sel.selectedIndex = i; break; } }
     }
@@ -1223,10 +1241,16 @@ function switchBackend(b, desiredModel) {
   document.querySelectorAll('.zimage-only').forEach(function(el) {
     el.style.display = (b === 'zimage') ? '' : 'none';
   });
+  document.querySelectorAll('.flux-only').forEach(function(el) {
+    el.style.display = (b === 'flux') ? '' : 'none';
+  });
+  document.querySelectorAll('.comfy-lora-only').forEach(function(el) {
+    el.style.display = (b === 'zimage' || b === 'flux') ? '' : 'none';
+  });
   document.querySelectorAll('.forge-lora-only').forEach(function(el) {
     el.style.display = (b === 'forge') ? '' : 'none';
   });
-  if (b === 'zimage') loadLoraList();
+  if (b === 'zimage' || b === 'flux') loadLoraList();
   if (b === 'forge') loadForgeLoraList();
 }
 
@@ -1573,6 +1597,8 @@ function applyPreset(id) {
   });
   if(p.model && p.model.startsWith('krea2_')) switchBackend('krea2', p.model);
   else if(p.model && p.model.startsWith('zimage')) switchBackend('zimage', p.model);
+  else if(p.model && p.model.indexOf('flux1_') === 0) switchBackend('flux', p.model);
+  else if(p.model && (p.model.indexOf('flux2_') === 0 || p.model === 'flux_moss_sft')) switchBackend('flux', p.model);
   else switchBackend('forge');
   var sel = document.getElementById('model-sel');
   for(var i=0;i<sel.options.length;i++){
@@ -1885,12 +1911,17 @@ function onModelChange(val) {
   else if (vl.startsWith('zimage')) {
     if (_backend !== 'zimage') switchBackend('zimage', val);
   }
-  else if (_backend === 'krea2' || _backend === 'zimage') switchBackend('forge');
+  else if (vl.indexOf('flux1_') === 0 || vl.indexOf('flux2_') === 0 || vl === 'flux_moss_sft') {
+    if (_backend !== 'flux') switchBackend('flux', val);
+  }
+  else if (_backend === 'krea2' || _backend === 'zimage' || _backend === 'flux') switchBackend('forge');
 
   // Flux wykrywany po prawdziwej zawartości pliku (backend, is_flux), nie po nazwie —
   // nazwy modeli bywają mylące (np. "gonzalomoXLFluxPony" to zwykły SDXL).
   var modelInfo = _modelsCache.find(function(m){ return (m.name || m.title) === val; });
-  var isFlux = (modelInfo && modelInfo.is_flux) || val.toLowerCase().indexOf('krea') !== -1;
+  var isFlux = val !== 'flux_moss_sft' && ((modelInfo && modelInfo.is_flux) || val.toLowerCase().indexOf('krea') !== -1);
+  var fluxInfo = document.getElementById('flux-info');
+  if (fluxInfo && val === 'flux_moss_sft') fluxInfo.style.display = 'none';
   var fluxBanner = document.getElementById('flux-banner');
   if (isFlux) {
     if (!fluxBanner) {
@@ -1982,6 +2013,11 @@ function startGenerate() {
   }
   if (_backend === 'forge') {
     params.loras = getSelectedForgeLoras();
+  }
+  if (_backend === 'flux') {
+    // Backend FLUX rozroznia modele po wartosci z dropdownu, nie po nazwie pliku.
+    params.model = document.getElementById('model-sel').value;
+    params.loras = getSelectedLoras();
   }
   if (_refImageB64) {
     params.init_image = _refImageB64;
